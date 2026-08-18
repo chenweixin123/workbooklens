@@ -1,0 +1,16 @@
+.venv/
+.tools/
+.artifacts/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.DS_Store
+Thumbs.db

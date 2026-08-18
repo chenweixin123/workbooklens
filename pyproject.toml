@@ -1,0 +1,108 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "workbooklens"
+version = "0.1.0"
+description = "Local-first linting, testing, semantic diffing, and safe repair for Excel workbooks"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "WorkbookLens contributors" }]
+keywords = ["excel", "xlsx", "ooxml", "lint", "spreadsheet"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Office/Business :: Financial :: Spreadsheet",
+]
+dependencies = [
+  "fastapi>=0.116,<1",
+  "jinja2>=3.1.6,<4",
+  "lxml>=5.4,<7",
+  "openpyxl>=3.1.5,<4",
+  "pydantic>=2.11,<3",
+  "python-multipart>=0.0.20,<1",
+  "pyyaml>=6.0.2,<7",
+  "rich>=14,<15",
+  "typer>=0.16,<1",
+  "uvicorn>=0.35,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/workbooklens/workbooklens"
+Documentation = "https://github.com/workbooklens/workbooklens/tree/main/docs"
+Issues = "https://github.com/workbooklens/workbooklens/issues"
+
+[project.scripts]
+workbooklens = "workbooklens.cli:app"
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.138,<7",
+  "httpx>=0.28,<1",
+  "lxml-stubs>=0.5,<1",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<10",
+  "pytest-cov>=6.2,<8",
+  "ruff>=0.12,<1",
+  "types-openpyxl>=3.1.5,<4",
+  "types-pyyaml>=6.0.12,<7",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/workbooklens"]
+
+[tool.hatch.build]
+exclude = [
+  ".artifacts/",
+  ".tools/",
+  "CODEX_MASTER_PROMPT.md",
+  "CODEX_REVIEW_PROMPT.md",
+]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers --cov=workbooklens --cov-report=term-missing --cov-fail-under=75"
+testpaths = ["tests"]
+markers = [
+  "integration: end-to-end tests that read and write workbook packages",
+  "security: adversarial package and resource-limit tests",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["workbooklens"]
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "S", "RUF"]
+ignore = ["E501", "S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S108"]
+"src/workbooklens/cli.py" = ["B008"]
+"src/workbooklens/web/app.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["workbooklens"]
+mypy_path = "src"
+warn_unused_ignores = true

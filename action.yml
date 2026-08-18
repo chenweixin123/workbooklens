@@ -1,0 +1,71 @@
+name: WorkbookLens scan
+description: Scan changed .xlsx files locally and upload self-contained reports
+author: WorkbookLens contributors
+inputs:
+  path:
+    description: Repository subdirectory to scan
+    required: false
+    default: .
+  base-sha:
+    description: Base commit for changed-file detection; leave empty to scan tracked .xlsx files
+    required: false
+    default: ""
+  head-sha:
+    description: Head commit for changed-file detection
+    required: false
+    default: HEAD
+  fail-on:
+    description: Minimum finding severity that fails the action
+    required: false
+    default: error
+  output:
+    description: Report directory relative to the repository
+    required: false
+    default: .workbooklens-reports
+  upload-sarif:
+    description: Upload SARIF to GitHub code scanning; requires security-events write permission
+    required: false
+    default: "false"
+outputs:
+  report-path:
+    description: Directory containing generated reports
+    value: ${{ steps.scan.outputs.report-path }}
+  file-count:
+    description: Number of changed .xlsx files scanned
+    value: ${{ steps.scan.outputs.file-count }}
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        enable-cache: true
+    - name: Scan changed workbooks
+      id: scan
+      shell: bash
+      env:
+        WORKBOOKLENS_SCAN_PATH: ${{ inputs.path }}
+        WORKBOOKLENS_BASE_SHA: ${{ inputs.base-sha }}
+        WORKBOOKLENS_HEAD_SHA: ${{ inputs.head-sha }}
+        WORKBOOKLENS_FAIL_ON: ${{ inputs.fail-on }}
+        WORKBOOKLENS_OUTPUT: ${{ inputs.output }}
+      run: >-
+        uv run --project "$GITHUB_ACTION_PATH" --locked --no-dev
+        python "$GITHUB_ACTION_PATH/scripts/action_scan.py"
+    - name: Upload WorkbookLens reports
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: workbooklens-reports-${{ github.run_id }}-${{ github.job }}
+        path: ${{ steps.scan.outputs.report-path }}
+        if-no-files-found: error
+    - name: Upload SARIF to code scanning
+      if: inputs.upload-sarif == 'true' && steps.scan.outputs.file-count != '0'
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ steps.scan.outputs.report-path }}
+        category: workbooklens
+    - name: Enforce finding threshold
+      if: always()
+      shell: bash
+      run: exit "${{ steps.scan.outputs.exit-code }}"

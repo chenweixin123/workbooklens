@@ -1,0 +1,21 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WorkbookLens semantic diff</title><style>
+:root{color-scheme:light dark;--bg:#f5f7fb;--card:#fff;--ink:#172033;--muted:#64748b;--line:#dce3ee;--error:#c24135;--warning:#a15c00;--info:#1769aa}
+@media(prefers-color-scheme:dark){:root{--bg:#10131a;--card:#181d27;--ink:#edf2f7;--muted:#a7b2c3;--line:#303849}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 Arial,sans-serif}main{max-width:1200px;margin:auto;padding:28px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:16px 0}.muted{color:var(--muted)}.controls{display:flex;gap:12px;flex-wrap:wrap}
+select,input{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:7px;padding:8px}table{width:100%;border-collapse:collapse}th,td{text-align:left;vertical-align:top;border-bottom:1px solid var(--line);padding:10px}
+.badge{color:#fff;border-radius:99px;padding:2px 8px;font-size:12px}.error{background:var(--error)}.warning{background:var(--warning)}.info{background:var(--info)}.critical{background:#8b1e2d}.hidden{display:none}code{overflow-wrap:anywhere}.scroll{overflow:auto;max-height:72vh}
+</style></head><body><main><h1>Semantic workbook diff</h1><div class="muted">Before {{ diff.before_sha256 }}<br>After {{ diff.after_sha256 }}</div>
+<section class="card"><b>{{ diff.cell_changes|length }}</b> cell changes · <b>{{ diff.structural_changes|length }}</b> structural changes. Formula values were not calculated.</section>
+<div class="controls"><label>Sheet <select id="sheet"><option value="">All</option>{% for name in diff.cell_changes|map(attribute='sheet')|unique|sort %}<option>{{ name }}</option>{% endfor %}</select></label>
+<label>Type <select id="type"><option value="">All</option><option>value</option><option>formula</option><option>style</option><option>number_format</option><option>structure</option></select></label>
+<label>Importance <select id="importance"><option value="">All</option><option>critical</option><option>error</option><option>warning</option><option>info</option></select></label>
+<label>Search <input id="search" type="search"></label></div>
+<section class="card scroll"><table><thead><tr><th>Importance</th><th>Type</th><th>Subject</th><th>Before</th><th>After</th></tr></thead><tbody id="changes">
+{% for change in diff.cell_changes %}<tr data-sheet="{{ change.sheet }}" data-type="{{ change.change_type }}" data-importance="{{ change.importance.value }}"><td><span class="badge {{ change.importance.value }}">{{ change.importance.value }}</span></td><td>{{ change.change_type }}</td><td>{{ change.sheet }}!{{ change.cell }}</td><td><code>{{ change.before }}</code>{% if change.before_signature %}<br><small>{{ change.before_signature }}</small>{% endif %}</td><td><code>{{ change.after }}</code>{% if change.after_signature %}<br><small>{{ change.after_signature }}</small>{% endif %}</td></tr>{% endfor %}
+{% for change in diff.structural_changes %}<tr data-sheet="" data-type="structure" data-importance="{{ change.importance.value }}"><td><span class="badge {{ change.importance.value }}">{{ change.importance.value }}</span></td><td>{{ change.change_type }}</td><td>{{ change.subject }}</td><td><code>{{ change.before }}</code></td><td><code>{{ change.after }}</code></td></tr>{% endfor %}
+</tbody></table>{% if not diff.cell_changes and not diff.structural_changes %}<p>No semantic differences detected.</p>{% endif %}</section>
+<p class="muted">Self-contained WorkbookLens report with no remote assets. It can contain workbook-derived evidence; whoever distributes or uploads it controls that data.</p></main><script>
+const cs=[...document.querySelectorAll('select,input')];function f(){const s=document.querySelector('#sheet').value,t=document.querySelector('#type').value,i=document.querySelector('#importance').value,q=document.querySelector('#search').value.toLowerCase();document.querySelectorAll('#changes tr').forEach(r=>r.classList.toggle('hidden',!!((s&&r.dataset.sheet!==s)||(t&&r.dataset.type!==t)||(i&&r.dataset.importance!==i)||(q&&!r.textContent.toLowerCase().includes(q)))))}cs.forEach(c=>c.addEventListener('input',f));
+</script></body></html>

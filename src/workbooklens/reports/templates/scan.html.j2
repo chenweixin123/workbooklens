@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WorkbookLens scan — {{ source }}</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#f5f7fb; --card:#fff; --ink:#172033;
+      --muted:#64748b; --line:#dce3ee; --critical:#8b1e2d; --error:#c24135;
+      --warning:#a15c00; --info:#1769aa; --accent:#3157d5; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#10131a; --card:#181d27;
+      --ink:#edf2f7; --muted:#a7b2c3; --line:#303849; --accent:#8da2ff; } }
+    * { box-sizing:border-box; } body { margin:0; font:15px/1.55 Arial,sans-serif;
+      color:var(--ink); background:var(--bg); } main { max-width:1200px; margin:auto; padding:28px; }
+    h1 { margin:0 0 4px; font-size:30px; } h2 { margin-top:0; } .muted { color:var(--muted); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:14px;
+      margin:22px 0; } .card { background:var(--card); border:1px solid var(--line);
+      border-radius:12px; padding:16px; box-shadow:0 4px 18px #0000000a; }
+    .metric { font-size:28px; font-weight:700; } .controls { display:flex; flex-wrap:wrap;
+      gap:10px; margin:18px 0; } label { font-weight:600; } select,input { font:inherit;
+      color:inherit; background:var(--card); border:1px solid var(--line); border-radius:7px;
+      padding:8px 10px; } input { min-width:260px; }
+    table { width:100%; border-collapse:collapse; } th,td { text-align:left; vertical-align:top;
+      border-bottom:1px solid var(--line); padding:11px 9px; } th { position:sticky; top:0;
+      background:var(--card); } .table-wrap { overflow:auto; max-height:70vh; }
+    .badge { display:inline-block; border-radius:99px; padding:2px 8px; color:#fff;
+      font-size:12px; font-weight:700; } .critical { background:var(--critical); }
+    .error { background:var(--error); } .warning { background:var(--warning); }
+    .info { background:var(--info); } code { overflow-wrap:anywhere; } details { margin-top:6px; }
+    .privacy { border-left:4px solid var(--accent); } .hidden { display:none; }
+    .location { white-space:nowrap; } .risk { color:var(--error); }
+    @media (max-width:700px) { main { padding:16px; } th:nth-child(4),td:nth-child(4) { display:none; } }
+  </style>
+</head>
+<body><main>
+  <header><h1>WorkbookLens scan</h1><div class="muted">{{ source }} · SHA-256 {{ source_sha256 }}</div></header>
+  <section class="grid" aria-label="Workbook summary">
+    <div class="card"><div class="muted">Risk score</div><div class="metric risk">{{ risk_score }}/100</div></div>
+    <div class="card"><div class="muted">Critical</div><div class="metric">{{ severity_counts.get('critical', 0) }}</div></div>
+    <div class="card"><div class="muted">Errors</div><div class="metric">{{ severity_counts.get('error', 0) }}</div></div>
+    <div class="card"><div class="muted">Warnings</div><div class="metric">{{ severity_counts.get('warning', 0) }}</div></div>
+    <div class="card"><div class="muted">Sheets</div><div class="metric">{{ sheets|length }}</div></div>
+  </section>
+  <section class="card privacy"><strong>Local processing.</strong> WorkbookLens made no network
+    request while inspecting this workbook. This report can contain workbook-derived evidence;
+    whoever distributes or uploads it controls that data. Formulas, macros, links, and embedded
+    objects were not executed.</section>
+  <section class="card" style="margin-top:16px"><h2>Sheet overview</h2>
+    <div class="table-wrap"><table><thead><tr><th>Sheet</th><th>State</th><th>Relevant cells</th><th>Used bounds</th></tr></thead><tbody>
+      {% for sheet in sheets %}<tr><td>{{ sheet.name }}</td><td>{{ sheet.state }}</td><td>{{ sheet.cells|length }}</td><td>{{ sheet.max_row }} rows × {{ sheet.max_column }} columns</td></tr>{% endfor %}
+    </tbody></table></div></section>
+  <section class="card" style="margin-top:16px"><h2>Findings</h2>
+    <div class="controls">
+      <label>Severity <select id="severity"><option value="">All</option><option>critical</option><option>error</option><option>warning</option><option>info</option></select></label>
+      <label>Sheet <select id="sheet"><option value="">All</option>{% for sheet in sheets %}<option>{{ sheet.name }}</option>{% endfor %}</select></label>
+      <label>Rule <select id="rule"><option value="">All</option>{% for rule, count in rule_counts %}<option value="{{ rule }}">{{ rule }} ({{ count }})</option>{% endfor %}</select></label>
+      <label>Search <input id="search" type="search" placeholder="title, cell, evidence"></label>
+      <label>Sort <select id="sort"><option value="risk">Risk order</option><option value="rule">Rule</option><option value="location">Sheet/location</option></select></label>
+    </div>
+    <div class="table-wrap"><table><thead><tr><th>Severity</th><th>Rule</th><th>Location</th><th>Confidence</th><th>Explanation and evidence</th></tr></thead><tbody id="findings">
+    {% for finding in findings %}<tr data-order="{{ loop.index0 }}" data-severity="{{ finding.severity.value }}" data-sheet="{{ finding.sheet or '' }}" data-location="{{ finding.location or '' }}" data-rule="{{ finding.rule_id }}">
+      <td><span class="badge {{ finding.severity.value }}">{{ finding.severity.value }}</span></td>
+      <td><code>{{ finding.rule_id }}</code></td>
+      <td class="location">{{ finding.sheet or 'Workbook' }}{% if finding.location %}!{{ finding.location }}{% endif %}</td>
+      <td>{{ '%.0f'|format(finding.confidence.root * 100) }}%</td>
+      <td><strong>{{ finding.title }}</strong><br>{{ finding.explanation }}
+        <details><summary>Evidence</summary><p>{{ finding.evidence.summary }}</p>
+          <p><b>Observed:</b> <code>{{ finding.evidence.observed }}</code></p>
+          <p><b>Expected:</b> <code>{{ finding.evidence.expected }}</code></p>
+          {% if finding.evidence.peers %}<p><b>Peers:</b> {{ finding.evidence.peers|join(', ') }}</p>{% endif %}
+          <p><b>Suggested action:</b> {{ finding.suggested_action }}</p>
+          {% for patch_id in finding.patch_ids %}{% set patch = patch_map.get(patch_id) %}{% if patch %}
+          <p><b>Patch {{ patch.id }}</b> ({{ patch.kind.value }}, safe={{ patch.safe }}):
+            <code>{{ patch.before }}</code> → <code>{{ patch.after }}</code></p>{% endif %}{% endfor %}
+        </details></td></tr>{% endfor %}
+    </tbody></table></div>
+    {% if not findings %}<p>No findings were raised by the enabled deterministic rules.</p>{% endif %}
+  </section>
+  <section class="card" style="margin-top:16px"><h2>Limitations</h2><p>WorkbookLens does not calculate formulas and does not claim complete Excel compatibility.
+    Cached formula values may be stale. Formula repairs remove stale cached values and request a full recalculation
+    the next time the output is opened in a compatible spreadsheet application. Shared, array, data-table,
+    dynamic-array, and ambiguous formulas are not automatically repaired.</p></section>
+  <footer class="muted" style="margin-top:18px">Generated by WorkbookLens {{ tool_version }} · self-contained report</footer>
+</main><script>
+  const controls=[...document.querySelectorAll('#severity,#sheet,#rule,#search,#sort')];
+  function filter(){const sev=document.querySelector('#severity').value, sheet=document.querySelector('#sheet').value,
+    rule=document.querySelector('#rule').value, q=document.querySelector('#search').value.toLowerCase();
+    const sort=document.querySelector('#sort').value, body=document.querySelector('#findings'), rows=[...body.querySelectorAll('tr')];
+    rows.sort((a,b)=>sort==='rule'?(a.dataset.rule+a.dataset.sheet+a.dataset.location).localeCompare(b.dataset.rule+b.dataset.sheet+b.dataset.location):sort==='location'?(a.dataset.sheet+a.dataset.location).localeCompare(b.dataset.sheet+b.dataset.location):Number(a.dataset.order)-Number(b.dataset.order));
+    rows.forEach(row=>body.appendChild(row));
+    document.querySelectorAll('#findings tr').forEach(row=>{const ok=(!sev||row.dataset.severity===sev)&&
+      (!sheet||row.dataset.sheet===sheet)&&(!rule||row.dataset.rule===rule)&&(!q||row.textContent.toLowerCase().includes(q));
+      row.classList.toggle('hidden',!ok);});} controls.forEach(control=>control.addEventListener('input',filter));
+</script></body></html>

@@ -1,0 +1,36 @@
+version: 1
+workbook:
+  max_critical_findings: 0
+  max_error_findings: 0
+keys:
+  - sheet: Invoices
+    range: A2:A10000
+    ignore_blank: true
+assertions:
+  - id: no-broken-references
+    type: no_findings
+    rules: [WL001_BROKEN_REFERENCE, WL013_BROKEN_DEFINED_NAME]
+  - id: unique-invoice-id
+    type: unique
+    sheet: Invoices
+    range: A2:A10000
+    ignore_blank: true
+  - id: total-reconciles
+    type: equals
+    left: Summary!B12
+    right: SUM(Detail!F2:F500)
+    tolerance: 0.01
+  - id: status-domain
+    type: allowed_values
+    sheet: Invoices
+    range: G2:G10000
+    values: [Open, Paid, Void]
+  - id: required-invoice-id
+    type: nonblank
+    sheet: Invoices
+    range: A2:A10000
+  - id: nonnegative-amount
+    type: numeric_bounds
+    sheet: Invoices
+    range: F2:F10000
+    minimum: 0
