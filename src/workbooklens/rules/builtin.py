@@ -1,4 +1,4 @@
-"""The fifteen deterministic WorkbookLens v0.1 rules."""
+"""The fifteen deterministic WorkbookLens built-in rules."""
 
 from __future__ import annotations
 
@@ -64,10 +64,14 @@ def _make_finding(
     expected: str,
     suggested_action: str,
     patches: Sequence[PatchOperation] = (),
+    identity_discriminator: Any = None,
 ) -> Finding:
-    identifier = stable_id("finding", rule_id, sheet, location, evidence.model_dump(mode="json"))
+    identifier = stable_id("finding", rule_id, sheet, location, identity_discriminator)
     return Finding(
         id=identifier,
+        content_fingerprint=stable_id(
+            "finding-content", evidence.model_dump(mode="json"), length=24
+        ),
         rule_id=rule_id,
         title=title,
         explanation=explanation,
@@ -193,7 +197,8 @@ class BrokenReferenceRule(WorkbookRule):
             for cell in worksheet._cells.values():
                 if cell.data_type != "f" or not isinstance(cell.value, str):
                     continue
-                if "#REF!" not in cell.value.upper():
+                features = analyze_formula(cell.value)
+                if not features.broken_references:
                     continue
                 result.findings.append(
                     _make_finding(
@@ -205,7 +210,11 @@ class BrokenReferenceRule(WorkbookRule):
                         confidence=1.0,
                         sheet=worksheet.title,
                         location=cell.coordinate,
-                        evidence=Evidence(summary="Formula contains #REF!", observed=cell.value),
+                        evidence=Evidence(
+                            summary="Formula contains #REF!",
+                            observed=cell.value,
+                            details={"references": list(features.broken_references)},
+                        ),
                         expected="Every formula reference resolves to an existing cell or range.",
                         suggested_action="Review the deleted or moved source range; no automatic guess was made.",
                     )
@@ -1004,7 +1013,8 @@ class BrokenDefinedNameRule(WorkbookRule):
         for defined_name in context.workbook.defined_names.values():
             target = defined_name.attr_text or ""
             reason = None
-            if "#REF!" in target.upper():
+            formula = target if target.startswith("=") else f"={target}"
+            if analyze_formula(formula).broken_references:
                 reason = "target contains #REF!"
             elif defined_name.type == "RANGE":
                 try:
