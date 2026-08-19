@@ -35,7 +35,9 @@ def test_local_web_scan_apply_and_download_workflow(tmp_path: Path) -> None:
         session_id = session_match.group(1)
         patch_ids = re.findall(r'name="patch_id" value="([^"]+)"', response.text)
         assert len(patch_ids) == 5
-        assert client.get(f"/sessions/{session_id}/report").status_code == 200
+        report = client.get(f"/sessions/{session_id}/report")
+        assert report.status_code == 200
+        assert report.headers["content-disposition"].startswith("inline")
         assert client.get(f"/sessions/{session_id}/plan").status_code == 200
         applied = client.post(
             f"/sessions/{session_id}/apply",
@@ -46,7 +48,9 @@ def test_local_web_scan_apply_and_download_workflow(tmp_path: Path) -> None:
         fixed = client.get(f"/sessions/{session_id}/fixed")
         assert fixed.status_code == 200
         assert fixed.content.startswith(b"PK")
-        assert client.get(f"/sessions/{session_id}/diff").status_code == 200
+        diff = client.get(f"/sessions/{session_id}/diff")
+        assert diff.status_code == 200
+        assert diff.headers["content-disposition"].startswith("inline")
         assert client.get(f"/sessions/{session_id}/apply-report").status_code == 200
 
 
@@ -83,6 +87,19 @@ def test_xlsm_web_scan_does_not_offer_repairs(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert 'name="patch_id"' not in response.text
     assert "No safe deterministic patches are available" in response.text
+
+
+def test_web_errors_are_recoverable_html_pages() -> None:
+    app = create_app(max_file_bytes=10)
+    with TestClient(app) as client:
+        response = client.post(
+            "/scan",
+            files={"workbook": ("notes.txt", b"hello", "text/plain")},
+        )
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("text/html")
+    assert "could not continue" in response.text
+    assert "source workbook was not modified" in response.text
 
 
 def test_serve_command_hardcodes_loopback_binding() -> None:
