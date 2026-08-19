@@ -44,7 +44,7 @@ uv lock --check
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy src
-uv run pytest -q
+uv run python -m pytest -q
 uv run workbooklens demo --out .artifacts/demo
 uv build --out-dir dist
 uvx --from twine twine check dist/*
