@@ -201,7 +201,7 @@ uv sync --locked
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy src
-uv run pytest -q
+uv run python -m pytest -q
 uv build --out-dir dist
 uvx --from twine twine check dist/*
 python scripts/check_release_artifacts.py dist --version 2.0.0
