@@ -65,6 +65,8 @@ jobs:
         with:
           name: workbooklens-demo
           path: .artifacts
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 7
 
   build:
@@ -140,3 +142,4 @@ jobs:
           path: .action-fixtures
           fail-on: critical
           output: .action-reports
+
