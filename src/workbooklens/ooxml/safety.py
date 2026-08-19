@@ -15,8 +15,14 @@ from lxml import etree
 from workbooklens.exceptions import UnsafeWorkbookError, UsageError
 
 RELATIONSHIPS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 REQUIRED_PARTS = {"[Content_Types].xml", "_rels/.rels", "xl/workbook.xml"}
 FORBIDDEN_XML_DECLARATION_RE = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
+XLSX_WORKBOOK_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+)
+XLSM_WORKBOOK_CONTENT_TYPE = "application/vnd.ms-excel.sheet.macroEnabled.main+xml"
+VBA_RELATIONSHIP_NAMES = {"vbaproject", "vbaprojectsignature"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +48,12 @@ class PackageInspection:
     total_uncompressed_bytes: int
     part_names: frozenset[str]
     external_relationships: tuple[str, ...] = field(default_factory=tuple)
+
+    content_format: str | None = None
+    extension_format: str = ""
+    has_vba: bool = False
+    format_mismatch: bool = False
+    repairable: bool = False
 
 
 def _canonical_member_name(name: str) -> str:
@@ -134,8 +146,9 @@ def _inspect_relationships(
     archive: zipfile.ZipFile,
     infos: dict[str, zipfile.ZipInfo],
     limits: PackageLimits,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], bool]:
     external: list[str] = []
+    has_vba_relationship = False
     for name, info in infos.items():
         if not name.endswith(".rels"):
             continue
@@ -148,6 +161,10 @@ def _inspect_relationships(
                 continue
             target = relationship.get("Target", "")
             mode = relationship.get("TargetMode", "Internal")
+            relationship_type = relationship.get("Type", "")
+            relationship_name = relationship_type.rsplit("/", maxsplit=1)[-1].lower()
+            if relationship_name in VBA_RELATIONSHIP_NAMES:
+                has_vba_relationship = True
             if mode == "External":
                 external.append(target)
                 continue
@@ -156,7 +173,57 @@ def _inspect_relationships(
                 raise UnsafeWorkbookError(
                     f"Internal relationship from {name!r} points to missing part {resolved!r}"
                 )
-    return tuple(sorted(set(external)))
+    return tuple(sorted(set(external))), has_vba_relationship
+
+
+def _inspect_content_types(
+    archive: zipfile.ZipFile,
+    infos: dict[str, zipfile.ZipInfo],
+    limits: PackageLimits,
+) -> tuple[str | None, bool]:
+    """Return the workbook format declared by OOXML and any macro content marker."""
+
+    part_name = "[Content_Types].xml"
+    root = parse_xml_part(_read_bounded(archive, infos[part_name], limits.max_xml_bytes), part_name)
+    if root.tag != f"{{{CONTENT_TYPES_NS}}}Types":
+        raise UnsafeWorkbookError("Unexpected root element in '[Content_Types].xml'")
+
+    workbook_content_types: set[str] = set()
+    has_macro_content_type = False
+    for declaration in root:
+        content_type = declaration.get("ContentType", "")
+        lowered = content_type.lower()
+        if "vbaproject" in lowered or "macroenabled" in lowered:
+            has_macro_content_type = True
+        if declaration.tag != f"{{{CONTENT_TYPES_NS}}}Override":
+            continue
+        declared_part = declaration.get("PartName", "").lstrip("/")
+        if declared_part == "xl/workbook.xml" and content_type:
+            workbook_content_types.add(content_type)
+
+    if len(workbook_content_types) > 1:
+        raise UnsafeWorkbookError("Workbook has conflicting content-type declarations")
+    if not workbook_content_types:
+        return None, has_macro_content_type
+
+    workbook_content_type = next(iter(workbook_content_types))
+    if workbook_content_type == XLSX_WORKBOOK_CONTENT_TYPE:
+        return "xlsx", has_macro_content_type
+    if workbook_content_type == XLSM_WORKBOOK_CONTENT_TYPE or "macroenabled" in (
+        workbook_content_type.lower()
+    ):
+        return "xlsm", True
+    return None, has_macro_content_type
+
+
+def _has_vba_part(part_names: frozenset[str]) -> bool:
+    """Detect VBA project/signature parts even when their declarations are misleading."""
+
+    for part_name in part_names:
+        leaf = PurePosixPath(part_name).name.lower()
+        if leaf in {"vbaproject.bin", "vbaprojectsignature.bin"}:
+            return True
+    return False
 
 
 def inspect_package(path: Path, limits: PackageLimits | None = None) -> PackageInspection:
@@ -168,7 +235,7 @@ def inspect_package(path: Path, limits: PackageLimits | None = None) -> PackageI
         raise UsageError(f"Workbook does not exist or is not a file: {path}")
     suffix = resolved.suffix.lower()
     if suffix not in {".xlsx", ".xlsm"}:
-        raise UsageError("WorkbookLens v0.1 accepts only .xlsx and read-only .xlsm inputs")
+        raise UsageError("WorkbookLens 2.0 accepts only .xlsx and read-only .xlsm inputs")
     file_size = resolved.stat().st_size
     if file_size > active_limits.max_file_bytes:
         raise UnsafeWorkbookError(
@@ -227,16 +294,38 @@ def inspect_package(path: Path, limits: PackageLimits | None = None) -> PackageI
                 if name.endswith((".xml", ".rels")):
                     data = _read_bounded(archive, info, active_limits.max_xml_bytes)
                     parse_xml_part(data, name)
-            external_relationships = _inspect_relationships(archive, infos, active_limits)
+            content_format, macro_content_type = _inspect_content_types(
+                archive,
+                infos,
+                active_limits,
+            )
+            external_relationships, macro_relationship = _inspect_relationships(
+                archive,
+                infos,
+                active_limits,
+            )
     except (zipfile.BadZipFile, RuntimeError, OSError) as exc:
         raise UnsafeWorkbookError(f"Unable to inspect workbook package safely: {exc}") from exc
 
+    extension_format = suffix.lstrip(".")
+    has_vba = macro_content_type or macro_relationship or _has_vba_part(frozenset(infos))
+    detected_format = "xlsm" if has_vba else content_format
+    format_mismatch = detected_format is None or detected_format != extension_format
+    repairable = detected_format == "xlsx" and extension_format == "xlsx" and not format_mismatch
+    # Existing callers use format == "xlsm" as the conservative read-only signal.
+    effective_format = "xlsx" if repairable else "xlsm"
+
     return PackageInspection(
         path=resolved,
-        format=suffix.lstrip("."),
+        format=effective_format,
         entry_count=len(infos),
         total_compressed_bytes=total_compressed,
         total_uncompressed_bytes=total_uncompressed,
         part_names=frozenset(infos),
         external_relationships=external_relationships,
+        content_format=detected_format,
+        extension_format=extension_format,
+        has_vba=has_vba,
+        format_mismatch=format_mismatch,
+        repairable=repairable,
     )
