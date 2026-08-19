@@ -81,6 +81,7 @@ runs:
       with:
         name: workbooklens-reports-${{ github.run_id }}-${{ github.job }}
         path: ${{ steps.run.outputs.report-path }}
+        include-hidden-files: true
         if-no-files-found: error
         retention-days: 14
     - name: Upload SARIF to code scanning
