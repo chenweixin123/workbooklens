@@ -68,6 +68,37 @@ def test_formula_pattern_outlier_rule_and_safe_proposal(tmp_path: Path) -> None:
     assert patches[0].after == "=K1*2"
 
 
+def test_finding_identity_is_stable_when_evidence_content_changes(tmp_path: Path) -> None:
+    first = Workbook()
+    first_sheet = first.active
+    assert first_sheet is not None
+    first_sheet["A1"] = "=#REF!+1"
+    first_path = tmp_path / "first.xlsx"
+    first.save(first_path)
+    first.close()
+
+    second = Workbook()
+    second_sheet = second.active
+    assert second_sheet is not None
+    second_sheet["A1"] = "=#REF!+2"
+    second_path = tmp_path / "second.xlsx"
+    second.save(second_path)
+    second.close()
+
+    first_finding = next(
+        finding
+        for finding in scan_workbook(first_path).findings
+        if finding.rule_id == "WL001_BROKEN_REFERENCE"
+    )
+    second_finding = next(
+        finding
+        for finding in scan_workbook(second_path).findings
+        if finding.rule_id == "WL001_BROKEN_REFERENCE"
+    )
+    assert first_finding.id == second_finding.id
+    assert first_finding.content_fingerprint != second_finding.content_fingerprint
+
+
 def test_unsupported_formula_suppresses_automatic_band_repair(tmp_path: Path) -> None:
     workbook = Workbook()
     worksheet = workbook.active
@@ -86,6 +117,34 @@ def test_unsupported_formula_suppresses_automatic_band_repair(tmp_path: Path) ->
     scan = scan_workbook(path)
     assert not any(finding.rule_id == "WL002_FORMULA_PATTERN_OUTLIER" for finding in scan.findings)
     assert not any(patch.cell == "K2" for patch in scan.patches)
+
+
+def test_formula_rule_tokens_ignore_string_literals_but_keep_real_constructs(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet["A1"] = '="#REF! NOW() Table1[Amount] [Book.xlsx]S!A1"'
+    worksheet["A2"] = "=#REF!+1"
+    worksheet["A3"] = "=NOW()"
+    worksheet["A4"] = "='[Book.xlsx]S'!A1"
+    path = tmp_path / "formula-tokens.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    locations_by_rule = {
+        rule_id: {finding.location for finding in scan.findings if finding.rule_id == rule_id}
+        for rule_id in {
+            "WL001_BROKEN_REFERENCE",
+            "WL009_EXTERNAL_LINK",
+            "WL010_VOLATILE_OR_FRAGILE_FUNCTION",
+        }
+    }
+    assert locations_by_rule["WL001_BROKEN_REFERENCE"] == {"A2"}
+    assert locations_by_rule["WL009_EXTERNAL_LINK"] == {"A4"}
+    assert locations_by_rule["WL010_VOLATILE_OR_FRAGILE_FUNCTION"] == {"A3"}
 
 
 def test_numeric_text_excludes_leading_zero_identifiers(demo_scan: ScanResult) -> None:
