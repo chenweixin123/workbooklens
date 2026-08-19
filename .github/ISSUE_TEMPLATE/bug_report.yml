@@ -1,0 +1,43 @@
+name: Bug report
+description: Report a reproducible WorkbookLens defect without sharing a sensitive workbook.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Remove confidential data and use a generated or minimized workbook whenever possible.
+  - type: input
+    id: version
+    attributes:
+      label: WorkbookLens version or commit
+      placeholder: 2.0.0 or a commit SHA
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and Python version
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Include the exact command and a safe, minimized fixture-generation script if available.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed confidential workbook content and credentials.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
