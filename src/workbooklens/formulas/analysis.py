@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from openpyxl.formula import Tokenizer
+from openpyxl.formula.tokenizer import Token, TokenizerError
 from openpyxl.formula.translate import Translator, TranslatorError
 from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 
@@ -15,9 +16,8 @@ SHEET_PREFIX_RE = re.compile(r"^(?P<sheet>(?:'(?:[^']|'')+'|[^'!]+)!)?(?P<body>.
 EXTERNAL_RE = re.compile(r"\[[^\]]+\][^!]*!")
 WHOLE_COLUMN_RE = re.compile(r"(?<![A-Z0-9_])\$?[A-Z]{1,3}:\$?[A-Z]{1,3}(?![A-Z0-9_])", re.I)
 STRUCTURED_REFERENCE_RE = re.compile(r"(?:\b[A-Z_][A-Z0-9_.]*\s*)?\[[^\]]+\]", re.I)
-ADVANCED_FORMULA_RE = re.compile(
-    r"(?:(?:_xlfn|_xlws)\.)*(?:FILTER|UNIQUE|SORT|SORTBY|SEQUENCE|RANDARRAY|LAMBDA)\s*\(",
-    re.IGNORECASE,
+ADVANCED_FUNCTIONS = frozenset(
+    {"FILTER", "UNIQUE", "SORT", "SORTBY", "SEQUENCE", "RANDARRAY", "LAMBDA"}
 )
 VOLATILE_FUNCTIONS = (
     "OFFSET",
@@ -39,6 +39,7 @@ class FormulaFeatures:
 
     references: tuple[str, ...]
     external_references: tuple[str, ...]
+    broken_references: tuple[str, ...]
     volatile_functions: tuple[str, ...]
     has_whole_column_reference: bool
     unsupported_reason: str | None = None
@@ -90,7 +91,7 @@ def normalize_formula(formula: str, origin: str) -> str:
         raise ValueError("formula must be a string beginning with '='")
     try:
         tokens = Tokenizer(formula).items
-    except (ValueError, IndexError) as exc:
+    except (ValueError, IndexError, TokenizerError) as exc:
         raise UnsupportedFormulaError(f"formula tokenizer rejected the expression: {exc}") from exc
     result: list[str] = []
     for token in tokens:
@@ -105,35 +106,127 @@ def normalize_formula(formula: str, origin: str) -> str:
     return "".join(result)
 
 
-def _range_operands(formula: str) -> list[str]:
+def _tokens(formula: str) -> tuple[Token, ...] | None:
     try:
-        tokens = Tokenizer(formula).items
-    except (ValueError, IndexError):
-        return []
+        return tuple(Tokenizer(formula).items)
+    except (ValueError, IndexError, TokenizerError):
+        return None
+
+
+def _range_operands(tokens: tuple[Token, ...]) -> list[str]:
     return [token.value for token in tokens if token.type == "OPERAND" and token.subtype == "RANGE"]
+
+
+def _function_name(token: Token) -> str | None:
+    if token.type != "FUNC" or token.subtype != "OPEN":
+        return None
+    value = cast(str, token.value)[:-1].upper()
+    return value.rsplit(".", maxsplit=1)[-1]
+
+
+def _without_string_literals(formula: str) -> str:
+    """Blank Excel double-quoted strings for conservative tokenizer-failure fallback checks."""
+
+    output: list[str] = []
+    index = 0
+    inside = False
+    while index < len(formula):
+        character = formula[index]
+        if character == '"':
+            if inside and index + 1 < len(formula) and formula[index + 1] == '"':
+                output.extend((" ", " "))
+                index += 2
+                continue
+            inside = not inside
+            output.append(" ")
+        else:
+            output.append(" " if inside else character)
+        index += 1
+    return "".join(output)
 
 
 def analyze_formula(formula: str) -> FormulaFeatures:
     """Extract references and risky constructs while making no compatibility claims."""
 
-    operands = _range_operands(formula)
+    tokens = _tokens(formula)
+    if tokens is None:
+        # openpyxl currently rejects some valid newer syntax (for example spill references).
+        # Remove string literals before conservative fallback matching so display text is inert.
+        searchable = _without_string_literals(formula)
+        upper = searchable.upper()
+        external = tuple(sorted(set(EXTERNAL_RE.findall(searchable))))
+        broken = ("#REF!",) if "#REF!" in upper else ()
+        volatile = tuple(
+            function
+            for function in VOLATILE_FUNCTIONS
+            if re.search(
+                rf"(?<![A-Z0-9_])(?:(?:_XLFN|_XLWS)\.)*{function}\s*\(",
+                upper,
+            )
+        )
+        structured = bool(STRUCTURED_REFERENCE_RE.search(searchable)) and not external
+        advanced = (
+            any(
+                re.search(
+                    rf"(?<![A-Z0-9_])(?:(?:_XLFN|_XLWS)\.)*{function}\s*\(",
+                    upper,
+                )
+                for function in ADVANCED_FUNCTIONS
+            )
+            or "#" in searchable
+        )
+        unsupported_reason = (
+            "structured reference"
+            if structured
+            else "dynamic or advanced formula"
+            if advanced
+            else None
+        )
+        return FormulaFeatures(
+            references=(),
+            external_references=external,
+            broken_references=broken,
+            volatile_functions=volatile,
+            has_whole_column_reference=bool(WHOLE_COLUMN_RE.search(searchable)),
+            unsupported_reason=unsupported_reason,
+        )
+
+    operands = _range_operands(tokens)
     external = tuple(sorted({item for item in operands if EXTERNAL_RE.search(item)}))
-    upper = formula.upper()
-    volatile = tuple(
-        function
-        for function in VOLATILE_FUNCTIONS
-        if re.search(rf"(?<![A-Z0-9_])(?:(?:_XLFN|_XLWS)\.)*{function}\s*\(", upper)
+    broken = tuple(
+        sorted(
+            {
+                token.value
+                for token in tokens
+                if token.type == "OPERAND"
+                and token.subtype in {"ERROR", "RANGE"}
+                and "#REF!" in token.value.upper()
+            }
+        )
+    )
+    functions = {_function_name(token) for token in tokens}
+    functions.discard(None)
+    volatile = tuple(function for function in VOLATILE_FUNCTIONS if function in functions)
+    structured = any(
+        STRUCTURED_REFERENCE_RE.search(operand) and not EXTERNAL_RE.search(operand)
+        for operand in operands
+    )
+    advanced = bool(functions & ADVANCED_FUNCTIONS) or any(
+        "#" in token.value
+        for token in tokens
+        if token.type == "OPERAND" and token.subtype != "TEXT"
     )
     unsupported_reason = None
-    if STRUCTURED_REFERENCE_RE.search(formula) and not external:
+    if structured:
         unsupported_reason = "structured reference"
-    elif ADVANCED_FORMULA_RE.search(formula) or "#" in formula:
+    elif advanced:
         unsupported_reason = "dynamic or advanced formula"
     return FormulaFeatures(
         references=tuple(operands),
         external_references=external,
+        broken_references=broken,
         volatile_functions=volatile,
-        has_whole_column_reference=bool(WHOLE_COLUMN_RE.search(formula)),
+        has_whole_column_reference=any(WHOLE_COLUMN_RE.search(item) for item in operands),
         unsupported_reason=unsupported_reason,
     )
 
