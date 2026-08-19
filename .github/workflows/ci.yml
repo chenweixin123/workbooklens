@@ -52,7 +52,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --locked --python ${{ matrix.python-version }}
-      - run: uv run pytest -q
+      - run: uv run --python ${{ matrix.python-version }} python -m pytest -q
       - name: End-to-end demo
         if: matrix.os == 'ubuntu-24.04' && matrix.python-version == '3.12'
         run: |
