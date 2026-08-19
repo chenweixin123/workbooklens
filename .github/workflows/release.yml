@@ -44,7 +44,7 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run mypy src
-      - run: uv run pytest -q
+      - run: uv run python -m pytest -q
       - run: uv build --out-dir dist
       - run: uvx --from twine twine check dist/*
       - run: python scripts/check_release_artifacts.py dist --version 2.0.0
