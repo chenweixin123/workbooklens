@@ -1,18 +1,19 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
 name = "workbooklens"
-version = "0.1.0"
+version = "2.0.0"
 description = "Local-first linting, testing, semantic diffing, and safe repair for Excel workbooks"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "WorkbookLens contributors" }]
 keywords = ["excel", "xlsx", "ooxml", "lint", "spreadsheet"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Environment :: Console",
   "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
@@ -36,9 +37,12 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/workbooklens/workbooklens"
-Documentation = "https://github.com/workbooklens/workbooklens/tree/main/docs"
-Issues = "https://github.com/workbooklens/workbooklens/issues"
+Homepage = "https://github.com/chenweixin123/workbooklens"
+Documentation = "https://github.com/chenweixin123/workbooklens/tree/main/docs"
+Issues = "https://github.com/chenweixin123/workbooklens/issues"
+Changelog = "https://github.com/chenweixin123/workbooklens/blob/main/CHANGELOG.md"
+Security = "https://github.com/chenweixin123/workbooklens/security/policy"
+Source = "https://github.com/chenweixin123/workbooklens"
 
 [project.scripts]
 workbooklens = "workbooklens.cli:app"
@@ -59,12 +63,42 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/workbooklens"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+  "/.github",
+  "/docs",
+  "/scripts/action_scan.py",
+  "/scripts/check_release_artifacts.py",
+  "/src",
+  "/tests",
+  "/action.yml",
+  "/CHANGELOG.md",
+  "/CONTRIBUTING.md",
+  "/LICENSE",
+  "/pyproject.toml",
+  "/README.md",
+  "/SECURITY.md",
+  "/uv.lock",
+  "/workbooklens.example.yml",
+]
+
 [tool.hatch.build]
 exclude = [
-  ".artifacts/",
-  ".tools/",
-  "CODEX_MASTER_PROMPT.md",
-  "CODEX_REVIEW_PROMPT.md",
+  "**/.artifacts/**",
+  "**/.git/**",
+  "**/.mypy_cache/**",
+  "**/.pytest_cache/**",
+  "**/.ruff_cache/**",
+  "**/.tools/**",
+  "**/.venv*/**",
+  "**/*-venv/**",
+  "**/__pycache__/**",
+  "**/node_modules/**",
+  "**/.env*",
+  "**/*.key",
+  "**/*.p12",
+  "**/*.pem",
+  "**/*.pfx",
 ]
 
 [tool.pytest.ini_options]

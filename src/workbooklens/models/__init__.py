@@ -53,6 +53,7 @@ class CellSnapshot(StrictModel):
     formula: str | None = None
     data_type: str
     style_id: int = 0
+    style_fingerprint: str = ""
     number_format: str = "General"
     row_hidden: bool = False
     column_hidden: bool = False
@@ -145,6 +146,7 @@ class Finding(StrictModel):
     """One deterministic workbook quality finding with auditable evidence."""
 
     id: str
+    content_fingerprint: str = ""
     rule_id: str
     title: str
     explanation: str

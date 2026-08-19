@@ -28,23 +28,33 @@
     .error { background:var(--error); } .warning { background:var(--warning); }
     .info { background:var(--info); } code { overflow-wrap:anywhere; } details { margin-top:6px; }
     .privacy { border-left:4px solid var(--accent); } .hidden { display:none; }
-    .location { white-space:nowrap; } .risk { color:var(--error); }
+    .location { white-space:nowrap; } .score { color:var(--error); }
+    .policy { border-left:4px solid var(--warning); }
     @media (max-width:700px) { main { padding:16px; } th:nth-child(4),td:nth-child(4) { display:none; } }
   </style>
 </head>
 <body><main>
   <header><h1>WorkbookLens scan</h1><div class="muted">{{ source }} · SHA-256 {{ source_sha256 }}</div></header>
   <section class="grid" aria-label="Workbook summary">
-    <div class="card"><div class="muted">Risk score</div><div class="metric risk">{{ risk_score }}/100</div></div>
+    <div class="card"><div class="muted">Weighted finding score</div><div class="metric score">{{ weighted_finding_score }}</div>
+      <small class="muted">critical 35 · error 15 · warning 5 · info 1; additive, not a percentage</small></div>
     <div class="card"><div class="muted">Critical</div><div class="metric">{{ severity_counts.get('critical', 0) }}</div></div>
     <div class="card"><div class="muted">Errors</div><div class="metric">{{ severity_counts.get('error', 0) }}</div></div>
     <div class="card"><div class="muted">Warnings</div><div class="metric">{{ severity_counts.get('warning', 0) }}</div></div>
-    <div class="card"><div class="muted">Sheets</div><div class="metric">{{ sheets|length }}</div></div>
+    <div class="card"><div class="muted">Active / total</div><div class="metric">{{ policy_summary.active }} / {{ policy_summary.total }}</div></div>
   </section>
   <section class="card privacy"><strong>Local processing.</strong> WorkbookLens made no network
     request while inspecting this workbook. This report can contain workbook-derived evidence;
     whoever distributes or uploads it controls that data. Formulas, macros, links, and embedded
     objects were not executed.</section>
+  {% if baseline_path or suppressed_findings or expired_suppression_ids %}
+  <section class="card policy" style="margin-top:16px"><h2>Finding policy</h2>
+    {% if baseline_path %}<p>Baseline comparison is active{% if new_only %}; only new findings are shown and gated{% endif %}.
+      Known baseline findings: {{ policy_summary.baseline_known }} · new findings: {{ policy_summary.new }}.</p>{% endif %}
+    {% if suppressed_findings %}<p>{{ policy_summary.suppressed }} findings were suppressed by documented configuration waivers.</p>{% endif %}
+    {% if expired_suppression_ids %}<p><b>Expired suppressions ignored:</b> {{ expired_suppression_ids|join(', ') }}</p>{% endif %}
+  </section>
+  {% endif %}
   <section class="card" style="margin-top:16px"><h2>Sheet overview</h2>
     <div class="table-wrap"><table><thead><tr><th>Sheet</th><th>State</th><th>Relevant cells</th><th>Used bounds</th></tr></thead><tbody>
       {% for sheet in sheets %}<tr><td>{{ sheet.name }}</td><td>{{ sheet.state }}</td><td>{{ sheet.cells|length }}</td><td>{{ sheet.max_row }} rows × {{ sheet.max_column }} columns</td></tr>{% endfor %}
@@ -74,8 +84,26 @@
             <code>{{ patch.before }}</code> → <code>{{ patch.after }}</code></p>{% endif %}{% endfor %}
         </details></td></tr>{% endfor %}
     </tbody></table></div>
-    {% if not findings %}<p>No findings were raised by the enabled deterministic rules.</p>{% endif %}
+    {% if not findings %}
+      {% if policy_summary.total == 0 %}
+      <p>No findings were raised by the enabled deterministic rules.</p>
+      {% else %}
+      <p>No active findings remain after baseline and suppression policy. The scan still recorded
+        {{ policy_summary.baseline_known }} baseline-known and {{ policy_summary.suppressed }} suppressed findings.</p>
+      {% endif %}
+    {% endif %}
   </section>
+  {% if suppressed_findings %}
+  <section class="card" style="margin-top:16px"><h2>Suppressed findings</h2>
+    <p>Suppressed findings do not affect the active score, SARIF, or failure threshold.</p>
+    <div class="table-wrap"><table><thead><tr><th>Rule</th><th>Location</th><th>Waiver</th><th>Reason</th></tr></thead><tbody>
+      {% for item in suppressed_findings %}<tr><td><code>{{ item.finding.rule_id }}</code></td>
+        <td>{{ item.finding.sheet or 'Workbook' }}{% if item.finding.location %}!{{ item.finding.location }}{% endif %}</td>
+        <td><code>{{ item.suppression_id }}</code>{% if item.expires %}<br>expires {{ item.expires }}{% endif %}</td>
+        <td>{{ item.reason }}</td></tr>{% endfor %}
+    </tbody></table></div>
+  </section>
+  {% endif %}
   <section class="card" style="margin-top:16px"><h2>Limitations</h2><p>WorkbookLens does not calculate formulas and does not claim complete Excel compatibility.
     Cached formula values may be stale. Formula repairs remove stale cached values and request a full recalculation
     the next time the output is opened in a compatible spreadsheet application. Shared, array, data-table,

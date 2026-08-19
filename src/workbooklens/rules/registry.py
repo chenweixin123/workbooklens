@@ -41,7 +41,7 @@ class RuleRegistry:
 
 
 def default_registry() -> RuleRegistry:
-    """Construct a fresh registry containing all v0.1 built-in rules."""
+    """Construct a fresh registry containing all built-in rules."""
 
     from workbooklens.rules.builtin import BUILTIN_RULES
 

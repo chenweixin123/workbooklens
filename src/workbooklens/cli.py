@@ -16,11 +16,12 @@ from workbooklens.diff import compare_workbooks, write_diff_report
 from workbooklens.exceptions import ExitCode, UsageError, WorkbookLensError
 from workbooklens.models import SEVERITY_RANK, Severity
 from workbooklens.ooxml.safety import PackageLimits
+from workbooklens.policy import apply_finding_policy, load_baseline, source_scope_for_path
 from workbooklens.repair import apply_patch_plan, build_patch_plan
 from workbooklens.repair.planning import load_patch_plan, write_patch_plan
 from workbooklens.reports import write_scan_report
 from workbooklens.scanner import scan_workbook
-from workbooklens.testing import evaluate_workbook_tests, load_test_config
+from workbooklens.testing import TestConfig, evaluate_workbook_tests, load_test_config
 from workbooklens.utils import write_json
 from workbooklens.web import create_app
 
@@ -77,12 +78,31 @@ def _optional_config(path: Path | None) -> dict[str, Any]:
     return load_test_config(path).model_dump(mode="python")
 
 
+def _optional_test_config(path: Path | None) -> TestConfig | None:
+    return load_test_config(path) if path is not None else None
+
+
 @app.command()
 def scan(
     input_workbook: Path = typer.Argument(..., metavar="INPUT.xlsx", help="Workbook to inspect."),
     out: Path = typer.Option(..., "--out", help="Directory for HTML, JSON, snapshot, and SARIF."),
     config: Path | None = typer.Option(
         None, "--config", help="Optional workbooklens YAML configuration."
+    ),
+    baseline: Path | None = typer.Option(
+        None,
+        "--baseline",
+        help="Previous findings.json or a JSON finding-ID baseline.",
+    ),
+    new_only: bool = typer.Option(
+        False,
+        "--new-only",
+        help="Report and gate only unsuppressed findings absent from --baseline.",
+    ),
+    source_scope: str | None = typer.Option(
+        None,
+        "--source-scope",
+        help="Portable logical workbook path for scoped baselines and SARIF; defaults to cwd-relative.",
     ),
     fail_on: Severity | None = typer.Option(
         None,
@@ -95,18 +115,42 @@ def scan(
     """Scan a workbook and emit a self-contained report, findings JSON, snapshot, and SARIF."""
 
     try:
+        if new_only and baseline is None:
+            raise UsageError("--new-only requires --baseline")
+        configuration = _optional_test_config(config)
         result = scan_workbook(
             input_workbook,
-            config=_optional_config(config),
+            config=configuration.model_dump(mode="python") if configuration else {},
             limits=_limits(max_file_mb),
         )
-        paths = write_scan_report(result, out)
+        logical_source = source_scope_for_path(input_workbook, explicit=source_scope)
+        baseline_ids = (
+            load_baseline(baseline, expected_source_scope=logical_source)
+            if baseline is not None
+            else frozenset()
+        )
+        policy = apply_finding_policy(
+            result.findings,
+            suppressions=configuration.suppressions if configuration else [],
+            baseline_ids=baseline_ids,
+            baseline_path=baseline,
+            source_scope=logical_source,
+            new_only=new_only,
+        )
+        paths = write_scan_report(result, out, policy=policy)
         console.print(
-            f"[green]Scanned[/green] {input_workbook}: {len(result.findings)} findings; "
+            f"[green]Scanned[/green] {input_workbook}: {len(policy.active_findings)} active, "
+            f"{len(policy.suppressed_findings)} suppressed, {len(policy.new_findings)} new; "
             f"report [link=file://{paths['html'].resolve()}]{paths['html']}[/link]"
         )
+        if policy.expired_suppression_ids:
+            console.print(
+                "[yellow]Expired suppressions ignored:[/yellow] "
+                + ", ".join(policy.expired_suppression_ids)
+            )
         if fail_on is not None and any(
-            SEVERITY_RANK[finding.severity] >= SEVERITY_RANK[fail_on] for finding in result.findings
+            SEVERITY_RANK[finding.severity] >= SEVERITY_RANK[fail_on]
+            for finding in policy.active_findings
         ):
             raise typer.Exit(ExitCode.FINDINGS_OR_ASSERTIONS)
     except typer.Exit:
@@ -130,7 +174,7 @@ def plan(
 
     try:
         if input_workbook.suffix.lower() == ".xlsm":
-            raise UsageError(".xlsm is scan/diff/test read-only in v0.1; no repair plan is created")
+            raise UsageError(".xlsm inputs are read-only; no repair plan is created")
         result = scan_workbook(
             input_workbook,
             config=_optional_config(config),
@@ -223,7 +267,7 @@ def diff(
 @app.command(name="test")
 def test_workbook(
     input_workbook: Path = typer.Argument(..., metavar="INPUT.xlsx"),
-    config: Path = typer.Option(..., "--config", help="Version-1 workbooklens YAML assertions."),
+    config: Path = typer.Option(..., "--config", help="Version-1 or version-2 WorkbookLens YAML."),
     out: Path | None = typer.Option(None, "--out", help="Optional JSON assertion report."),
     max_file_mb: int = typer.Option(100, min=1, help="Maximum compressed input size."),
 ) -> None:
@@ -243,12 +287,29 @@ def test_workbook(
                 result.message,
             )
         console.print(table)
+        if run.policy.suppressed_findings:
+            console.print(
+                f"[yellow]{len(run.policy.suppressed_findings)} findings suppressed by "
+                "documented waivers.[/yellow]"
+            )
+        if run.policy.expired_suppression_ids:
+            console.print(
+                "[yellow]Expired suppressions ignored:[/yellow] "
+                + ", ".join(run.policy.expired_suppression_ids)
+            )
         if out is not None:
             write_json(
                 out,
                 {
                     "passed": run.passed,
                     "results": [result.model_dump(mode="json") for result in run.results],
+                    "finding_policy": {
+                        "summary": run.policy.summary,
+                        "suppressed_findings": [
+                            item.model_dump() for item in run.policy.suppressed_findings
+                        ],
+                        "expired_suppression_ids": list(run.policy.expired_suppression_ids),
+                    },
                 },
             )
         if not run.passed:

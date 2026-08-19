@@ -1,21 +1,37 @@
-name: WorkbookLens scan
-description: Scan changed .xlsx files locally and upload self-contained reports
-author: WorkbookLens contributors
+name: WorkbookLens quality gate
+description: Scan or test changed .xlsx/.xlsm workbooks and upload local reports
+author: chenweixin123
 inputs:
+  mode:
+    description: Run scan findings or YAML workbook tests (scan or test)
+    required: false
+    default: scan
   path:
-    description: Repository subdirectory to scan
+    description: Repository subdirectory containing workbooks
     required: false
     default: .
   base-sha:
-    description: Base commit for changed-file detection; leave empty to scan tracked .xlsx files
+    description: Base commit for changed-file detection; empty scans all tracked workbooks
     required: false
     default: ""
   head-sha:
     description: Head commit for changed-file detection
     required: false
     default: HEAD
+  config:
+    description: Optional repository-relative WorkbookLens YAML config; required in test mode
+    required: false
+    default: ""
+  baseline:
+    description: Optional scoped findings.json or aggregate workbook baseline JSON for scan mode
+    required: false
+    default: ""
+  new-only:
+    description: With a baseline, report and gate only findings not already known
+    required: false
+    default: "false"
   fail-on:
-    description: Minimum finding severity that fails the action
+    description: Minimum active finding severity that fails scan mode
     required: false
     default: error
   output:
@@ -23,16 +39,19 @@ inputs:
     required: false
     default: .workbooklens-reports
   upload-sarif:
-    description: Upload SARIF to GitHub code scanning; requires security-events write permission
+    description: Upload scan SARIF to code scanning; requires security-events write permission
     required: false
     default: "false"
 outputs:
   report-path:
-    description: Directory containing generated reports
-    value: ${{ steps.scan.outputs.report-path }}
+    description: Absolute directory containing the manifest and per-workbook reports
+    value: ${{ steps.run.outputs.report-path }}
   file-count:
-    description: Number of changed .xlsx files scanned
-    value: ${{ steps.scan.outputs.file-count }}
+    description: Number of changed .xlsx/.xlsm files processed
+    value: ${{ steps.run.outputs.file-count }}
+  exit-code:
+    description: Aggregated WorkbookLens exit code
+    value: ${{ steps.run.outputs.exit-code }}
 runs:
   using: composite
   steps:
@@ -40,32 +59,51 @@ runs:
       uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       with:
         enable-cache: true
-    - name: Scan changed workbooks
-      id: scan
+    - name: Run WorkbookLens
+      id: run
       shell: bash
       env:
+        WORKBOOKLENS_MODE: ${{ inputs.mode }}
         WORKBOOKLENS_SCAN_PATH: ${{ inputs.path }}
         WORKBOOKLENS_BASE_SHA: ${{ inputs.base-sha }}
         WORKBOOKLENS_HEAD_SHA: ${{ inputs.head-sha }}
+        WORKBOOKLENS_CONFIG: ${{ inputs.config }}
+        WORKBOOKLENS_BASELINE: ${{ inputs.baseline }}
+        WORKBOOKLENS_NEW_ONLY: ${{ inputs.new-only }}
         WORKBOOKLENS_FAIL_ON: ${{ inputs.fail-on }}
         WORKBOOKLENS_OUTPUT: ${{ inputs.output }}
       run: >-
         uv run --project "$GITHUB_ACTION_PATH" --locked --no-dev
         python "$GITHUB_ACTION_PATH/scripts/action_scan.py"
     - name: Upload WorkbookLens reports
-      if: always()
+      if: always() && steps.run.outputs.report-path != ''
       uses: actions/upload-artifact@v7
       with:
         name: workbooklens-reports-${{ github.run_id }}-${{ github.job }}
-        path: ${{ steps.scan.outputs.report-path }}
+        path: ${{ steps.run.outputs.report-path }}
+        include-hidden-files: true
         if-no-files-found: error
+        retention-days: 14
     - name: Upload SARIF to code scanning
-      if: inputs.upload-sarif == 'true' && steps.scan.outputs.file-count != '0'
+      if: >-
+        inputs.mode == 'scan' &&
+        inputs.upload-sarif == 'true' &&
+        steps.run.outputs.file-count != '0'
       uses: github/codeql-action/upload-sarif@v4
       with:
-        sarif_file: ${{ steps.scan.outputs.report-path }}
+        sarif_file: ${{ steps.run.outputs.report-path }}
         category: workbooklens
-    - name: Enforce finding threshold
+    - name: Enforce WorkbookLens result
       if: always()
       shell: bash
-      run: exit "${{ steps.scan.outputs.exit-code }}"
+      env:
+        WORKBOOKLENS_EXIT_CODE: ${{ steps.run.outputs.exit-code }}
+      run: |
+        if [[ -z "$WORKBOOKLENS_EXIT_CODE" ]]; then
+          echo "WorkbookLens did not produce an exit code." >&2
+          exit 10
+        fi
+        exit "$WORKBOOKLENS_EXIT_CODE"
+branding:
+  icon: eye
+  color: blue

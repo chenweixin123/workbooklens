@@ -129,13 +129,14 @@ def test_selection_and_output_safety_fail_closed(tmp_path: Path) -> None:
     generate_demo_workbook(source)
     plan = _plan(source)
     with pytest.raises(UsageError, match="Select at least one"):
-        patch_ooxml_package(source, plan, tmp_path / "none.xlsx")
+        patch_ooxml_package(source, plan, tmp_path / "none.xlsx", canonical_plan=plan)
     with pytest.raises(UsageError, match="Unknown patch IDs"):
         patch_ooxml_package(
             source,
             plan,
             tmp_path / "unknown.xlsx",
             selected_ids={"patch-does-not-exist"},
+            canonical_plan=plan,
         )
     with pytest.raises(UsageError, match="mutually exclusive"):
         patch_ooxml_package(
@@ -144,14 +145,15 @@ def test_selection_and_output_safety_fail_closed(tmp_path: Path) -> None:
             tmp_path / "conflicting-selection.xlsx",
             selected_ids={plan.patches[0].id},
             safe_only=True,
+            canonical_plan=plan,
         )
     existing = tmp_path / "existing.xlsx"
     existing.write_bytes(b"do not overwrite")
     with pytest.raises(UsageError, match="already exists"):
-        patch_ooxml_package(source, plan, existing, safe_only=True)
+        patch_ooxml_package(source, plan, existing, safe_only=True, canonical_plan=plan)
     assert existing.read_bytes() == b"do not overwrite"
     with pytest.raises(UsageError, match="source workbook is never overwritten"):
-        patch_ooxml_package(source, plan, source, safe_only=True)
+        patch_ooxml_package(source, plan, source, safe_only=True, canonical_plan=plan)
 
 
 def test_patch_plan_input_is_size_bounded(tmp_path: Path) -> None:
@@ -281,7 +283,13 @@ def test_xlsm_remains_read_only(tmp_path: Path) -> None:
     assert not any(finding.safe_patch_available for finding in scan.findings)
     plan = build_patch_plan(scan)
     with pytest.raises(UsageError, match="read-only"):
-        patch_ooxml_package(xlsm, plan, tmp_path / "fixed.xlsx", safe_only=True)
+        patch_ooxml_package(
+            xlsm,
+            plan,
+            tmp_path / "fixed.xlsx",
+            safe_only=True,
+            canonical_plan=plan,
+        )
 
 
 def test_repair_package_never_calls_openpyxl_save() -> None:

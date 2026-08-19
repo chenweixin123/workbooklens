@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import shutil
 import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from jinja2 import Environment, select_autoescape
 from starlette.concurrency import run_in_threadpool
 
@@ -45,6 +46,7 @@ RESULT_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <section><h2>All findings ({{ findings|length }})</h2>{% for finding in findings %}<article class="card finding {{ finding.severity.value }}"><b>{{ finding.severity.value|upper }} · {{ finding.rule_id }} · {{ finding.sheet or 'Workbook' }}{% if finding.location %}!{{ finding.location }}{% endif %}</b><h3>{{ finding.title }}</h3><p>{{ finding.explanation }}</p><details><summary>Evidence</summary><p>{{ finding.evidence.summary }}</p><code>{{ finding.evidence.observed }}</code></details></article>{% endfor %}{% if not findings %}<div class="card">No findings.</div>{% endif %}</section></main></body></html>"""
 
 APPLIED_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WorkbookLens repair complete</title><style>:root{color-scheme:light dark;--bg:#f5f7fb;--card:#fff;--ink:#172033;--line:#dce3ee;--accent:#3157d5}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 Arial,sans-serif}main{max-width:850px;margin:auto;padding:32px}.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;margin:16px 0}.button{display:inline-block;background:var(--accent);color:white;border-radius:8px;padding:10px 15px;text-decoration:none;font-weight:700;margin:5px}</style></head><body><main><h1>Validated copy created</h1><section class="card"><p>Applied {{ result.applied_patch_ids|length }} reviewed patches. The source hash remained {{ result.source_sha256 }}.</p><p>{{ result.resolved_finding_ids|length }} findings resolved; {{ result.new_finding_ids|length }} new informational/warning findings.</p>{% for message in result.validation_messages %}<p>✓ {{ message }}</p>{% endfor %}</section><div><a class="button" href="/sessions/{{ session_id }}/fixed">Download fixed workbook</a><a class="button" href="/sessions/{{ session_id }}/diff">Preview semantic diff</a><a class="button" href="/sessions/{{ session_id }}/apply-report">Download apply report</a></div></main></body></html>"""
+ERROR_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WorkbookLens could not continue</title><style>:root{color-scheme:light dark;--bg:#f5f7fb;--card:#fff;--ink:#172033;--line:#dce3ee;--accent:#3157d5;--error:#c24135}@media(prefers-color-scheme:dark){:root{--bg:#10131a;--card:#181d27;--ink:#edf2f7;--line:#303849;--accent:#8da2ff}}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 Arial,sans-serif}main{max-width:760px;margin:auto;padding:32px}.card{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--error);border-radius:12px;padding:20px;margin:16px 0}.button{display:inline-block;background:var(--accent);color:white;border-radius:8px;padding:10px 15px;text-decoration:none;font-weight:700}</style></head><body><main><h1>WorkbookLens could not continue</h1><section class="card"><p>{{ message }}</p><p>The source workbook was not modified.</p></section><a class="button" href="/">Choose another workbook</a></main></body></html>"""
 
 
 @dataclass(slots=True)
@@ -102,9 +104,17 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
     )
     environment = _environment()
 
+    def error_page(message: str, status_code: int) -> HTMLResponse:
+        html = environment.from_string(ERROR_TEMPLATE).render(message=message)
+        return HTMLResponse(html, status_code=status_code)
+
     @app.exception_handler(WorkbookLensError)
-    async def workbook_error(_request: Request, exc: WorkbookLensError) -> JSONResponse:
-        return JSONResponse(status_code=400, content={"error": str(exc)})
+    async def workbook_error(_request: Request, exc: WorkbookLensError) -> HTMLResponse:
+        return error_page(str(exc), 400)
+
+    @app.exception_handler(HTTPException)
+    async def http_error(_request: Request, exc: HTTPException) -> HTMLResponse:
+        return error_page(str(exc.detail), exc.status_code)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -137,7 +147,7 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
             plan_path = session_root / "repair-plan.json"
             write_patch_plan(plan_path, plan)
         except BaseException:
-            source.unlink(missing_ok=True)
+            shutil.rmtree(session_root, ignore_errors=True)
             raise
         sessions[session_id] = WebSession(
             session_id=session_id,
@@ -166,7 +176,10 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
     async def report(session_id: str) -> FileResponse:
         session = session_or_404(session_id)
         return FileResponse(
-            session.report, media_type="text/html", filename="workbooklens-report.html"
+            session.report,
+            media_type="text/html",
+            filename="workbooklens-report.html",
+            content_disposition_type="inline",
         )
 
     @app.get("/sessions/{session_id}/plan")
@@ -223,7 +236,12 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
         session = session_or_404(session_id)
         if session.diff is None:
             raise HTTPException(status_code=404, detail="No semantic diff has been created")
-        return FileResponse(session.diff, media_type="text/html", filename="workbooklens-diff.html")
+        return FileResponse(
+            session.diff,
+            media_type="text/html",
+            filename="workbooklens-diff.html",
+            content_disposition_type="inline",
+        )
 
     @app.get("/sessions/{session_id}/apply-report")
     async def apply_report(session_id: str) -> FileResponse:

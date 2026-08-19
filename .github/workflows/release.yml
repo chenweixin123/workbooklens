@@ -1,0 +1,60 @@
+name: Release candidate
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'chenweixin123/workbooklens'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - name: Validate tag and project version
+        if: github.ref_type == 'tag'
+        shell: python
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          import os
+          import pathlib
+          import tomllib
+
+          tag = os.environ["RELEASE_TAG"]
+          version = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          if tag != f"v{version}":
+              raise SystemExit(f"tag {tag!r} does not match project version {version!r}")
+      - run: uv sync --locked --python 3.12
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy src
+      - run: uv run pytest -q
+      - run: uv build --out-dir dist
+      - run: uvx --from twine twine check dist/*
+      - run: python scripts/check_release_artifacts.py dist --version 2.0.0
+      - name: Create checksums
+        run: sha256sum dist/* > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workbooklens-release-candidate-${{ github.ref_name }}
+          path: |
+            dist
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30

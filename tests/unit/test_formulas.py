@@ -48,6 +48,27 @@ def test_formula_features_are_nonexecuting_and_explicit() -> None:
     assert features.external_references == ("'[Book.xlsx]S'!C1",)
 
 
+def test_formula_features_ignore_constructs_inside_string_literals() -> None:
+    features = analyze_formula('="#REF! NOW() Table1[Amount] [Book.xlsx]S!A1 B:B"')
+    assert not features.broken_references
+    assert not features.volatile_functions
+    assert not features.external_references
+    assert not features.has_whole_column_reference
+    assert features.unsupported_reason is None
+
+
+def test_formula_features_retain_real_token_detection() -> None:
+    features = analyze_formula("=#REF!+NOW()+SUM(B:B)+SUM(Table1[Amount])")
+    assert features.broken_references == ("#REF!",)
+    assert features.volatile_functions == ("NOW",)
+    assert features.has_whole_column_reference
+    assert features.unsupported_reason == "structured reference"
+
+
+def test_string_only_structured_reference_can_be_translated() -> None:
+    assert translate_formula('="Table1[Amount]"', "A1", "B2") == '="Table1[Amount]"'
+
+
 def test_normalize_rejects_non_formula() -> None:
     with pytest.raises(ValueError, match="beginning"):
         normalize_formula("A1", "B2")

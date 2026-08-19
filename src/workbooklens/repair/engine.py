@@ -9,6 +9,7 @@ from workbooklens.exceptions import PatchValidationError
 from workbooklens.models import PatchPlan, PatchResult, Severity
 from workbooklens.ooxml.safety import PackageLimits
 from workbooklens.repair.ooxml_patch import patch_ooxml_package
+from workbooklens.repair.planning import build_patch_plan
 from workbooklens.scanner import scan_workbook
 
 
@@ -25,6 +26,7 @@ def apply_patch_plan(
     """Apply, reopen, rescan, compare findings, and delete invalid output."""
 
     before_scan = scan_workbook(source, config=config, limits=limits)
+    canonical_plan = build_patch_plan(before_scan)
     low_level, selected = patch_ooxml_package(
         source,
         plan,
@@ -32,6 +34,7 @@ def apply_patch_plan(
         selected_ids=selected_ids,
         safe_only=safe_only,
         limits=limits,
+        canonical_plan=canonical_plan,
     )
     try:
         after_scan = scan_workbook(output, config=config, limits=limits)

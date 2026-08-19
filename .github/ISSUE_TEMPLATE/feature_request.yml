@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a deterministic rule, workflow, format, or compatibility improvement.
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and user workflow
+    validations:
+      required: true
+  - type: textarea
+    id: invariant
+    attributes:
+      label: Proposed invariant or behavior
+      description: Explain evidence, ambiguity, false-positive risks, and whether this is report-only.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance and verification
+      description: Describe fixtures, edge cases, preservation checks, and platform expectations.
+    validations:
+      required: true

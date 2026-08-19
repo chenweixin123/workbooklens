@@ -209,6 +209,40 @@ def test_config_is_size_bounded_and_safe_loaded(tmp_path: Path) -> None:
         load_test_config(deeply_nested)
 
 
+def test_suppressed_findings_remain_auditable_in_test_run(tmp_path: Path) -> None:
+    workbook_path = tmp_path / "broken.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet.title = "Data"
+    sheet["A1"] = "=#REF!+1"
+    workbook.save(workbook_path)
+    workbook.close()
+    config_path = tmp_path / "workbooklens.yml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 2,
+                "workbook": {"max_error_findings": 0},
+                "suppressions": [
+                    {
+                        "id": "accepted-fixture",
+                        "reason": "Synthetic fixture is intentionally broken",
+                        "rules": ["WL001_BROKEN_REFERENCE"],
+                        "sheets": ["Data"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    run = evaluate_workbook_tests(workbook_path, load_test_config(config_path))
+    assert run.passed
+    assert run.policy.summary["suppressed"] == 1
+    assert run.policy.suppressed_findings[0].suppression_id == "accepted-fixture"
+
+
 def test_explicit_range_limit_fails_assertion_clearly(tmp_path: Path) -> None:
     workbook = tmp_path / "assertions.xlsx"
     config_path = tmp_path / "workbooklens.yml"

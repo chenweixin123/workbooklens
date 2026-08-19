@@ -9,7 +9,8 @@ from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from workbooklens.demo.workflow import generate_demo_workbook
-from workbooklens.diff import compare_workbooks, write_diff_report
+from workbooklens.diff import compare_snapshots, compare_workbooks, write_diff_report
+from workbooklens.models import CellSnapshot, SheetSnapshot, WorkbookSnapshot
 from workbooklens.reports import write_scan_report
 from workbooklens.reports.scan import build_sarif
 from workbooklens.scanner import scan_workbook
@@ -79,6 +80,96 @@ def test_semantic_diff_covers_cell_and_structure_changes(tmp_path: Path) -> None
     assert formula_change.before_signature != formula_change.after_signature
 
 
+def test_semantic_diff_is_value_type_sensitive(tmp_path: Path) -> None:
+    before = Workbook()
+    before.active["A1"] = 1
+    before_path = tmp_path / "integer.xlsx"
+    before.save(before_path)
+    before.close()
+
+    after = Workbook()
+    after.active["A1"] = True
+    after_path = tmp_path / "boolean.xlsx"
+    after.save(after_path)
+    after.close()
+
+    changes = compare_workbooks(before_path, after_path).cell_changes
+    value_change = next(change for change in changes if change.change_type == "value")
+    assert type(value_change.before) is int
+    assert type(value_change.after) is bool
+
+
+def test_semantic_diff_uses_style_fingerprint_not_workbook_style_id(tmp_path: Path) -> None:
+    before = Workbook()
+    before.active["A1"] = "same"
+    before.active["A1"].fill = PatternFill("solid", fgColor="FFFF0000")
+    before_path = tmp_path / "red.xlsx"
+    before.save(before_path)
+    before.close()
+
+    after = Workbook()
+    after.active["A1"] = "same"
+    after.active["A1"].fill = PatternFill("solid", fgColor="FF0000FF")
+    after_path = tmp_path / "blue.xlsx"
+    after.save(after_path)
+    after.close()
+
+    changes = compare_workbooks(before_path, after_path).cell_changes
+    style_change = next(change for change in changes if change.change_type == "style")
+    assert style_change.before != style_change.after
+
+
+def _snapshot_with_sheets(*sheets: SheetSnapshot, source: str) -> WorkbookSnapshot:
+    return WorkbookSnapshot(
+        source_name=f"{source}.xlsx",
+        source_sha256=source,
+        format="xlsx",
+        sheets=list(sheets),
+    )
+
+
+def _sheet(
+    name: str, index: int, *, style_id: int = 0, style_fingerprint: str = "default"
+) -> SheetSnapshot:
+    return SheetSnapshot(
+        name=name,
+        index=index,
+        state="visible",
+        max_row=1,
+        max_column=1,
+        cells={
+            "A1": CellSnapshot(
+                coordinate="A1",
+                value="same",
+                data_type="s",
+                style_id=style_id,
+                style_fingerprint=style_fingerprint,
+            )
+        },
+    )
+
+
+def test_style_id_difference_alone_is_not_a_semantic_change() -> None:
+    before = _snapshot_with_sheets(
+        _sheet("Data", 0, style_id=1, style_fingerprint="same"), source="a"
+    )
+    after = _snapshot_with_sheets(
+        _sheet("Data", 0, style_id=99, style_fingerprint="same"), source="b"
+    )
+
+    assert not compare_snapshots(before, after).cell_changes
+
+
+def test_ambiguous_sheet_rename_degrades_to_add_and_remove() -> None:
+    before = _snapshot_with_sheets(_sheet("Old A", 0), _sheet("Old B", 1), source="a")
+    after = _snapshot_with_sheets(_sheet("New", 0), source="b")
+
+    changes = compare_snapshots(before, after).structural_changes
+    assert not any(change.change_type == "sheet_renamed" for change in changes)
+    assert [change.change_type for change in changes].count("sheet_removed") == 2
+    assert [change.change_type for change in changes].count("sheet_added") == 1
+
+
 def test_diff_report_is_self_contained_and_has_json_twin(tmp_path: Path) -> None:
     before, after = _diff_workbooks(tmp_path)
     diff = compare_workbooks(before, after)
@@ -98,7 +189,7 @@ def test_scan_report_and_sarif_handle_multi_cell_locations(tmp_path: Path) -> No
         workbook,
         config={"keys": [{"sheet": "Sales", "range": "A2:A22"}]},
     )
-    sarif = build_sarif(scan)
+    sarif = build_sarif(scan, source_uri="models/demo.xlsx")
     duplicate = next(
         finding for finding in scan.findings if finding.rule_id == "WL012_DUPLICATE_CONFIGURED_KEY"
     )
@@ -109,6 +200,10 @@ def test_scan_report_and_sarif_handle_multi_cell_locations(tmp_path: Path) -> No
         if result["ruleId"] == "WL012_DUPLICATE_CONFIGURED_KEY"
     )
     assert "region" not in sarif_result["locations"][0]["physicalLocation"]
+    assert sarif_result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == (
+        "models/demo.xlsx"
+    )
+    assert sarif["runs"][0]["automationDetails"]["id"] == "workbooklens/models/demo.xlsx"
     paths = write_scan_report(scan, tmp_path / "report")
     html = paths["html"].read_text(encoding="utf-8")
     findings = json.loads(paths["findings"].read_text(encoding="utf-8"))

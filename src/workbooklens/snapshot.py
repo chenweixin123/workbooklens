@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -53,11 +54,65 @@ def cell_fingerprint(cell: Cell) -> str:
     return sha256_bytes(stable_json_bytes(cell_semantic_payload(cell)))
 
 
+def _xml_component_payload(component: Any) -> dict[str, Any]:
+    """Return a deterministic, workbook-local-ID-free style component tree."""
+
+    element = component.to_tree()
+
+    def normalize(node: Any) -> dict[str, Any]:
+        return {
+            "tag": str(node.tag),
+            "attributes": dict(
+                sorted((str(key), str(value)) for key, value in node.attrib.items())
+            ),
+            "text": node.text or "",
+            "children": [normalize(child) for child in node],
+        }
+
+    return normalize(element)
+
+
+def _style_payload(cell: Cell) -> dict[str, Any]:
+    """Describe effective non-number-format styling without using ``style_id``."""
+
+    return {
+        "font": _xml_component_payload(cell.font),
+        "fill": _xml_component_payload(cell.fill),
+        "border": _xml_component_payload(cell.border),
+        "alignment": _xml_component_payload(cell.alignment),
+        "protection": _xml_component_payload(cell.protection),
+        "quote_prefix": bool(cell.quotePrefix),
+        "pivot_button": bool(cell.pivotButton),
+    }
+
+
+@lru_cache(maxsize=1)
+def _default_style_payload() -> dict[str, Any]:
+    workbook = Workbook()
+    try:
+        worksheet = workbook.active
+        if worksheet is None:  # pragma: no cover - openpyxl always creates an active sheet
+            raise RuntimeError("new workbook has no active worksheet")
+        return _style_payload(worksheet["A1"])
+    finally:
+        workbook.close()
+
+
+def style_fingerprint(cell: Cell) -> str:
+    """Hash effective visual/protection styling independently of workbook style-table IDs."""
+
+    payload = _style_payload(cell)
+    if payload == _default_style_payload():
+        return "default"
+    return sha256_bytes(stable_json_bytes(payload))
+
+
 def _snapshot_cell(cell: Cell, worksheet: Worksheet) -> CellSnapshot:
     payload = cell_semantic_payload(cell)
     column_letter = cell.column_letter
     return CellSnapshot(
         **payload,
+        style_fingerprint=style_fingerprint(cell),
         row_hidden=bool(worksheet.row_dimensions[cell.row].hidden),
         column_hidden=bool(worksheet.column_dimensions[column_letter].hidden),
     )

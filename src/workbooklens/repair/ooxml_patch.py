@@ -38,6 +38,14 @@ class OoxmlPatchOutput:
     formula_changed: bool
 
 
+CANONICAL_PLAN_MISMATCH = (
+    "Patch plan does not match the canonical scan: an operation intersects an unsupported "
+    "shared formula range, uses an unsupported array or unsupported dataTable formula, or "
+    "contains edited structured or ordinary formula, safe, confidence, kind, source-cell, "
+    "description, or precondition fields"
+)
+
+
 def _qname(namespace: str, local_name: str) -> str:
     return f"{{{namespace}}}{local_name}"
 
@@ -206,7 +214,7 @@ def _set_formula(cell: etree._Element, formula: str) -> None:
     features = analyze_formula(formula)
     if features.external_references or features.unsupported_reason:
         raise PatchValidationError(
-            "External, structured, dynamic, spilled, or advanced formulas are not patchable in v0.1"
+            "External, structured, dynamic, spilled, or advanced formulas are not patchable in 2.0"
         )
     namespace = _element_namespace(cell)
     _remove_value_children(cell)
@@ -290,13 +298,18 @@ def _mark_full_recalculation(workbook_xml: bytes) -> bytes:
     return _serialize_xml(root)
 
 
-def _verify_preconditions(source: Path, plan: PatchPlan, selected: list[PatchOperation]) -> None:
+def _verify_preconditions(
+    source: Path,
+    plan: PatchPlan,
+    selected: list[PatchOperation],
+    limits: PackageLimits | None,
+) -> None:
     actual_hash = sha256_file(source)
     if actual_hash != plan.source_sha256:
         raise StalePlanError(
             f"Plan source hash {plan.source_sha256} does not match workbook hash {actual_hash}"
         )
-    workbook = load_for_analysis(source)
+    workbook = load_for_analysis(source, limits)
     try:
         for patch in selected:
             if patch.sheet not in workbook.sheetnames:
@@ -316,7 +329,11 @@ def _verify_preconditions(source: Path, plan: PatchPlan, selected: list[PatchOpe
 
 
 def _select_patches(
-    plan: PatchPlan, selected_ids: set[str] | None, safe_only: bool
+    plan: PatchPlan,
+    selected_ids: set[str] | None,
+    safe_only: bool,
+    *,
+    enforce_safety: bool = True,
 ) -> list[PatchOperation]:
     by_id = {patch.id: patch for patch in plan.patches}
     if len(by_id) != len(plan.patches):
@@ -336,12 +353,38 @@ def _select_patches(
         selected = [by_id[patch_id] for patch_id in sorted(selected_ids)]
     if not selected:
         raise UsageError("No eligible patches were selected")
-    unsafe = [patch.id for patch in selected if not patch.safe or float(patch.confidence) < 0.95]
-    if unsafe:
-        raise UsageError(
-            "WorkbookLens v0.1 refuses patches below the safe 0.95 threshold: " + ", ".join(unsafe)
-        )
+    if enforce_safety:
+        unsafe = [
+            patch.id for patch in selected if not patch.safe or float(patch.confidence) < 0.95
+        ]
+        if unsafe:
+            raise UsageError(
+                "WorkbookLens 2.0 refuses patches below the safe 0.95 threshold: "
+                + ", ".join(unsafe)
+            )
     return selected
+
+
+def _validate_canonical_plan(plan: PatchPlan, canonical_plan: PatchPlan) -> None:
+    """Reject any serialized repair authority not reproduced by the current scan."""
+
+    if (
+        plan.schema_version != canonical_plan.schema_version
+        or plan.tool_version != canonical_plan.tool_version
+        or plan.source_name != canonical_plan.source_name
+        or plan.source_sha256 != canonical_plan.source_sha256
+    ):
+        raise PatchValidationError(CANONICAL_PLAN_MISMATCH)
+
+    incoming = {patch.id: patch for patch in plan.patches}
+    canonical = {patch.id: patch for patch in canonical_plan.patches}
+    if len(incoming) != len(plan.patches) or len(canonical) != len(canonical_plan.patches):
+        raise PatchValidationError(CANONICAL_PLAN_MISMATCH)
+    if incoming.keys() != canonical.keys():
+        raise PatchValidationError(CANONICAL_PLAN_MISMATCH)
+    for patch_id, patch in incoming.items():
+        if patch.model_dump(mode="json") != canonical[patch_id].model_dump(mode="json"):
+            raise PatchValidationError(CANONICAL_PLAN_MISMATCH)
 
 
 def _apply_to_parts(
@@ -523,15 +566,17 @@ def patch_ooxml_package(
     selected_ids: set[str] | None = None,
     safe_only: bool = False,
     limits: PackageLimits | None = None,
+    canonical_plan: PatchPlan,
 ) -> tuple[OoxmlPatchOutput, list[PatchOperation]]:
     """Apply selected safe patches through XML only and validate the resulting package."""
 
     source = source.expanduser().resolve()
     output = output.expanduser().resolve()
-    inspect_package(source, limits)
-    if source.suffix.lower() == ".xlsm":
+    inspection = inspect_package(source, limits)
+    if not inspection.repairable:
         raise UsageError(
-            ".xlsm is read-only in v0.1 so VBA and unknown macro parts cannot be rewritten"
+            "This workbook package is read-only for repair because its extension, "
+            "declared content type, or VBA parts are not a verified plain .xlsx match"
         )
     if output.suffix.lower() != ".xlsx":
         raise UsageError("Repair output must use the .xlsx extension")
@@ -540,8 +585,10 @@ def patch_ooxml_package(
     if output.exists():
         raise UsageError(f"Output already exists and will not be overwritten: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
-    selected = _select_patches(plan, selected_ids, safe_only)
-    _verify_preconditions(source, plan, selected)
+    selected = _select_patches(plan, selected_ids, safe_only, enforce_safety=False)
+    _verify_preconditions(source, plan, selected, limits)
+    _validate_canonical_plan(plan, canonical_plan)
+    selected = _select_patches(canonical_plan, selected_ids, safe_only)
     source_hash = sha256_file(source)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{output.stem}.", suffix=".xlsx", dir=output.parent
