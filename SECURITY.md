@@ -1,38 +1,55 @@
 # Security policy
 
-Workbook files are untrusted ZIP/XML inputs. Security reports about package parsing, resource
-exhaustion, path/relationship handling, temporary files, output preservation, or the local web UI
-are especially important.
+Workbook files are untrusted ZIP/XML inputs. Reports about package parsing, resource exhaustion,
+path or relationship handling, temporary files, output preservation, dependencies, GitHub Action
+behavior, or the local web UI are especially important.
 
-## Reporting
+## Report privately
 
-Use GitHub's private vulnerability-reporting form for the repository. Do not open a public issue
-until maintainers have coordinated a fix. Include:
+Use the repository's
+[private vulnerability reporting form](https://github.com/chenweixin123/workbooklens/security/advisories/new).
+Do not disclose exploit details or attach a sensitive workbook to a public issue.
+
+If GitHub private reporting is unavailable, open a minimal
+[public issue](https://github.com/chenweixin123/workbooklens/issues/new) that says only that you
+need a private security contact and identifies the affected version. Do not include the
+vulnerability, proof of concept, workbook-derived logs, or credentials. Maintainers can then
+coordinate a private GitHub Security Advisory.
+
+Include privately:
 
 - affected WorkbookLens version or commit;
 - operating system and Python version;
-- exact command and observed behavior/resource use;
+- exact command and observed behavior or resource use;
 - a minimized synthetic reproducer when safe;
-- whether the workbook contains macros, external links, embedded objects, or malformed ZIP/XML.
+- whether macros, external links, embedded objects, malformed ZIP/XML, or the GitHub Action are
+  involved.
 
-Never send a sensitive production workbook. Reduce it to the smallest generated package that
-reproduces the flaw, or describe how maintainers can create one.
+Never send a production workbook. Generate or reduce a package to the smallest non-sensitive
+reproducer.
 
 ## Supported versions
 
-Until the first stable release, security fixes are made on `main` and included in the next v0.x
-release. After 1.0, the project will publish a version-support table here.
+| Version | Security support |
+|---|---|
+| 2.0.x | Supported |
+| Earlier than 2.0 | Upgrade required |
+
+Security fixes land on main and are included in the next supported patch release. A GitHub
+Security Advisory may remain private until users have an upgrade path.
 
 ## Security model
 
-WorkbookLens v0.1 does not execute formulas, VBA, embedded objects, or external links. It rejects
-packages that exceed configured entry, compressed/uncompressed size, compression ratio, member
-path, relationship, or XML limits. DTDs and entities are forbidden. `.xlsm` is read-only.
+WorkbookLens 2.0 does not execute formulas, VBA, embedded objects, or external links. It rejects
+packages that exceed entry, compressed/uncompressed size, compression-ratio, member-path,
+relationship, or XML limits. DTDs and entities are forbidden. .xlsm remains read-only.
 
 Repairs require a matching source hash, matching target fingerprints, explicit safe patches, an
-exact changed-part allowlist, successful reopen, and a clean post-repair scan. Partial outputs are
-removed on validation failure. The web server binds to `127.0.0.1` and keeps uploads under a
-process-owned temporary directory.
+exact changed-part allowlist, successful reopen, and a clean post-repair scan. Partial output is
+removed on failure. The web server binds to 127.0.0.1 and stores uploads in a process-owned
+temporary directory.
 
-These controls reduce risk but do not prove that every OOXML parser dependency is vulnerability
-free. Run WorkbookLens with ordinary user privileges and keep dependencies patched.
+Release artifacts are built from an explicit allowlist and audited for unexpected roots,
+environments, caches, bytecode, secret-like files, and oversized members. These controls reduce
+risk but do not prove that every OOXML parser or transitive dependency is vulnerability-free. Run
+WorkbookLens with ordinary user privileges and keep dependencies patched.

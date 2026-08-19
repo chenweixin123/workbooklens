@@ -1,4 +1,4 @@
-version: 1
+version: 2
 workbook:
   max_critical_findings: 0
   max_error_findings: 0
@@ -6,6 +6,12 @@ keys:
   - sheet: Invoices
     range: A2:A10000
     ignore_blank: true
+suppressions:
+  - id: accepted-template-volatility
+    reason: Legacy template intentionally uses NOW() on the Cover sheet.
+    rules: [WL010_VOLATILE_OR_FRAGILE_FUNCTION]
+    sheets: [Cover]
+    expires: 2027-01-31
 assertions:
   - id: no-broken-references
     type: no_findings
