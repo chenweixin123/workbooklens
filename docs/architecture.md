@@ -28,7 +28,7 @@ flowchart LR
 - `snapshot`: sparse extraction of populated/styled cells and workbook structure.
 - `formulas`: non-executing A1 token analysis, R1C1-like signatures, and conservative translation.
 - `regions`: connected dense regions and formula bands with bounded gaps.
-- `rules`: plugin interface, registry, and all v0.1 built-ins.
+- `rules`: plugin interface, registry, and the version-2 built-in catalog.
 - `repair`: deterministic plans, preconditions, direct XML operations, manifests, and validation.
 - `diff`: semantic comparison independent of ZIP serialization.
 - `testing`: bounded YAML assertions, not a general formula evaluator.
