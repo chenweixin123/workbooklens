@@ -64,6 +64,12 @@ def scan_workbook(
         for rule in active_registry.values():
             rule_result = rule.run(context)
             for finding in rule_result.findings:
+                if finding.id in finding_by_id:
+                    raise RuntimeError(
+                        "Duplicate finding identity generated for "
+                        f"{finding.rule_id} at {finding.sheet or 'Workbook'}!"
+                        f"{finding.location or ''}"
+                    )
                 finding_by_id[finding.id] = finding
             for patch in rule_result.patches:
                 patch_by_id[patch.id] = patch
