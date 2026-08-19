@@ -23,6 +23,11 @@ from workbooklens.utils import atomic_write_bytes, sha256_bytes, stable_json_byt
 
 def _sheet_content_fingerprint(sheet: SheetSnapshot) -> str:
     payload = sheet.model_dump(mode="json", exclude={"name", "index", "state"})
+    for cell in payload["cells"].values():
+        # ``style_id`` is only meaningful within one workbook. Fresh snapshots carry a
+        # workbook-independent fingerprint; retain IDs only for legacy snapshots.
+        if cell.get("style_fingerprint"):
+            cell.pop("style_id", None)
     return sha256_bytes(stable_json_bytes(payload))
 
 
@@ -31,14 +36,18 @@ def _renamed_sheets(before: WorkbookSnapshot, after: WorkbookSnapshot) -> dict[s
     after_names = {sheet.name for sheet in after.sheets}
     removed = [sheet for sheet in before.sheets if sheet.name not in after_names]
     added = [sheet for sheet in after.sheets if sheet.name not in before_names]
-    by_hash: dict[str, list[SheetSnapshot]] = {}
-    for sheet in added:
-        by_hash.setdefault(_sheet_content_fingerprint(sheet), []).append(sheet)
-    renamed: dict[str, str] = {}
+    removed_by_hash: dict[str, list[SheetSnapshot]] = {}
     for sheet in removed:
-        matches = by_hash.get(_sheet_content_fingerprint(sheet), [])
-        if len(matches) == 1:
-            renamed[sheet.name] = matches[0].name
+        removed_by_hash.setdefault(_sheet_content_fingerprint(sheet), []).append(sheet)
+    added_by_hash: dict[str, list[SheetSnapshot]] = {}
+    for sheet in added:
+        added_by_hash.setdefault(_sheet_content_fingerprint(sheet), []).append(sheet)
+    renamed: dict[str, str] = {}
+    for fingerprint in sorted(removed_by_hash.keys() & added_by_hash.keys()):
+        old_matches = removed_by_hash[fingerprint]
+        new_matches = added_by_hash[fingerprint]
+        if len(old_matches) == 1 and len(new_matches) == 1:
+            renamed[old_matches[0].name] = new_matches[0].name
     return renamed
 
 
@@ -49,6 +58,21 @@ def _signature(formula: str | None, coordinate: str) -> str | None:
         return normalize_formula(formula, coordinate)
     except (ValueError, UnsupportedFormulaError):
         return None
+
+
+def _typed_equal(before: Any, after: Any) -> bool:
+    """Compare cell values without collapsing booleans into integers or other coercions."""
+
+    return type(before) is type(after) and before == after
+
+
+def _style_fingerprint(cell: CellSnapshot | None) -> str:
+    if cell is None:
+        return "default"
+    if cell.style_fingerprint:
+        return cell.style_fingerprint
+    # Backward compatibility for deserialized v0.1 snapshots without semantic fingerprints.
+    return "default" if cell.style_id == 0 else f"legacy-style-id:{cell.style_id}"
 
 
 def _compare_cell(
@@ -75,7 +99,7 @@ def _compare_cell(
         )
     before_value = before.value if before and before_formula is None else None
     after_value = after.value if after and after_formula is None else None
-    if before_value != after_value:
+    if not _typed_equal(before_value, after_value):
         changes.append(
             CellChange(
                 sheet=sheet_name,
@@ -86,8 +110,8 @@ def _compare_cell(
                 importance=Severity.ERROR,
             )
         )
-    before_style = before.style_id if before else 0
-    after_style = after.style_id if after else 0
+    before_style = _style_fingerprint(before)
+    after_style = _style_fingerprint(after)
     if before_style != after_style:
         changes.append(
             CellChange(
