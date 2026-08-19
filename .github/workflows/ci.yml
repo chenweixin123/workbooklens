@@ -2,20 +2,46 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked --python 3.12
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy src
+      - name: Audit locked runtime dependencies
+        run: |
+          mkdir -p .artifacts
+          uv export --locked --no-dev --no-emit-project --no-hashes --output-file .artifacts/runtime-requirements.txt
+          uvx --from pip-audit pip-audit --requirement .artifacts/runtime-requirements.txt
+
+  test:
     name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-2025, macos-15]
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
@@ -26,19 +52,91 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --locked --python ${{ matrix.python-version }}
-      - run: uv run ruff format --check .
-      - run: uv run ruff check .
-      - run: uv run mypy src
       - run: uv run pytest -q
       - name: End-to-end demo
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        if: matrix.os == 'ubuntu-24.04' && matrix.python-version == '3.12'
         run: |
           uv run workbooklens demo --out .artifacts/demo
           uv run workbooklens scan .artifacts/demo/before.xlsx --out .artifacts/scan
           uv run workbooklens diff .artifacts/demo/before.xlsx .artifacts/demo/after.xlsx --out .artifacts/diff.html
       - name: Upload demo
-        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        if: matrix.os == 'ubuntu-24.04' && matrix.python-version == '3.12'
         uses: actions/upload-artifact@v7
         with:
           name: workbooklens-demo
           path: .artifacts
+          retention-days: 7
+
+  build:
+    needs: [quality, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - run: uv lock --check
+      - run: uv build --out-dir dist
+      - run: uvx --from twine twine check dist/*
+      - run: python scripts/check_release_artifacts.py dist --version 2.0.0
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workbooklens-distributions
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  wheel-smoke:
+    needs: build
+    name: wheel / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: workbooklens-distributions
+          path: dist
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install the built wheel into a fresh interpreter
+        shell: python
+        run: |
+          import glob
+          import subprocess
+          import sys
+
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, wheels
+          subprocess.check_call([sys.executable, "-m", "pip", "install", wheels[0]])
+      - run: workbooklens --version
+      - run: workbooklens demo --out .wheel-smoke
+
+  action-smoke:
+    needs: [quality, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - run: |
+          uv sync --locked
+          uv run workbooklens demo --out .action-fixtures
+          git add -f .action-fixtures/after.xlsx
+      - uses: ./
+        with:
+          mode: scan
+          path: .action-fixtures
+          fail-on: critical
+          output: .action-reports
