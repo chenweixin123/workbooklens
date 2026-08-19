@@ -13,12 +13,13 @@ from openpyxl import load_workbook
 from openpyxl.cell.cell import Cell
 from openpyxl.utils.cell import range_boundaries
 from openpyxl.workbook.workbook import Workbook
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from yaml.nodes import Node
 
 from workbooklens.exceptions import UsageError
 from workbooklens.models import AssertionResult, Severity, WorkbookAssertion
 from workbooklens.ooxml.safety import PackageLimits, inspect_package
+from workbooklens.policy import FindingPolicyResult, FindingSuppression, apply_finding_policy
 from workbooklens.scanner import ScanResult, scan_workbook
 from workbooklens.snapshot import load_for_analysis
 
@@ -59,13 +60,23 @@ class ConfiguredKey(BaseModel):
 
 
 class TestConfig(BaseModel):
-    """Validated v0.1 YAML configuration."""
+    """Validated workbook policy configuration."""
 
     model_config = ConfigDict(extra="forbid")
-    version: Literal[1]
+    version: Literal[1, 2]
     workbook: WorkbookThresholds = Field(default_factory=WorkbookThresholds)
     assertions: list[WorkbookAssertion] = Field(default_factory=list)
     keys: list[ConfiguredKey] = Field(default_factory=list)
+    suppressions: list[FindingSuppression] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_policy_version(self) -> TestConfig:
+        if self.version == 1 and self.suppressions:
+            raise ValueError("finding suppressions require configuration version 2")
+        identifiers = [suppression.id for suppression in self.suppressions]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("suppression IDs must be unique")
+        return self
 
 
 class LimitedSafeLoader(yaml.SafeLoader):
@@ -104,6 +115,7 @@ class TestRun:
 
     config: TestConfig
     scan: ScanResult
+    policy: FindingPolicyResult
     results: list[AssertionResult]
 
     @property
@@ -269,10 +281,13 @@ def _resolve_expression(
         ) from exc
 
 
-def _threshold_results(config: TestConfig, scan: ScanResult) -> list[AssertionResult]:
+def _threshold_results(config: TestConfig, policy: FindingPolicyResult) -> list[AssertionResult]:
+    active_findings = policy.active_findings
     counts = {
-        Severity.CRITICAL: sum(finding.severity == Severity.CRITICAL for finding in scan.findings),
-        Severity.ERROR: sum(finding.severity == Severity.ERROR for finding in scan.findings),
+        Severity.CRITICAL: sum(
+            finding.severity == Severity.CRITICAL for finding in active_findings
+        ),
+        Severity.ERROR: sum(finding.severity == Severity.ERROR for finding in active_findings),
     }
     results: list[AssertionResult] = []
     for severity, maximum in (
@@ -421,12 +436,19 @@ def evaluate_workbook_tests(
         keep_vba=False,
     )
     try:
-        results = _threshold_results(config, scan)
+        policy = apply_finding_policy(scan.findings, suppressions=config.suppressions)
+        results = _threshold_results(config, policy)
+        policy_scan = ScanResult(
+            inspection=scan.inspection,
+            snapshot=scan.snapshot,
+            findings=list(policy.active_findings),
+            patches=scan.patches,
+        )
         results.extend(
-            _evaluate_assertion(assertion, formula_workbook, value_workbook, scan)
+            _evaluate_assertion(assertion, formula_workbook, value_workbook, policy_scan)
             for assertion in config.assertions
         )
-        return TestRun(config=config, scan=scan, results=results)
+        return TestRun(config=config, scan=scan, policy=policy, results=results)
     finally:
         formula_workbook.close()
         value_workbook.close()
