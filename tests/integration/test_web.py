@@ -34,7 +34,7 @@ def test_local_web_scan_apply_and_download_workflow(tmp_path: Path) -> None:
         assert session_match
         session_id = session_match.group(1)
         patch_ids = re.findall(r'name="patch_id" value="([^"]+)"', response.text)
-        assert len(patch_ids) == 5
+        assert len(patch_ids) == 4
         report = client.get(f"/sessions/{session_id}/report")
         assert report.status_code == 200
         assert report.headers["content-disposition"].startswith("inline")

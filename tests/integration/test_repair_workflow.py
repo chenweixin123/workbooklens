@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from lxml import etree
 from openpyxl import Workbook, load_workbook
+from openpyxl.chart import LineChart, Reference
 
 from workbooklens.demo import run_demo
 from workbooklens.demo.workflow import DemoOutput, generate_demo_workbook
@@ -28,22 +29,22 @@ def _plan(path: Path) -> PatchPlan:
     return build_patch_plan(scan_workbook(path, config=config))
 
 
-def test_demo_applies_all_five_patch_types_and_reopens(completed_demo: DemoOutput) -> None:
+def test_demo_applies_four_safe_patch_types_and_reopens(completed_demo: DemoOutput) -> None:
     plan = PatchPlan.model_validate_json(completed_demo.repair_plan.read_text(encoding="utf-8"))
     report_path = completed_demo.directory / "apply-report.json"
     result = PatchResult.model_validate_json(report_path.read_text(encoding="utf-8"))
-    assert len(plan.patches) == 5
+    assert len(plan.patches) == 4
     assert plan.findings
     assert {finding.id for finding in plan.findings} == set(plan.finding_ids)
     assert all(finding.evidence.summary for finding in plan.findings)
-    assert len(result.applied_patch_ids) == 5
+    assert len(result.applied_patch_ids) == 4
     assert result.source_sha256 == sha256_file(completed_demo.before_workbook)
     assert result.output_sha256 == sha256_file(completed_demo.after_workbook)
     workbook = load_workbook(completed_demo.after_workbook, read_only=True, data_only=False)
     assert workbook["Sales"]["D8"].value == "=B8*C8"
     assert workbook["Sales"]["E12"].value == "=D12*0.08"
     assert workbook["Sales"]["B10"].value == 12
-    assert workbook["Summary"]["B10"].value == "=SUM(B2:B9)"
+    assert workbook["Summary"]["B10"].value == "=SUM(B2:B8)"
     workbook.close()
 
 
@@ -57,7 +58,6 @@ def test_only_manifested_parts_change_and_chart_is_byte_identical(
     assert changed == {
         "xl/workbook.xml",
         "xl/worksheets/sheet1.xml",
-        "xl/worksheets/sheet2.xml",
     }
     with (
         zipfile.ZipFile(completed_demo.before_workbook) as before_archive,
@@ -69,6 +69,50 @@ def test_only_manifested_parts_change_and_chart_is_byte_identical(
         for name in before_archive.namelist():
             if name not in changed:
                 assert before_archive.read(name) == after_archive.read(name), name
+
+
+def test_chartsheet_is_skipped_and_preserved_during_scan_and_apply(tmp_path: Path) -> None:
+    source = tmp_path / "chartsheet-source.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Month", "Value", "Double"])
+    for row in range(2, 22):
+        worksheet.append([f"M{row - 1}", row, None])
+        worksheet[f"C{row}"] = f"=B{row}*2"
+    worksheet["C12"] = None
+    chart = LineChart()
+    chart.add_data(Reference(worksheet, min_col=2, min_row=1, max_row=21), titles_from_data=True)
+    chart.set_categories(Reference(worksheet, min_col=1, min_row=2, max_row=21))
+    chartsheet = workbook.create_chartsheet("Trend")
+    chartsheet.add_chart(chart)
+    workbook.save(source)
+    workbook.close()
+
+    scan = scan_workbook(source)
+    assert any(patch.cell == "C12" for patch in scan.patches)
+    plan = build_patch_plan(scan)
+    output = tmp_path / "chartsheet-fixed.xlsx"
+    apply_patch_plan(source, plan, output, safe_only=True)
+
+    with zipfile.ZipFile(source) as before, zipfile.ZipFile(output) as after:
+        preserved = [
+            name
+            for name in before.namelist()
+            if name.startswith(("xl/chartsheets/", "xl/charts/", "xl/drawings/"))
+        ]
+        assert preserved
+        assert before.namelist() == after.namelist()
+        for name in preserved:
+            assert before.read(name) == after.read(name), name
+
+    reopened = load_workbook(output, read_only=False, data_only=False)
+    try:
+        assert reopened.sheetnames == ["Data", "Trend"]
+        assert reopened["Data"]["C12"].value == "=B12*2"
+    finally:
+        reopened.close()
 
 
 def test_formula_repairs_remove_cache_and_request_full_recalculation(
@@ -154,6 +198,18 @@ def test_selection_and_output_safety_fail_closed(tmp_path: Path) -> None:
     assert existing.read_bytes() == b"do not overwrite"
     with pytest.raises(UsageError, match="source workbook is never overwritten"):
         patch_ooxml_package(source, plan, source, safe_only=True, canonical_plan=plan)
+
+    conflicting = plan.model_copy(deep=True)
+    duplicate = conflicting.patches[0].model_copy(update={"id": "patch-conflicting-copy"})
+    conflicting.patches.append(duplicate)
+    with pytest.raises(UsageError, match="Conflicting patches target the same cell"):
+        patch_ooxml_package(
+            source,
+            conflicting,
+            tmp_path / "conflicting-target.xlsx",
+            safe_only=True,
+            canonical_plan=conflicting,
+        )
 
 
 def test_patch_plan_input_is_size_bounded(tmp_path: Path) -> None:

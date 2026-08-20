@@ -2,6 +2,45 @@
 
 All notable changes are documented here. WorkbookLens follows Semantic Versioning.
 
+## [2.1.0] - 2026-08-20
+
+### Changed
+
+- Preserve repair safety for protected input cells and explicitly text-formatted cells by refusing
+  style-copy patches that would change their protection or text-storage semantics.
+- Restrict automatic numeric-text conversion to an explicit measure-header allowlist. Identifier
+  columns such as IDs, SKUs, account numbers, postal codes, and Chinese identifier fields, unknown
+  columns, grouped numeric strings, and explicitly text-formatted values are findings-only.
+  A separate numeric-text anomaly in an identifier column no longer prevents an otherwise safe
+  explicit-measure conversion on the same ordinary detail row.
+- Keep every merged-range cell, summary or subtotal row, protected worksheet, non-visible worksheet,
+  and hidden row or column out of automatic repair. Grouped hidden column spans are now recognized
+  across their complete range and represented accurately in snapshots.
+- Require formula and style repairs to establish stable detail-row context across all text columns
+  and peer visual styles. Secondary override labels, labels outside the inferred data rectangle,
+  intentionally highlighted rows, unique notes, and free-form-only row labels are review-only.
+- Require style-copy repairs to preserve number format, protection, quote-prefix, and pivot-button
+  semantics; protection-only differences are not reported as visual style anomalies.
+- Skip valid Chartsheet relationships during worksheet analysis and patching while preserving
+  Chartsheet, chart, drawing, and relationship parts byte-for-byte.
+- Exclude boundary totals and subtotals from formula-outlier replacement, report multiple isolated
+  formula/style anomalies without bulk auto-repair, and make all suspicious SUM-boundary findings
+  review-only because adjacency cannot prove inclusion semantics.
+
+### Security
+
+- Recheck non-visible sheets, hidden rows, grouped hidden columns, protected sheets, and semantic
+  style fields in the low-level OOXML patch preconditions.
+- Reject hidden column spans outside Excel's A:XFD limit before expanding snapshot metadata.
+
+### Compatibility
+
+- JSON schemas and rule IDs remain unchanged from 2.0.0.
+- `PatchKind.EXTEND_SUM` remains in the serialized enum for compatibility, but 2.1 does not generate
+  it as a canonical automatic repair.
+- Serialized patch plans continue to be revalidated against a fresh canonical scan before repair
+  authority is granted.
+
 ## [2.0.0] - 2026-08-19
 
 ### Added

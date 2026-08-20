@@ -32,15 +32,15 @@ reproducer.
 
 | Version | Security support |
 |---|---|
-| 2.0.x | Supported |
-| Earlier than 2.0 | Upgrade required |
+| 2.1.x | Supported |
+| 2.0.x and earlier | Upgrade required |
 
 Security fixes land on main and are included in the next supported patch release. A GitHub
 Security Advisory may remain private until users have an upgrade path.
 
 ## Security model
 
-WorkbookLens 2.0 does not execute formulas, VBA, embedded objects, or external links. It rejects
+WorkbookLens 2.1 does not execute formulas, VBA, embedded objects, or external links. It rejects
 packages that exceed entry, compressed/uncompressed size, compression-ratio, member-path,
 relationship, or XML limits. DTDs and entities are forbidden. .xlsm remains read-only.
 

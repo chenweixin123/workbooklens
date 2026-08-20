@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 from lxml import etree
+from openpyxl import load_workbook
+from openpyxl.styles import Protection
 
 import workbooklens.repair.ooxml_patch as ooxml_patch
 from workbooklens.demo.workflow import generate_demo_workbook
@@ -21,6 +23,8 @@ from workbooklens.models import PatchKind, PatchOperation, PatchPlan
 from workbooklens.ooxml.safety import PackageLimits, inspect_package
 from workbooklens.repair import apply_patch_plan, build_patch_plan
 from workbooklens.scanner import scan_workbook
+from workbooklens.snapshot import cell_fingerprint
+from workbooklens.utils import sha256_file
 
 CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
 RELATIONSHIPS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -230,3 +234,75 @@ def test_precondition_analysis_receives_original_package_limits(
     assert received == [limits]
     assert received[0] is limits
     assert output.exists()
+
+
+@pytest.mark.parametrize("hidden_target", ["sheet", "row", "grouped_column"])
+def test_low_level_repair_rejects_newly_hidden_targets(tmp_path: Path, hidden_target: str) -> None:
+    source = tmp_path / f"hidden-{hidden_target}.xlsx"
+    generate_demo_workbook(source)
+    plan = _plan(source)
+    patch = _formula_patch(plan)
+
+    workbook = load_workbook(source)
+    worksheet = workbook[patch.sheet]
+    if hidden_target == "sheet":
+        worksheet.sheet_state = "hidden"
+    elif hidden_target == "row":
+        worksheet.row_dimensions[worksheet[patch.cell].row].hidden = True
+    else:
+        worksheet.column_dimensions.group("B", "D", hidden=True)
+    workbook.save(source)
+    workbook.close()
+    plan.source_sha256 = sha256_file(source)
+
+    output = tmp_path / f"hidden-{hidden_target}-fixed.xlsx"
+    with pytest.raises(PatchValidationError, match=r"hidden|non-visible"):
+        ooxml_patch.patch_ooxml_package(
+            source,
+            plan,
+            output,
+            selected_ids={patch.id},
+            canonical_plan=plan,
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("semantic", "expected_message"),
+    [
+        ("protection", "protection semantics"),
+        ("number_format", "number-format semantics"),
+        ("quote_prefix", "quote-prefix semantics"),
+        ("pivot_button", "pivot-button semantics"),
+    ],
+)
+def test_low_level_style_copy_rejects_semantic_mismatch(
+    tmp_path: Path, semantic: str, expected_message: str
+) -> None:
+    source = tmp_path / f"style-{semantic}.xlsx"
+    generate_demo_workbook(source)
+    plan = _plan(source)
+    patch = next(item for item in plan.patches if item.kind == PatchKind.COPY_STYLE)
+
+    workbook = load_workbook(source)
+    worksheet = workbook[patch.sheet]
+    target = worksheet[patch.cell]
+    if semantic == "protection":
+        target.protection = Protection(locked=False)
+    elif semantic == "number_format":
+        target.number_format = "0.00%"
+    elif semantic == "quote_prefix":
+        target.quotePrefix = not target.quotePrefix
+    else:
+        target.pivotButton = not target.pivotButton
+    workbook.save(source)
+    workbook.close()
+
+    workbook = load_workbook(source)
+    target = workbook[patch.sheet][patch.cell]
+    plan.source_sha256 = sha256_file(source)
+    patch.precondition.cell_fingerprint = cell_fingerprint(target)
+    workbook.close()
+
+    with pytest.raises(PatchValidationError, match=expected_message):
+        ooxml_patch._verify_preconditions(source, plan, [patch], None)

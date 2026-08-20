@@ -15,6 +15,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from workbooklens.models import CellSnapshot, SheetSnapshot, WorkbookSnapshot
 from workbooklens.ooxml.safety import PackageLimits, inspect_package
 from workbooklens.utils import sha256_bytes, sha256_file, stable_json_bytes
+from workbooklens.worksheet_state import hidden_column_labels, is_column_hidden
 
 
 def _formula_payload(cell: Cell) -> str | None:
@@ -45,6 +46,7 @@ def cell_semantic_payload(cell: Cell) -> dict[str, Any]:
         "data_type": cell.data_type,
         "style_id": cell.style_id,
         "number_format": cell.number_format,
+        "quote_prefix": bool(cell.quotePrefix),
     }
 
 
@@ -109,12 +111,13 @@ def style_fingerprint(cell: Cell) -> str:
 
 def _snapshot_cell(cell: Cell, worksheet: Worksheet) -> CellSnapshot:
     payload = cell_semantic_payload(cell)
-    column_letter = cell.column_letter
+    snapshot_payload = dict(payload)
+    snapshot_payload.pop("quote_prefix", None)
     return CellSnapshot(
-        **payload,
+        **snapshot_payload,
         style_fingerprint=style_fingerprint(cell),
         row_hidden=bool(worksheet.row_dimensions[cell.row].hidden),
-        column_hidden=bool(worksheet.column_dimensions[column_letter].hidden),
+        column_hidden=is_column_hidden(worksheet, cell.column),
     )
 
 
@@ -170,11 +173,7 @@ def snapshot_from_workbook(workbook: Workbook, path: Path, source_sha256: str) -
                     for index, dimension in worksheet.row_dimensions.items()
                     if dimension.hidden
                 ),
-                hidden_columns=sorted(
-                    key
-                    for key, dimension in worksheet.column_dimensions.items()
-                    if dimension.hidden
-                ),
+                hidden_columns=hidden_column_labels(worksheet),
                 data_validations=sorted(validations),
             )
         )

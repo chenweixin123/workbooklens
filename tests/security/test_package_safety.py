@@ -14,6 +14,7 @@ from workbooklens.ooxml.safety import (
     inspect_package,
     parse_xml_part,
 )
+from workbooklens.worksheet_state import hidden_column_labels
 
 CONTENT_TYPES = b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>'
 WORKBOOK = b'<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>'
@@ -161,3 +162,17 @@ def test_file_size_limit_precedes_zip_parsing(tmp_path: Path) -> None:
     path.write_bytes(b"x" * 11)
     with pytest.raises(UnsafeWorkbookError, match="configured limit"):
         inspect_package(path, PackageLimits(max_file_bytes=10))
+
+
+def test_hidden_column_span_cannot_expand_beyond_excel_limit() -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    dimension = worksheet.column_dimensions["A"]
+    dimension.hidden = True
+    dimension.min = 1
+    dimension.max = 10**9
+
+    with pytest.raises(UnsafeWorkbookError, match="A:XFD"):
+        hidden_column_labels(worksheet)
+    workbook.close()

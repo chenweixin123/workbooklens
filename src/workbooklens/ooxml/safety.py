@@ -235,7 +235,7 @@ def inspect_package(path: Path, limits: PackageLimits | None = None) -> PackageI
         raise UsageError(f"Workbook does not exist or is not a file: {path}")
     suffix = resolved.suffix.lower()
     if suffix not in {".xlsx", ".xlsm"}:
-        raise UsageError("WorkbookLens 2.0 accepts only .xlsx and read-only .xlsm inputs")
+        raise UsageError("WorkbookLens 2.1 accepts only .xlsx and read-only .xlsm inputs")
     file_size = resolved.stat().st_size
     if file_size > active_limits.max_file_bytes:
         raise UnsafeWorkbookError(

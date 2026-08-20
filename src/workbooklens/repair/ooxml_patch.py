@@ -26,6 +26,7 @@ from workbooklens.models import PackageChange, PatchKind, PatchOperation, PatchP
 from workbooklens.ooxml.safety import PackageLimits, inspect_package, parse_xml_part
 from workbooklens.snapshot import cell_fingerprint, load_for_analysis
 from workbooklens.utils import sha256_file
+from workbooklens.worksheet_state import is_column_hidden
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,15 +77,15 @@ def _sheet_parts(archive: zipfile.ZipFile) -> dict[str, str]:
     if rels_name not in archive.namelist():
         raise PatchValidationError("Workbook relationships part is missing")
     rels_root = parse_xml_part(archive.read(rels_name), rels_name)
-    relationships: dict[str, str] = {}
+    relationships: dict[str, tuple[str, str]] = {}
     for relationship in rels_root:
         if etree.QName(relationship).localname != "Relationship":
             continue
         relationship_id = relationship.get("Id")
         target = relationship.get("Target")
         relationship_type = relationship.get("Type", "")
-        if relationship_id and target and relationship_type.endswith("/worksheet"):
-            relationships[relationship_id] = _resolve_part("xl/workbook.xml", target)
+        if relationship_id and target:
+            relationships[relationship_id] = (relationship_type, target)
     result: dict[str, str] = {}
     for sheet in workbook_root.iter():
         if etree.QName(sheet).localname != "sheet":
@@ -103,7 +104,14 @@ def _sheet_parts(archive: zipfile.ZipFile) -> dict[str, str]:
         )
         if not name or not relationship_id or relationship_id not in relationships:
             raise PatchValidationError("Workbook contains a sheet with a malformed relationship")
-        result[name] = relationships[relationship_id]
+        relationship_type, target = relationships[relationship_id]
+        if relationship_type.endswith("/chartsheet"):
+            continue
+        if not relationship_type.endswith("/worksheet"):
+            raise PatchValidationError(
+                f"Workbook contains an unsupported sheet relationship type: {relationship_type!r}"
+            )
+        result[name] = _resolve_part("xl/workbook.xml", target)
     return result
 
 
@@ -202,6 +210,23 @@ def _assert_not_in_advanced_formula_range(root: etree._Element, coordinate: str)
             )
 
 
+def _assert_not_in_merged_range(root: etree._Element, coordinate: str) -> None:
+    for element in root.iter():
+        if etree.QName(element).localname != "mergeCell":
+            continue
+        reference = element.get("ref")
+        if not reference:
+            continue
+        try:
+            merged = CellRange(reference)
+        except ValueError as exc:
+            raise PatchValidationError(f"Invalid merged range {reference!r}") from exc
+        if coordinate in merged:
+            raise PatchValidationError(
+                f"target {coordinate} intersects merged range {reference}; automatic patches are refused"
+            )
+
+
 def _remove_value_children(cell: etree._Element) -> None:
     for child in list(cell):
         if etree.QName(child).localname in {"f", "v", "is"}:
@@ -214,7 +239,7 @@ def _set_formula(cell: etree._Element, formula: str) -> None:
     features = analyze_formula(formula)
     if features.external_references or features.unsupported_reason:
         raise PatchValidationError(
-            "External, structured, dynamic, spilled, or advanced formulas are not patchable in 2.0"
+            "External, structured, dynamic, spilled, or advanced formulas are not patchable"
         )
     namespace = _element_namespace(cell)
     _remove_value_children(cell)
@@ -311,10 +336,12 @@ def _verify_preconditions(
         )
     workbook = load_for_analysis(source, limits)
     try:
+        worksheets = {worksheet.title: worksheet for worksheet in workbook.worksheets}
         for patch in selected:
-            if patch.sheet not in workbook.sheetnames:
-                raise StalePlanError(f"Patch sheet no longer exists: {patch.sheet!r}")
-            cell = workbook[patch.sheet][patch.cell]
+            worksheet = worksheets.get(patch.sheet)
+            if worksheet is None:
+                raise StalePlanError(f"Patch worksheet no longer exists: {patch.sheet!r}")
+            cell = worksheet[patch.cell]
             if not isinstance(cell, Cell):
                 raise StalePlanError(
                     f"Patch target is not a writable cell: {patch.sheet}!{patch.cell}"
@@ -324,6 +351,52 @@ def _verify_preconditions(
                 raise StalePlanError(
                     f"Cell precondition failed for {patch.sheet}!{patch.cell}; plan is stale"
                 )
+            if worksheet.protection.sheet:
+                raise PatchValidationError(
+                    f"Patch target is on protected worksheet {patch.sheet!r}; unprotect it before repair"
+                )
+            if worksheet.sheet_state != "visible":
+                raise PatchValidationError(
+                    f"Patch target is on non-visible worksheet {patch.sheet!r}; unhide it before repair"
+                )
+            row_dimension = worksheet.row_dimensions.get(cell.row)
+            if row_dimension is not None and row_dimension.hidden:
+                raise PatchValidationError(
+                    f"Patch target is on hidden row {patch.sheet}!{cell.row}; unhide it before repair"
+                )
+            if is_column_hidden(worksheet, cell.column):
+                raise PatchValidationError(
+                    f"Patch target is in a hidden column at {patch.sheet}!{patch.cell}; "
+                    "unhide it before repair"
+                )
+            if patch.kind == PatchKind.COPY_STYLE:
+                if not patch.source_cell:
+                    raise PatchValidationError(f"Style patch {patch.id} has no source cell")
+                source_cell = worksheet[patch.source_cell]
+                if not isinstance(source_cell, Cell):
+                    raise PatchValidationError(
+                        f"Style patch source is not a writable cell: "
+                        f"{patch.sheet}!{patch.source_cell}"
+                    )
+                if (
+                    cell.protection.locked != source_cell.protection.locked
+                    or cell.protection.hidden != source_cell.protection.hidden
+                ):
+                    raise PatchValidationError(
+                        f"Style patch {patch.id} would change cell protection semantics"
+                    )
+                if cell.number_format != source_cell.number_format:
+                    raise PatchValidationError(
+                        f"Style patch {patch.id} would change number-format semantics"
+                    )
+                if cell.quotePrefix != source_cell.quotePrefix:
+                    raise PatchValidationError(
+                        f"Style patch {patch.id} would change quote-prefix semantics"
+                    )
+                if cell.pivotButton != source_cell.pivotButton:
+                    raise PatchValidationError(
+                        f"Style patch {patch.id} would change pivot-button semantics"
+                    )
     finally:
         workbook.close()
 
@@ -359,9 +432,20 @@ def _select_patches(
         ]
         if unsafe:
             raise UsageError(
-                "WorkbookLens 2.0 refuses patches below the safe 0.95 threshold: "
+                "WorkbookLens 2.1 refuses patches below the safe 0.95 threshold: "
                 + ", ".join(unsafe)
             )
+    domains: dict[tuple[str, str, str], list[str]] = {}
+    for patch in selected:
+        domain = "style" if patch.kind == PatchKind.COPY_STYLE else "content"
+        domains.setdefault((patch.sheet, patch.cell, domain), []).append(patch.id)
+    conflicts = [
+        f"{sheet}!{cell} ({domain}: {', '.join(sorted(patch_ids))})"
+        for (sheet, cell, domain), patch_ids in sorted(domains.items())
+        if len(patch_ids) > 1
+    ]
+    if conflicts:
+        raise UsageError("Conflicting patches target the same cell: " + "; ".join(conflicts))
     return selected
 
 
@@ -404,6 +488,7 @@ def _apply_to_parts(
         root = parse_xml_part(archive.read(part), part)
         for patch in patches:
             _assert_not_in_advanced_formula_range(root, patch.cell)
+            _assert_not_in_merged_range(root, patch.cell)
             target = _find_or_create_cell(root, patch.cell)
             _assert_simple_formula_cell(target, f"target {patch.sheet}!{patch.cell}")
             source_element = None
@@ -536,8 +621,14 @@ def _publish_without_overwrite(temporary: Path, output: Path, expected_hash: str
 def _validate_semantics(output: Path, selected: list[PatchOperation]) -> None:
     workbook = load_workbook(output, read_only=False, data_only=False, keep_links=False)
     try:
+        worksheets = {worksheet.title: worksheet for worksheet in workbook.worksheets}
         for patch in selected:
-            cell = workbook[patch.sheet][patch.cell]
+            worksheet = worksheets.get(patch.sheet)
+            if worksheet is None:
+                raise PatchValidationError(
+                    f"Patched worksheet is missing from output: {patch.sheet!r}"
+                )
+            cell = worksheet[patch.cell]
             if (
                 patch.kind
                 in {

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Protection
 
 from workbooklens.demo.workflow import generate_demo_workbook
 from workbooklens.models import PatchKind
@@ -19,7 +20,7 @@ def demo_scan(tmp_path_factory: pytest.TempPathFactory) -> ScanResult:
     return scan_workbook(path, config=config)
 
 
-def test_demo_exercises_fourteen_rules_and_all_patch_kinds(demo_scan: ScanResult) -> None:
+def test_demo_exercises_fourteen_rules_and_generated_patch_kinds(demo_scan: ScanResult) -> None:
     rule_ids = {finding.rule_id for finding in demo_scan.findings}
     assert rule_ids == {
         "WL001_BROKEN_REFERENCE",
@@ -37,7 +38,7 @@ def test_demo_exercises_fourteen_rules_and_all_patch_kinds(demo_scan: ScanResult
         "WL014_MERGED_CELL_IN_DATA_REGION",
         "WL015_INCONSISTENT_DATA_VALIDATION",
     }
-    assert {patch.kind for patch in demo_scan.patches} == set(PatchKind)
+    assert {patch.kind for patch in demo_scan.patches} == set(PatchKind) - {PatchKind.EXTEND_SUM}
     assert all(patch.safe and float(patch.confidence) >= 0.95 for patch in demo_scan.patches)
 
 
@@ -66,6 +67,176 @@ def test_formula_pattern_outlier_rule_and_safe_proposal(tmp_path: Path) -> None:
     assert len(patches) == 1
     assert patches[0].kind == PatchKind.SET_FORMULA
     assert patches[0].after == "=K1*2"
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        "=SUM(B2:T2)",
+        "=SUBTOTAL(9,B2:T2)",
+        "=AGGREGATE(9,5,B2:T2)",
+        "=SUM(B2:T2)+0",
+        "=ROUND(SUM(B2:T2),2)",
+        "=SUM(B2:T2,N(0))",
+        "=SUM(B2:T2)+IFERROR(0,0)",
+        "=AVERAGE(B2:T2)",
+        "=MIN(B2:T2)",
+        "=MAX(B2:T2)",
+        "=COUNT(B2:T2)",
+        "=COUNTA(B2:T2)",
+        "=MEDIAN(B2:T2)",
+    ],
+)
+def test_boundary_aggregate_is_not_treated_as_formula_outlier(tmp_path: Path, formula: str) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    for column in range(2, 21):
+        worksheet.cell(1, column, column)
+        coordinate = worksheet.cell(2, column).coordinate
+        source = worksheet.cell(1, column).coordinate
+        worksheet[coordinate] = f"={source}*2"
+    worksheet["U2"] = formula
+    path = tmp_path / "boundary-total.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert not any(
+        finding.rule_id == "WL002_FORMULA_PATTERN_OUTLIER" and finding.location == "U2"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "U2" for patch in scan.patches)
+
+
+def test_multiple_isolated_formula_outliers_are_findings_only(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    for column in range(2, 22):
+        worksheet.cell(1, column, column)
+        coordinate = worksheet.cell(2, column).coordinate
+        source = worksheet.cell(1, column).coordinate
+        worksheet[coordinate] = f"={source}*2"
+    worksheet["K2"] = "=K1*3"
+    worksheet["Q2"] = "=Q1+7"
+    path = tmp_path / "multiple-outliers.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    findings = {
+        finding.location
+        for finding in scan.findings
+        if finding.rule_id == "WL002_FORMULA_PATTERN_OUTLIER"
+    }
+    assert findings == {"K2", "Q2"}
+    assert not any(patch.cell in findings for patch in scan.patches)
+
+
+def test_merged_formula_outlier_is_findings_only(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    for row in range(2, 22):
+        worksheet[f"B{row}"] = f"=A{row}*2"
+    worksheet["B10"] = "=A10*3"
+    worksheet.merge_cells("B10:C10")
+    path = tmp_path / "merged-formula-outlier.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL002_FORMULA_PATTERN_OUTLIER" and finding.location == "B10"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "B10" for patch in scan.patches)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Subtotal",
+        "Sub-total",
+        "Grand-total",
+        "Average",
+        "Mean",
+        "Minimum",
+        "Maximum",
+        "Summary",
+        "小计",
+        "小计金额",
+        "合计金额",
+        "汇总金额",
+        "平均金额",
+        "最大金额",
+        "最小金额",
+        "总金额",
+        "累计金额",
+        "净额",
+        "期末余额",
+    ],
+)
+def test_summary_row_formula_outlier_is_findings_only(tmp_path: Path, label: str) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet["A2"] = label
+    for column in range(2, 22):
+        coordinate = worksheet.cell(2, column).coordinate
+        source = worksheet.cell(1, column).coordinate
+        worksheet[coordinate] = f"={source}*2"
+    worksheet["K2"] = "=K1*3"
+    path = tmp_path / f"summary-formula-outlier-{len(label)}.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL002_FORMULA_PATTERN_OUTLIER" and finding.location == "K2"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "K2" for patch in scan.patches)
+
+
+def test_hidden_formula_outlier_is_findings_only(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    for row in range(2, 22):
+        worksheet[f"B{row}"] = f"=A{row}*2"
+    worksheet["B10"] = "=A10*3"
+    worksheet.row_dimensions[10].hidden = True
+    path = tmp_path / "hidden-formula-outlier.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL002_FORMULA_PATTERN_OUTLIER" and finding.location == "B10"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "B10" for patch in scan.patches)
+
+
+def test_formula_band_boundary_never_gets_automatic_replacement(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Band"
+    for column in range(2, 21):
+        worksheet.cell(1, column, column)
+        coordinate = worksheet.cell(2, column).coordinate
+        source = worksheet.cell(1, column).coordinate
+        worksheet[coordinate] = f"={source}*2"
+    worksheet["U2"] = "=AVERAGE(Band!B2:T2)"
+    path = tmp_path / "explicit-sheet-boundary-summary.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert not any(patch.cell == "U2" for patch in scan.patches)
 
 
 def test_finding_identity_is_stable_when_evidence_content_changes(tmp_path: Path) -> None:
@@ -156,6 +327,614 @@ def test_numeric_text_excludes_leading_zero_identifiers(demo_scan: ScanResult) -
     assert locations == {"B10"}
 
 
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Customer ID",
+        "SKU",
+        "Account Number",
+        "Postal Code",
+        "Phone Number",
+        "Mobile Number",
+        "SSN",
+        "ISBN",
+        "手机号",
+        "证件号码",
+        "银行卡号",
+        "客户编号",
+    ],
+)
+def test_identifier_headers_suppress_numeric_text_patch(tmp_path: Path, header: str) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append([header, "Amount"])
+    for row in range(2, 22):
+        worksheet.append([10000 + row, row * 10])
+    worksheet["A10"] = "12345"
+    path = tmp_path / f"identifier-{len(header)}.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    finding = next(
+        finding
+        for finding in scan.findings
+        if finding.rule_id == "WL006_NUMERIC_TEXT" and finding.location == "A10"
+    )
+    assert not finding.safe_patch_available
+    assert not any(patch.cell == "A10" for patch in scan.patches)
+
+
+def test_account_balance_still_allows_numeric_measure_patch(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Account Balance", "Context"])
+    for row in range(2, 22):
+        worksheet.append([row * 100, f"R{row}"])
+    worksheet["A10"] = "1200"
+    path = tmp_path / "account-balance.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        patch.kind == PatchKind.SET_NUMERIC and patch.cell == "A10" for patch in scan.patches
+    )
+
+
+def test_measure_patch_survives_plain_numeric_text_in_identifier_column(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Account ID", "Customer", "Credit Limit"])
+    for row in range(2, 22):
+        worksheet.append([10000 + row, f"Customer {row}", row * 1000])
+    worksheet["A10"] = "12345"
+    worksheet["C10"] = "12000"
+    path = tmp_path / "identifier-and-measure-numeric-text.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    patches = {(patch.kind, patch.cell) for patch in scan.patches}
+    assert (PatchKind.SET_NUMERIC, "A10") not in patches
+    assert (PatchKind.SET_NUMERIC, "C10") in patches
+
+
+def test_unknown_numeric_column_is_findings_only(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Business Field", "Context"])
+    for row in range(2, 22):
+        worksheet.append([row * 100, f"R{row}"])
+    worksheet["A10"] = "1200"
+    path = tmp_path / "unknown-numeric-column.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL006_NUMERIC_TEXT" and finding.location == "A10"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "A10" for patch in scan.patches)
+
+
+def test_explicit_text_format_suppresses_numeric_text_patch(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Measure", "Context"])
+    for row in range(2, 22):
+        worksheet.append([row * 100, f"R{row}"])
+    worksheet["A10"] = "1200"
+    worksheet["A10"].number_format = "@"
+    path = tmp_path / "explicit-text.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL006_NUMERIC_TEXT" and finding.location == "A10"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "A10" for patch in scan.patches)
+
+
+def test_quote_prefix_suppresses_numeric_and_style_patches(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Measure", "Context"])
+    for row in range(2, 22):
+        worksheet.append([row * 100, f"R{row}"])
+    worksheet["A10"] = "1200"
+    worksheet["A10"].quotePrefix = True
+    path = tmp_path / "quote-prefix.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL006_NUMERIC_TEXT" and finding.location == "A10"
+        for finding in scan.findings
+    )
+    assert not any(
+        patch.cell == "A10" and patch.kind in {PatchKind.SET_NUMERIC, PatchKind.COPY_STYLE}
+        for patch in scan.patches
+    )
+
+
+def test_protected_worksheet_is_findings_only_for_numeric_text(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Amount", "Context"])
+    for row in range(2, 22):
+        worksheet.append([row * 100, f"R{row}"])
+    worksheet["A10"] = "1200"
+    worksheet.protection.sheet = True
+    path = tmp_path / "protected-numeric.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL006_NUMERIC_TEXT" and finding.location == "A10"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "A10" for patch in scan.patches)
+
+
+def test_grouped_numeric_text_is_reported_without_auto_patch(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Amount", "Context"])
+    for row in range(2, 22):
+        worksheet.append([row * 100, f"R{row}"])
+    worksheet["A10"] = "1,200"
+    path = tmp_path / "grouped-numeric.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL006_NUMERIC_TEXT" and finding.location == "A10"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "A10" for patch in scan.patches)
+
+
+def test_grouped_hidden_nonleading_column_is_findings_only(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Item", "Context", "Amount", "Reviewer"])
+    for row in range(2, 22):
+        worksheet.append([f"R{row}", f"C{row}", row * 100, "Chen"])
+    worksheet["C10"] = "1200"
+    worksheet.column_dimensions.group("B", "D", hidden=True)
+    path = tmp_path / "grouped-hidden-nonleading-column.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL006_NUMERIC_TEXT" and finding.location == "C10"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "C10" for patch in scan.patches)
+    snapshot_sheet = scan.snapshot.sheets[0]
+    assert snapshot_sheet.hidden_columns == ["B", "C", "D"]
+    assert snapshot_sheet.cells["C10"].column_hidden
+
+
+@pytest.mark.parametrize("sheet_state", ["hidden", "veryHidden"])
+def test_nonvisible_worksheet_is_findings_only_for_numeric_text(
+    tmp_path: Path, sheet_state: str
+) -> None:
+    workbook = Workbook()
+    cover = workbook.active
+    assert cover is not None
+    cover.title = "Cover"
+    worksheet = workbook.create_sheet("Data")
+    worksheet.append(["Amount", "Context"])
+    for row in range(2, 22):
+        worksheet.append([row * 100, f"R{row}"])
+    worksheet["A10"] = "1200"
+    worksheet.sheet_state = sheet_state
+    path = tmp_path / f"{sheet_state}-numeric.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL006_NUMERIC_TEXT"
+        and finding.sheet == "Data"
+        and finding.location == "A10"
+        for finding in scan.findings
+    )
+    assert not any(patch.sheet == "Data" for patch in scan.patches)
+
+
+@pytest.mark.parametrize("sheet_state", ["hidden", "veryHidden"])
+def test_nonvisible_worksheet_is_findings_only_for_formula_and_style(
+    tmp_path: Path, sheet_state: str
+) -> None:
+    workbook = Workbook()
+    cover = workbook.active
+    assert cover is not None
+    cover.title = "Cover"
+    worksheet = workbook.create_sheet("Data")
+    worksheet.append(["Amount", "Calculated"])
+    for row in range(2, 22):
+        worksheet.append([row * 100, f"=A{row}*2"])
+    worksheet["B10"] = 999
+    worksheet["A11"].font = Font(bold=True)
+    worksheet.sheet_state = sheet_state
+    path = tmp_path / f"{sheet_state}-formula-style.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL004_HARDCODED_VALUE_IN_FORMULA_BAND"
+        and finding.sheet == "Data"
+        and finding.location == "B10"
+        for finding in scan.findings
+    )
+    assert any(
+        finding.rule_id == "WL007_STYLE_OUTLIER"
+        and finding.sheet == "Data"
+        and finding.location == "A11"
+        for finding in scan.findings
+    )
+    assert not any(patch.sheet == "Data" for patch in scan.patches)
+
+
+@pytest.mark.parametrize("sheet_state", ["hidden", "veryHidden"])
+def test_nonvisible_worksheet_sum_boundary_is_findings_only(
+    tmp_path: Path, sheet_state: str
+) -> None:
+    workbook = Workbook()
+    cover = workbook.active
+    assert cover is not None
+    cover.title = "Cover"
+    worksheet = workbook.create_sheet("Data")
+    for row in range(2, 10):
+        worksheet.cell(row, 1, f"R{row}")
+        worksheet.cell(row, 2, row * 100)
+    worksheet["A10"] = "Total"
+    worksheet["B10"] = "=SUM(B2:B8)"
+    worksheet.sheet_state = sheet_state
+    path = tmp_path / f"{sheet_state}-sum-boundary.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    finding = next(
+        finding
+        for finding in scan.findings
+        if finding.rule_id == "WL005_SUSPICIOUS_SUM_BOUNDARY" and finding.sheet == "Data"
+    )
+    assert not finding.safe_patch_available
+    assert not any(patch.sheet == "Data" for patch in scan.patches)
+
+
+def test_protection_only_difference_is_not_a_visual_style_outlier(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Input", "Context"])
+    for row in range(2, 22):
+        worksheet.append([row, f"R{row}"])
+    worksheet["A10"].protection = Protection(locked=False)
+    worksheet.protection.sheet = True
+    path = tmp_path / "unlocked-style-outlier.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert not any(
+        finding.rule_id == "WL007_STYLE_OUTLIER" and finding.location == "A10"
+        for finding in scan.findings
+    )
+    assert not any(
+        patch.kind == PatchKind.COPY_STYLE and patch.cell == "A10" for patch in scan.patches
+    )
+
+
+def test_style_outlier_with_different_number_format_has_no_patch(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Customer ID", "Context"])
+    for row in range(2, 22):
+        worksheet.append([10000 + row, f"R{row}"])
+    worksheet["A10"].number_format = "000000"
+    path = tmp_path / "identifier-number-format-outlier.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    finding = next(
+        finding
+        for finding in scan.findings
+        if finding.rule_id == "WL007_STYLE_OUTLIER" and finding.location == "A10"
+    )
+    assert not finding.safe_patch_available
+    assert not any(
+        patch.kind == PatchKind.COPY_STYLE and patch.cell == "A10" for patch in scan.patches
+    )
+
+
+def test_pivot_button_only_difference_is_not_a_visual_style_outlier(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Amount", "Context"])
+    for row in range(2, 22):
+        worksheet.append([row, f"R{row}"])
+    worksheet["A10"].pivotButton = True
+    path = tmp_path / "pivot-button-style.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert not any(
+        finding.rule_id == "WL007_STYLE_OUTLIER" and finding.location == "A10"
+        for finding in scan.findings
+    )
+    assert not any(
+        patch.kind == PatchKind.COPY_STYLE and patch.cell == "A10" for patch in scan.patches
+    )
+
+
+def test_multiple_style_outliers_are_findings_only(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Amount", "Context"])
+    for row in range(2, 24):
+        worksheet.append([row, f"R{row}"])
+    worksheet["A8"].font = Font(bold=True)
+    worksheet["A18"].font = Font(italic=True)
+    path = tmp_path / "multiple-style-outliers.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    locations = {
+        finding.location for finding in scan.findings if finding.rule_id == "WL007_STYLE_OUTLIER"
+    }
+    assert locations == {"A8", "A18"}
+    assert not any(
+        patch.kind == PatchKind.COPY_STYLE and patch.cell in locations for patch in scan.patches
+    )
+
+
+@pytest.mark.parametrize("label", ["Grand Total", "Summary", "总金额", "累计金额", "期末余额"])
+def test_summary_row_style_outliers_are_never_auto_copied(tmp_path: Path, label: str) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Item", "Amount"])
+    for row in range(2, 22):
+        worksheet.append([f"R{row}", row * 10])
+    worksheet.append([label, "=SUM(B2:B21)"])
+    worksheet["A22"].font = Font(bold=True)
+    worksheet["B22"].font = Font(bold=True)
+    path = tmp_path / "summary-row-style.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert not any(
+        patch.kind == PatchKind.COPY_STYLE and patch.cell in {"A22", "B22"}
+        for patch in scan.patches
+    )
+
+
+@pytest.mark.parametrize("label", ["Total", "Summary", "总金额", "累计金额", "期末余额"])
+def test_summary_row_numeric_text_is_findings_only(tmp_path: Path, label: str) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Item", "Amount"])
+    for row in range(2, 22):
+        worksheet.append([f"R{row}", row * 100])
+    worksheet["A10"] = label
+    worksheet["B10"] = "1200"
+    path = tmp_path / f"summary-numeric-{len(label)}.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    finding = next(
+        finding
+        for finding in scan.findings
+        if finding.rule_id == "WL006_NUMERIC_TEXT" and finding.location == "B10"
+    )
+    assert not finding.safe_patch_available
+    assert not any(patch.cell == "B10" for patch in scan.patches)
+
+
+def test_secondary_row_semantic_override_blocks_all_candidate_patches(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Item", "Row type", "Amount", "Calculated"])
+    for row in range(2, 22):
+        worksheet.append([f"Item {row}", "Regular", row * 100, f"=C{row}*2"])
+    worksheet["B10"] = "Manual override"
+    worksheet["C10"] = "1200"
+    worksheet["C10"].font = Font(bold=True)
+    worksheet["D10"] = 999
+    path = tmp_path / "secondary-row-semantic-override.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    findings = {(finding.rule_id, finding.location) for finding in scan.findings}
+    assert ("WL004_HARDCODED_VALUE_IN_FORMULA_BAND", "D10") in findings
+    assert ("WL006_NUMERIC_TEXT", "C10") in findings
+    assert ("WL007_STYLE_OUTLIER", "C10") in findings
+    assert not any(patch.cell in {"C10", "D10"} for patch in scan.patches)
+
+
+@pytest.mark.parametrize(
+    ("fault", "rule_id"),
+    [
+        ("formula", "WL002_FORMULA_PATTERN_OUTLIER"),
+        ("blank", "WL003_BLANK_IN_FORMULA_BAND"),
+    ],
+)
+def test_secondary_row_semantic_override_blocks_formula_candidate_patches(
+    tmp_path: Path, fault: str, rule_id: str
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Item", "Row type", "Input", "Calculated"])
+    for row in range(2, 22):
+        worksheet.append([f"Item {row}", "Regular", row * 100, f"=C{row}*2"])
+    worksheet["B10"] = "调整项"
+    worksheet["D10"] = "=C10*3" if fault == "formula" else None
+    path = tmp_path / f"secondary-row-{fault}.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    finding = next(
+        finding
+        for finding in scan.findings
+        if finding.rule_id == rule_id and finding.location == "D10"
+    )
+    assert not finding.safe_patch_available
+    assert not any(patch.cell == "D10" for patch in scan.patches)
+
+
+def test_visually_marked_blank_formula_gap_is_findings_only(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Item", "Calculated"])
+    for row in range(2, 22):
+        worksheet.append([f"Item {row}", f'=A{row}&"-done"'])
+    worksheet["B10"] = None
+    worksheet["B10"].fill = PatternFill("solid", fgColor="FFF2CC")
+    path = tmp_path / "highlighted-blank-formula-gap.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    finding = next(
+        finding
+        for finding in scan.findings
+        if finding.rule_id == "WL003_BLANK_IN_FORMULA_BAND" and finding.location == "B10"
+    )
+    assert not finding.safe_patch_available
+    assert not any(patch.cell == "B10" for patch in scan.patches)
+
+
+def test_summary_label_outside_inferred_region_blocks_numeric_and_style_patches(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet["C1"] = "Item"
+    worksheet["D1"] = "Amount"
+    for row in range(2, 22):
+        worksheet[f"C{row}"] = f"R{row}"
+        worksheet[f"D{row}"] = row * 100
+    worksheet["A10"] = "Summary"
+    worksheet["D10"] = "1200"
+    worksheet["D10"].font = Font(bold=True)
+    path = tmp_path / "outside-region-summary.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    findings = {(finding.rule_id, finding.location) for finding in scan.findings}
+    assert ("WL006_NUMERIC_TEXT", "D10") in findings
+    assert ("WL007_STYLE_OUTLIER", "D10") in findings
+    assert not any(patch.cell == "D10" for patch in scan.patches)
+
+
+def test_intentionally_highlighted_row_blocks_content_and_style_patches(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Item", "Amount", "Calculated"])
+    for row in range(2, 22):
+        worksheet.append([f"Item {row}", row * 100, f"=B{row}*2"])
+    worksheet["B10"] = "1200"
+    worksheet["C10"] = 999
+    highlight = PatternFill("solid", fgColor="FFF2CC")
+    for cell in worksheet[10]:
+        cell.font = Font(bold=True)
+        cell.fill = highlight
+    path = tmp_path / "highlighted-override-row.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    findings = {(finding.rule_id, finding.location) for finding in scan.findings}
+    assert ("WL004_HARDCODED_VALUE_IN_FORMULA_BAND", "C10") in findings
+    assert ("WL006_NUMERIC_TEXT", "B10") in findings
+    assert ("WL007_STYLE_OUTLIER", "B10") in findings
+    assert not any(patch.cell in {"B10", "C10"} for patch in scan.patches)
+
+
+def test_freeform_only_row_labels_keep_formula_and_style_findings_review_only(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    names = [
+        "Alice",
+        "Bob",
+        "Carol",
+        "Diego",
+        "Eve",
+        "Fatima",
+        "Grace",
+        "Special Case",
+        "Hiro",
+        "Iris",
+        "Jamal",
+        "Kai",
+        "Lina",
+        "Marta",
+        "Nora",
+        "Omar",
+        "Pia",
+        "Quinn",
+        "Ravi",
+        "Sara",
+    ]
+    worksheet.append(["Name", "Amount", "Calculated"])
+    for row, name in enumerate(names, start=2):
+        worksheet.append([name, row * 100, f"=B{row}*2"])
+    worksheet["B9"].font = Font(bold=True)
+    worksheet["C9"] = 999
+    path = tmp_path / "freeform-label-special-case.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    findings = {(finding.rule_id, finding.location) for finding in scan.findings}
+    assert ("WL004_HARDCODED_VALUE_IN_FORMULA_BAND", "C9") in findings
+    assert ("WL007_STYLE_OUTLIER", "B9") in findings
+    assert not any(patch.cell in {"B9", "C9"} for patch in scan.patches)
+
+
 def test_hidden_adjacent_row_suppresses_sum_boundary(tmp_path: Path) -> None:
     workbook = Workbook()
     worksheet = workbook.active
@@ -169,6 +948,73 @@ def test_hidden_adjacent_row_suppresses_sum_boundary(tmp_path: Path) -> None:
     workbook.close()
     scan = scan_workbook(path)
     assert not any(finding.rule_id == "WL005_SUSPICIOUS_SUM_BOUNDARY" for finding in scan.findings)
+
+
+def test_sum_boundary_numeric_candidate_is_findings_only(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    for row in range(2, 10):
+        worksheet.cell(row, 1, f"R{row}")
+        worksheet.cell(row, 2, row * 100)
+    worksheet["A10"] = "Total"
+    worksheet["B10"] = "=SUM(B2:B8)"
+    path = tmp_path / "numeric-boundary-findings-only.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    finding = next(
+        finding for finding in scan.findings if finding.rule_id == "WL005_SUSPICIOUS_SUM_BOUNDARY"
+    )
+    assert finding.location == "B10"
+    assert finding.evidence.expected == "=SUM(B2:B9)"
+    assert not finding.safe_patch_available
+    assert not any(patch.cell == "B10" for patch in scan.patches)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Subtotal",
+        "Sub-total",
+        "Grand-total",
+        "Total adjustment",
+        "Average",
+        "Mean",
+        "Minimum",
+        "Maximum",
+        "Summary",
+        "小计",
+        "合计金额",
+        "汇总金额",
+        "平均金额",
+        "最大金额",
+        "最小金额",
+        "总金额",
+        "累计金额",
+        "净额",
+        "期末余额",
+    ],
+)
+def test_sum_boundary_subtotal_candidate_is_findings_only(tmp_path: Path, label: str) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    for row in range(2, 10):
+        worksheet.cell(row, 2, row * 100)
+    worksheet["A9"] = label
+    worksheet["B10"] = "=SUM(B2:B8)"
+    path = tmp_path / f"subtotal-boundary-{len(label)}.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL005_SUSPICIOUS_SUM_BOUNDARY" and finding.location == "B10"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "B10" for patch in scan.patches)
 
 
 def test_sum_boundary_does_not_cross_explicit_sheet_reference(tmp_path: Path) -> None:
@@ -188,19 +1034,27 @@ def test_sum_boundary_does_not_cross_explicit_sheet_reference(tmp_path: Path) ->
     assert not any(finding.rule_id == "WL005_SUSPICIOUS_SUM_BOUNDARY" for finding in scan.findings)
 
 
-def test_sum_boundary_requires_literal_numeric_adjacent_cell(tmp_path: Path) -> None:
+def test_sum_boundary_reports_adjacent_formula_without_patch(tmp_path: Path) -> None:
     workbook = Workbook()
     worksheet = workbook.active
     assert worksheet is not None
     for row in range(2, 9):
+        worksheet.cell(row, 1, f"R{row}")
         worksheet.cell(row, 2, row)
+    worksheet["A9"] = "R9"
     worksheet["B9"] = "=1+1"
+    worksheet["A10"] = "Total"
     worksheet["B10"] = "=SUM(B2:B8)"
     path = tmp_path / "formula-adjacent-sum.xlsx"
     workbook.save(path)
     workbook.close()
     scan = scan_workbook(path)
-    assert not any(finding.rule_id == "WL005_SUSPICIOUS_SUM_BOUNDARY" for finding in scan.findings)
+    finding = next(
+        finding for finding in scan.findings if finding.rule_id == "WL005_SUSPICIOUS_SUM_BOUNDARY"
+    )
+    assert finding.location == "B10"
+    assert not finding.safe_patch_available
+    assert not any(patch.cell == "B10" for patch in scan.patches)
 
 
 def test_scientific_notation_text_is_not_auto_converted(tmp_path: Path) -> None:
@@ -256,6 +1110,130 @@ def test_merged_header_is_not_reported_as_data_body_merge(tmp_path: Path) -> Non
     assert not any(
         finding.rule_id == "WL014_MERGED_CELL_IN_DATA_REGION" for finding in scan.findings
     )
+
+
+def test_merged_non_anchor_formula_gap_is_never_auto_patched(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    for row in range(4, 12):
+        for column in range(2, 7):
+            worksheet.cell(row, column, row + column)
+    for column in (2, 3, 5, 6):
+        coordinate = worksheet.cell(12, column).coordinate
+        source = worksheet.cell(11, column).coordinate
+        worksheet[coordinate] = f"={source}*2"
+    worksheet.merge_cells("C12:D12")
+    path = tmp_path / "merged-non-anchor.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    finding = next(
+        finding
+        for finding in scan.findings
+        if finding.rule_id == "WL003_BLANK_IN_FORMULA_BAND" and finding.location == "D12"
+    )
+    assert not finding.safe_patch_available
+    assert not any(patch.cell == "D12" for patch in scan.patches)
+
+
+def test_merged_anchor_formula_gap_is_never_auto_patched(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    for row in (2, 3, 5, 6):
+        worksheet[f"B{row}"] = f"=A{row}*2"
+    worksheet.merge_cells("B4:C4")
+    path = tmp_path / "merged-anchor-gap.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL003_BLANK_IN_FORMULA_BAND" and finding.location == "B4"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "B4" for patch in scan.patches)
+
+
+def test_merged_anchor_literal_is_never_replaced(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    for row in range(2, 22):
+        worksheet[f"B{row}"] = f"=A{row}*2"
+    worksheet["B10"] = "Merged note"
+    worksheet.merge_cells("B10:C10")
+    path = tmp_path / "merged-anchor-literal.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL004_HARDCODED_VALUE_IN_FORMULA_BAND" and finding.location == "B10"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "B10" for patch in scan.patches)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Subtotal",
+        "Sub-total",
+        "Grand-total",
+        "Average",
+        "Mean",
+        "Minimum",
+        "Maximum",
+        "小计",
+        "小计金额",
+        "合计金额",
+        "汇总金额",
+        "平均金额",
+        "最大金额",
+        "最小金额",
+    ],
+)
+def test_summary_row_literal_is_never_replaced(tmp_path: Path, label: str) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    for row in range(2, 22):
+        worksheet[f"B{row}"] = f"=A{row}*2"
+    worksheet["A10"] = label
+    worksheet["B10"] = 999
+    path = tmp_path / f"summary-literal-{len(label)}.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL004_HARDCODED_VALUE_IN_FORMULA_BAND" and finding.location == "B10"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "B10" for patch in scan.patches)
+
+
+def test_hidden_literal_is_never_replaced(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    for row in range(2, 22):
+        worksheet[f"B{row}"] = f"=A{row}*2"
+    worksheet["B10"] = 999
+    worksheet.row_dimensions[10].hidden = True
+    path = tmp_path / "hidden-literal.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL004_HARDCODED_VALUE_IN_FORMULA_BAND" and finding.location == "B10"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "B10" for patch in scan.patches)
 
 
 def test_all_fifteen_builtin_rule_ids_are_stable(demo_scan: ScanResult, tmp_path: Path) -> None:
