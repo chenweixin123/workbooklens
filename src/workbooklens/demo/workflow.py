@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -88,7 +89,6 @@ def generate_demo_workbook(path: Path) -> None:
         sales[f"C{row}"].number_format = "$#,##0.00"
         sales[f"D{row}"].number_format = "$#,##0.00"
         sales[f"E{row}"].number_format = "$#,##0.00"
-    sales["C17"].number_format = "0.0%"  # One style/number-format outlier.
     sales.row_dimensions[20].hidden = True
     validation = DataValidation(type="list", formula1='"Open,Paid,Void"', allow_blank=False)
     sales.add_data_validation(validation)
@@ -131,6 +131,10 @@ def generate_demo_workbook(path: Path) -> None:
     hidden.sheet_state = "hidden"
     workbook.defined_names.add(DefinedName("BrokenName", attr_text="#REF!"))
     _style_cells(workbook)
+    sales["D8"]._style = copy(sales["D7"]._style)  # Pure content gap; no visual leave-blank signal.
+    sales["C17"].font = Font(
+        name="Arial", size=10, italic=True, color="FF9C0006"
+    )  # One visual-only style outlier; numeric semantics remain unchanged.
     # openpyxl is intentionally used only to create the demo input, never to save a repair.
     workbook.save(path)
     workbook.close()

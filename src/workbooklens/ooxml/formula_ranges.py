@@ -40,22 +40,16 @@ def _sheet_parts(archive: zipfile.ZipFile, limits: PackageLimits) -> dict[str, s
     relationships_root = parse_xml_part(
         _bounded_part(archive, relationships_part, limits), relationships_part
     )
-    relationships: dict[str, str] = {}
+    relationships: dict[str, tuple[str, str]] = {}
     for relationship in relationships_root:
         if etree.QName(relationship).localname != "Relationship":
             continue
         relationship_id = relationship.get("Id")
         target = relationship.get("Target")
         relationship_type = relationship.get("Type", "")
-        if not relationship_id or not target or not relationship_type.endswith("/worksheet"):
+        if not relationship_id or not target:
             continue
-        candidate = target.lstrip("/") if target.startswith("/") else posixpath.join("xl", target)
-        normalized = posixpath.normpath(candidate)
-        if normalized.startswith("../") or normalized in {"", ".", ".."}:
-            raise UnsafeWorkbookError(
-                f"Worksheet relationship target escapes the package: {target!r}"
-            )
-        relationships[relationship_id] = normalized
+        relationships[relationship_id] = (relationship_type, target)
     result: dict[str, str] = {}
     for sheet in workbook_root.iter():
         if etree.QName(sheet).localname != "sheet":
@@ -74,7 +68,20 @@ def _sheet_parts(archive: zipfile.ZipFile, limits: PackageLimits) -> dict[str, s
         )
         if not name or not relationship_id or relationship_id not in relationships:
             raise UnsafeWorkbookError("Workbook contains a malformed worksheet relationship")
-        result[name] = relationships[relationship_id]
+        relationship_type, target = relationships[relationship_id]
+        if relationship_type.endswith("/chartsheet"):
+            continue
+        if not relationship_type.endswith("/worksheet"):
+            raise UnsafeWorkbookError(
+                f"Workbook contains an unsupported sheet relationship type: {relationship_type!r}"
+            )
+        candidate = target.lstrip("/") if target.startswith("/") else posixpath.join("xl", target)
+        normalized = posixpath.normpath(candidate)
+        if normalized.startswith("../") or normalized in {"", ".", ".."}:
+            raise UnsafeWorkbookError(
+                f"Worksheet relationship target escapes the package: {target!r}"
+            )
+        result[name] = normalized
     return result
 
 

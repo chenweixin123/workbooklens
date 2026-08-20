@@ -46,8 +46,8 @@ jobs:
       - run: uv run mypy src
       - run: uv run python -m pytest -q
       - run: uv build --out-dir dist
-      - run: uvx --from twine twine check dist/*
-      - run: python scripts/check_release_artifacts.py dist --version 2.0.0
+      - run: uvx --from twine twine check --strict dist/*
+      - run: python scripts/check_release_artifacts.py dist --version 2.1.0
       - name: Create checksums
         run: sha256sum dist/* > SHA256SUMS
       - uses: actions/upload-artifact@v7
