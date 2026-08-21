@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from click import unstyle
 from openpyxl import Workbook
 from typer.testing import CliRunner
 
@@ -34,12 +35,18 @@ def test_help_version_and_required_commands() -> None:
 
 
 def test_apply_help_explains_layout_review_opt_in() -> None:
-    result = runner.invoke(app, ["apply", "--help"])
+    result = runner.invoke(
+        app,
+        ["apply", "--help"],
+        color=False,
+        terminal_width=160,
+    )
+    help_text = unstyle(result.stdout)
 
     assert result.exit_code == 0
-    assert "--accept-layout-risk" in result.stdout
-    assert "--safe-only" in result.stdout
-    assert "layout-review" in result.stdout
+    assert "--accept-layout-risk" in help_text
+    assert "--safe-only" in help_text
+    assert "layout-review" in help_text
 
 
 def test_plan_reports_safe_and_layout_review_counts(
