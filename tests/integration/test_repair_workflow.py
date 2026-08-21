@@ -33,11 +33,13 @@ def test_demo_applies_four_safe_patch_types_and_reopens(completed_demo: DemoOutp
     plan = PatchPlan.model_validate_json(completed_demo.repair_plan.read_text(encoding="utf-8"))
     report_path = completed_demo.directory / "apply-report.json"
     result = PatchResult.model_validate_json(report_path.read_text(encoding="utf-8"))
-    assert len(plan.patches) == 4
+    safe_patch_ids = {patch.id for patch in plan.patches if patch.safe_only_eligible}
+    assert len(safe_patch_ids) == 4
+    assert len(plan.patches) >= len(safe_patch_ids)
     assert plan.findings
     assert {finding.id for finding in plan.findings} == set(plan.finding_ids)
     assert all(finding.evidence.summary for finding in plan.findings)
-    assert len(result.applied_patch_ids) == 4
+    assert set(result.applied_patch_ids) == safe_patch_ids
     assert result.source_sha256 == sha256_file(completed_demo.before_workbook)
     assert result.output_sha256 == sha256_file(completed_demo.after_workbook)
     workbook = load_workbook(completed_demo.after_workbook, read_only=True, data_only=False)

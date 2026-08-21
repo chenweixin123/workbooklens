@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from workbooklens.models import SEVERITY_RANK, Finding, PatchOperation, WorkbookSnapshot
+from workbooklens.models import SEVERITY_RANK, Finding, PatchKind, PatchOperation, WorkbookSnapshot
 from workbooklens.ooxml.formula_ranges import find_unsupported_formula_ranges
 from workbooklens.ooxml.safety import PackageInspection, PackageLimits, inspect_package
 from workbooklens.regions import infer_data_regions, infer_formula_bands
@@ -23,6 +23,67 @@ class ScanResult:
     snapshot: WorkbookSnapshot
     findings: list[Finding]
     patches: list[PatchOperation]
+
+
+def _normalize_column_width_patches(
+    findings: list[Finding],
+    patches: list[PatchOperation],
+) -> tuple[list[Finding], list[PatchOperation]]:
+    """Collapse monotonic same-column width requests to their sufficient maximum."""
+
+    groups: dict[tuple[str, str], list[PatchOperation]] = {}
+    for patch in patches:
+        if patch.kind != PatchKind.SET_COLUMN_WIDTH or not isinstance(patch.after, dict):
+            continue
+        column = patch.after.get("column")
+        width = patch.after.get("width")
+        if (
+            not isinstance(column, str)
+            or isinstance(width, bool)
+            or not isinstance(width, (int, float))
+        ):
+            continue
+        groups.setdefault((patch.sheet, column.upper()), []).append(patch)
+    replacement: dict[str, str] = {}
+    removed: set[str] = set()
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        if any(patch.atomic_group is not None for patch in group):
+            continue
+        chosen = sorted(
+            group,
+            key=lambda patch: (-float(patch.after["width"]), patch.id),
+        )[0]
+        for patch in group:
+            replacement[patch.id] = chosen.id
+            if patch.id != chosen.id:
+                removed.add(patch.id)
+    normalized_patches = [patch for patch in patches if patch.id not in removed]
+    by_id = {patch.id: patch for patch in normalized_patches}
+    normalized_findings: list[Finding] = []
+    for finding in findings:
+        identifiers: list[str] = []
+        for patch_id in finding.patch_ids:
+            normalized = replacement.get(patch_id, patch_id)
+            if normalized not in identifiers:
+                identifiers.append(normalized)
+        missing = [patch_id for patch_id in identifiers if patch_id not in by_id]
+        if missing:
+            raise RuntimeError(
+                f"Finding {finding.id} references missing patches: {', '.join(sorted(missing))}"
+            )
+        normalized_findings.append(
+            finding.model_copy(
+                update={
+                    "patch_ids": identifiers,
+                    "safe_patch_available": any(
+                        by_id[patch_id].safe_only_eligible for patch_id in identifiers
+                    ),
+                }
+            )
+        )
+    return normalized_findings, normalized_patches
 
 
 def scan_workbook(
@@ -72,7 +133,13 @@ def scan_workbook(
                     )
                 finding_by_id[finding.id] = finding
             for patch in rule_result.patches:
+                existing = patch_by_id.get(patch.id)
+                if existing is not None and existing.model_dump(mode="json") != patch.model_dump(
+                    mode="json"
+                ):
+                    raise RuntimeError(f"Conflicting patch identity generated: {patch.id}")
                 patch_by_id[patch.id] = patch
+            context.prior_patches = tuple(patch_by_id.values())
         if inspection.format == "xlsm":
             finding_by_id = {
                 finding_id: finding.model_copy(
@@ -81,8 +148,12 @@ def scan_workbook(
                 for finding_id, finding in finding_by_id.items()
             }
             patch_by_id.clear()
+        normalized_findings, normalized_patches = _normalize_column_width_patches(
+            list(finding_by_id.values()),
+            list(patch_by_id.values()),
+        )
         findings = sorted(
-            finding_by_id.values(),
+            normalized_findings,
             key=lambda finding: (
                 -SEVERITY_RANK[finding.severity],
                 finding.rule_id,
@@ -92,7 +163,7 @@ def scan_workbook(
             ),
         )
         patches = sorted(
-            patch_by_id.values(), key=lambda patch: (patch.sheet, patch.cell, patch.kind, patch.id)
+            normalized_patches, key=lambda patch: (patch.sheet, patch.cell, patch.kind, patch.id)
         )
         return ScanResult(
             inspection=inspection,

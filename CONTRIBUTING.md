@@ -48,7 +48,7 @@ uv run python -m pytest -q
 uv run workbooklens demo --out .artifacts/demo
 uv build --out-dir dist
 uvx --from twine twine check --strict dist/*
-python scripts/check_release_artifacts.py dist --version 2.1.0
+python scripts/check_release_artifacts.py dist --version 2.2.0
 ~~~
 
 Review for unsafe ZIP handling, unbounded memory/ranges, inaccurate documentation, source rewrites,

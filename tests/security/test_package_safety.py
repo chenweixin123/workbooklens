@@ -17,6 +17,10 @@ from workbooklens.ooxml.safety import (
 from workbooklens.worksheet_state import hidden_column_labels
 
 CONTENT_TYPES = b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>'
+XLSX_WORKBOOK_CONTENT_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+)
+XLSM_WORKBOOK_CONTENT_TYPE = "application/vnd.ms-excel.sheet.macroEnabled.main+xml"
 WORKBOOK = b'<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>'
 ROOT_RELS = b"""<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
@@ -26,13 +30,23 @@ ROOT_RELS = b"""<Relationships xmlns="http://schemas.openxmlformats.org/package/
 def _minimal_package(
     path: Path,
     extras: list[tuple[str | zipfile.ZipInfo, bytes]] | None = None,
+    *,
+    content_types: bytes = CONTENT_TYPES,
 ) -> None:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", CONTENT_TYPES)
+        archive.writestr("[Content_Types].xml", content_types)
         archive.writestr("_rels/.rels", ROOT_RELS)
         archive.writestr("xl/workbook.xml", WORKBOOK)
         for name, data in extras or []:
             archive.writestr(name, data)
+
+
+def _content_types(*declarations: str) -> bytes:
+    body = "".join(declarations)
+    return (
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        f"{body}</Types>"
+    ).encode()
 
 
 def test_valid_openpyxl_package_passes(tmp_path: Path) -> None:
@@ -44,6 +58,106 @@ def test_valid_openpyxl_package_passes(tmp_path: Path) -> None:
     inspection = inspect_package(path)
     assert inspection.format == "xlsx"
     assert "xl/workbook.xml" in inspection.part_names
+
+
+def test_default_only_xlsx_content_type_is_repairable(tmp_path: Path) -> None:
+    path = tmp_path / "default-only.xlsx"
+    _minimal_package(
+        path,
+        content_types=_content_types(
+            f'<Default Extension=".XML" ContentType="{XLSX_WORKBOOK_CONTENT_TYPE.upper()}"/>'
+        ),
+    )
+
+    inspection = inspect_package(path)
+
+    assert inspection.content_format == "xlsx"
+    assert inspection.has_vba is False
+    assert inspection.format_mismatch is False
+    assert inspection.repairable is True
+    assert inspection.format == "xlsx"
+
+
+def test_default_only_macro_content_type_is_read_only(tmp_path: Path) -> None:
+    path = tmp_path / "default-macro.xlsx"
+    _minimal_package(
+        path,
+        content_types=_content_types(
+            f'<Default Extension="xml" ContentType="{XLSM_WORKBOOK_CONTENT_TYPE}"/>'
+        ),
+    )
+
+    inspection = inspect_package(path)
+
+    assert inspection.content_format == "xlsm"
+    assert inspection.has_vba is True
+    assert inspection.format_mismatch is True
+    assert inspection.repairable is False
+    assert inspection.format == "xlsm"
+
+
+def test_default_only_extension_mismatch_is_read_only(tmp_path: Path) -> None:
+    path = tmp_path / "default-xlsx.xlsm"
+    _minimal_package(
+        path,
+        content_types=_content_types(
+            f'<Default Extension="xml" ContentType="{XLSX_WORKBOOK_CONTENT_TYPE}"/>'
+        ),
+    )
+
+    inspection = inspect_package(path)
+
+    assert inspection.content_format == "xlsx"
+    assert inspection.has_vba is False
+    assert inspection.format_mismatch is True
+    assert inspection.repairable is False
+    assert inspection.format == "xlsm"
+
+
+def test_override_precedence_does_not_hide_macro_markers(tmp_path: Path) -> None:
+    path = tmp_path / "macro-marker.xlsx"
+    _minimal_package(
+        path,
+        content_types=_content_types(
+            f'<Default Extension="xml" ContentType="{XLSM_WORKBOOK_CONTENT_TYPE}"/>',
+            f'<Override PartName="/xl/workbook.xml" ContentType="{XLSX_WORKBOOK_CONTENT_TYPE}"/>',
+        ),
+    )
+
+    inspection = inspect_package(path)
+
+    assert inspection.content_format == "xlsm"
+    assert inspection.has_vba is True
+    assert inspection.format_mismatch is True
+    assert inspection.repairable is False
+
+
+def test_conflicting_override_content_types_are_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "conflicting-override.xlsx"
+    _minimal_package(
+        path,
+        content_types=_content_types(
+            f'<Override PartName="/xl/workbook.xml" ContentType="{XLSX_WORKBOOK_CONTENT_TYPE}"/>',
+            f'<Override PartName="xl/workbook.xml" ContentType="{XLSM_WORKBOOK_CONTENT_TYPE}"/>',
+        ),
+    )
+
+    with pytest.raises(UnsafeWorkbookError, match="conflicting Override"):
+        inspect_package(path)
+
+
+def test_conflicting_default_content_types_are_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "conflicting-default.xlsx"
+    _minimal_package(
+        path,
+        content_types=_content_types(
+            f'<Default Extension="XML" ContentType="{XLSX_WORKBOOK_CONTENT_TYPE}"/>',
+            f'<Default Extension=".xml" ContentType="{XLSM_WORKBOOK_CONTENT_TYPE}"/>',
+        ),
+    )
+
+    with pytest.raises(UnsafeWorkbookError, match="conflicting Default"):
+        inspect_package(path)
 
 
 @pytest.mark.parametrize("name", ["../escape.xml", "/absolute.xml"])

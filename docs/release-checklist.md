@@ -17,6 +17,12 @@
 - [ ] Charts, drawings, images, relationships, themes, and unknown fixtures remain byte-identical.
 - [ ] Shared, array, data-table, dynamic-array, stale-plan, and malformed inputs fail closed.
 - [ ] Formula edits remove caches and request recalculation without claiming it occurred.
+- [ ] `--safe-only` excludes every `layout_review` patch; explicit layout selection requires
+  `--accept-layout-risk`, confidence at least 0.95, and complete atomic groups.
+- [ ] Row heights, column widths, wrapping, width-only identifier display, saved views, edge-only borders, and
+  exact format-tail cleanup are represented accurately in scan, apply, rescan, and semantic diff.
+- [ ] Format-tail cleanup refuses formulas, names, tables, guarded ranges, links, comments, page
+  breaks, drawings, hidden/outlined rows, and unsupported row metadata.
 
 ## Security and supply chain
 
@@ -33,10 +39,12 @@
 - [ ] The exact wheel is installed into fresh Linux, Windows, and macOS environments.
 - [ ] workbooklens --version, --help, and demo run from the wheel rather than the source tree.
 - [ ] README Bash and PowerShell commands match a clean checkout.
+- [ ] Representative layout repairs are opened in the target spreadsheet application; text is not
+  clipped, identifiers are exact, the initial viewport is useful, and printer/page layout is reviewed.
 
 ## Release candidate and publication
 
-- [ ] Push v2.1.0; the release-candidate workflow validates the tag, builds distributions,
+- [ ] Push v2.2.0; the release-candidate workflow validates the tag, builds distributions,
   generates SHA256SUMS, and uploads workflow artifacts.
 - [ ] Inspect the downloaded artifacts before external publication.
 - [ ] Record whether the release is GitHub-only or also publishes to PyPI.
@@ -46,4 +54,4 @@
   chenweixin123/workbooklens, then publish only from the validated tag using OIDC; do not add a
   long-lived PyPI token.
 - [ ] If publishing to PyPI, verify the project page, uvx installation, and pipx installation for
-  version 2.1.0.
+  version 2.2.0.

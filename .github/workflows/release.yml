@@ -47,12 +47,13 @@ jobs:
       - run: uv run python -m pytest -q
       - run: uv build --out-dir dist
       - run: uvx --from twine twine check --strict dist/*
-      - run: python scripts/check_release_artifacts.py dist --version 2.1.0
+      - run: python scripts/check_release_artifacts.py dist --version 2.2.0
       - name: Create checksums
-        run: sha256sum dist/* > SHA256SUMS
+        working-directory: dist
+        run: sha256sum workbooklens-*.whl workbooklens-*.tar.gz > ../SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
-          name: workbooklens-release-candidate-${{ github.ref_name }}
+          name: workbooklens-release-candidate-${{ github.run_id }}
           path: |
             dist
             SHA256SUMS

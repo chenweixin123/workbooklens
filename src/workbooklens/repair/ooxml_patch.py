@@ -17,13 +17,32 @@ from typing import Any, cast
 from lxml import etree
 from openpyxl import load_workbook
 from openpyxl.cell.cell import Cell
-from openpyxl.utils.cell import coordinate_to_tuple
+from openpyxl.utils.cell import coordinate_to_tuple, get_column_letter
 from openpyxl.worksheet.cell_range import CellRange
 
 from workbooklens.exceptions import PatchValidationError, StalePlanError, UsageError
 from workbooklens.formulas import analyze_formula
 from workbooklens.models import PackageChange, PatchKind, PatchOperation, PatchPlan
 from workbooklens.ooxml.safety import PackageLimits, inspect_package, parse_xml_part
+from workbooklens.repair.layout_ooxml import (
+    StylesEditor,
+    apply_alignment,
+    apply_clear_formatting_tail,
+    apply_column_width,
+    apply_copy_border,
+    apply_remove_whitespace_tail_cells,
+    apply_row_height,
+    apply_set_text,
+    apply_sheet_view,
+    is_layout_kind,
+    needs_styles,
+    patch_target_key,
+    tail_authorization,
+    validate_layout_semantics,
+    verify_layout_precondition,
+    whitespace_tail_authorization,
+    whitespace_tail_preserved_style_ids,
+)
 from workbooklens.snapshot import cell_fingerprint, load_for_analysis
 from workbooklens.utils import sha256_file
 from workbooklens.worksheet_state import is_column_hidden
@@ -210,7 +229,12 @@ def _assert_not_in_advanced_formula_range(root: etree._Element, coordinate: str)
             )
 
 
-def _assert_not_in_merged_range(root: etree._Element, coordinate: str) -> None:
+def _assert_not_in_merged_range(
+    root: etree._Element,
+    coordinate: str,
+    *,
+    allow_anchor: bool = False,
+) -> None:
     for element in root.iter():
         if etree.QName(element).localname != "mergeCell":
             continue
@@ -222,6 +246,9 @@ def _assert_not_in_merged_range(root: etree._Element, coordinate: str) -> None:
         except ValueError as exc:
             raise PatchValidationError(f"Invalid merged range {reference!r}") from exc
         if coordinate in merged:
+            anchor = f"{get_column_letter(merged.min_col)}{merged.min_row}"
+            if allow_anchor and coordinate == anchor:
+                return
             raise PatchValidationError(
                 f"target {coordinate} intersects merged range {reference}; automatic patches are refused"
             )
@@ -281,21 +308,27 @@ def _update_dimension(root: etree._Element) -> None:
     ]
     if not cells:
         return
-    coordinates = [coordinate_to_tuple(cast(str, coordinate)) for coordinate in cells]
-    min_row = min(item[0] for item in coordinates)
-    max_row = max(item[0] for item in coordinates)
-    min_column = min(item[1] for item in coordinates)
-    max_column = max(item[1] for item in coordinates)
-    from openpyxl.utils.cell import get_column_letter
-
-    start = f"{get_column_letter(min_column)}{min_row}"
-    end = f"{get_column_letter(max_column)}{max_row}"
     dimension = next(
         (element for element in root if etree.QName(element).localname == "dimension"),
         None,
     )
-    if dimension is not None:
-        dimension.set("ref", start if start == end else f"{start}:{end}")
+    if dimension is None:
+        return
+    existing_ref = dimension.get("ref")
+    if not existing_ref:
+        raise PatchValidationError("Worksheet dimension is missing its ref attribute")
+    try:
+        existing = CellRange(existing_ref)
+    except (TypeError, ValueError) as exc:
+        raise PatchValidationError("Worksheet dimension ref is malformed") from exc
+    coordinates = [coordinate_to_tuple(cast(str, coordinate)) for coordinate in cells]
+    min_row = min(existing.min_row, *(item[0] for item in coordinates))
+    max_row = max(existing.max_row, *(item[0] for item in coordinates))
+    min_column = min(existing.min_col, *(item[1] for item in coordinates))
+    max_column = max(existing.max_col, *(item[1] for item in coordinates))
+    start = f"{get_column_letter(min_column)}{min_row}"
+    end = f"{get_column_letter(max_column)}{max_row}"
+    dimension.set("ref", start if start == end else f"{start}:{end}")
 
 
 def _serialize_xml(root: etree._Element) -> bytes:
@@ -351,6 +384,7 @@ def _verify_preconditions(
                 raise StalePlanError(
                     f"Cell precondition failed for {patch.sheet}!{patch.cell}; plan is stale"
                 )
+            verify_layout_precondition(worksheet, patch)
             if worksheet.protection.sheet:
                 raise PatchValidationError(
                     f"Patch target is on protected worksheet {patch.sheet!r}; unprotect it before repair"
@@ -369,6 +403,94 @@ def _verify_preconditions(
                     f"Patch target is in a hidden column at {patch.sheet}!{patch.cell}; "
                     "unhide it before repair"
                 )
+            if patch.kind == PatchKind.CLEAR_FORMATTING_TAIL:
+                tail_cells, tail_rows = tail_authorization(patch)
+                for coordinate in tail_cells:
+                    tail_cell = worksheet[coordinate]
+                    if not isinstance(tail_cell, Cell):
+                        raise PatchValidationError(
+                            f"Formatting-tail target is not a cell: {patch.sheet}!{coordinate}"
+                        )
+                    if tail_cell.value is not None:
+                        raise PatchValidationError(
+                            f"Formatting-tail target contains a value: {patch.sheet}!{coordinate}"
+                        )
+                    if tail_cell.comment is not None or tail_cell.hyperlink is not None:
+                        raise PatchValidationError(
+                            f"Formatting-tail target has a comment or hyperlink: "
+                            f"{patch.sheet}!{coordinate}"
+                        )
+                    row_dimension = worksheet.row_dimensions.get(tail_cell.row)
+                    if row_dimension is not None and row_dimension.hidden:
+                        raise PatchValidationError(
+                            f"Formatting-tail target is on hidden row {patch.sheet}!{tail_cell.row}"
+                        )
+                    if is_column_hidden(worksheet, tail_cell.column):
+                        raise PatchValidationError(
+                            f"Formatting-tail target is in hidden column {patch.sheet}!{coordinate}"
+                        )
+                for row in tail_rows:
+                    dimension = worksheet.row_dimensions.get(row)
+                    if dimension is None:
+                        raise PatchValidationError(
+                            f"Formatting-tail row is absent: {patch.sheet}!{row}"
+                        )
+                    if dimension.hidden or dimension.collapsed or dimension.outlineLevel:
+                        raise PatchValidationError(
+                            f"Formatting-tail cleanup refuses hidden, collapsed, or outlined row {row}"
+                        )
+            if patch.kind == PatchKind.REMOVE_WHITESPACE_TAIL_CELLS:
+                preserve_style_ids = whitespace_tail_preserved_style_ids(patch)
+                for coordinate in whitespace_tail_authorization(patch):
+                    target = worksheet[coordinate]
+                    if not isinstance(target, Cell):
+                        raise PatchValidationError(
+                            f"Whitespace-tail target is not a cell: {patch.sheet}!{coordinate}"
+                        )
+                    value = target.value
+                    if (
+                        target.data_type != "s"
+                        or not isinstance(value, str)
+                        or not value
+                        or value.strip()
+                        or any(character in "\r\n\t" for character in value)
+                        or target.quotePrefix
+                        or (target.number_format or "General").strip().casefold() != "general"
+                    ):
+                        raise PatchValidationError(
+                            f"Whitespace-tail target is no longer simple literal whitespace: "
+                            f"{patch.sheet}!{coordinate}"
+                        )
+                    if target.comment is not None or target.hyperlink is not None:
+                        raise PatchValidationError(
+                            f"Whitespace-tail target has a comment or hyperlink: "
+                            f"{patch.sheet}!{coordinate}"
+                        )
+                    expected_style_id = preserve_style_ids.get(coordinate)
+                    if expected_style_id is None and target.style_id != 0:
+                        raise PatchValidationError(
+                            f"Whitespace-tail target has an unauthorized non-default style: "
+                            f"{patch.sheet}!{coordinate}"
+                        )
+                    if expected_style_id is not None and target.style_id != expected_style_id:
+                        raise PatchValidationError(
+                            f"Whitespace-tail target style no longer matches its authorization: "
+                            f"{patch.sheet}!{coordinate}"
+                        )
+                    row_dimension = worksheet.row_dimensions.get(target.row)
+                    if row_dimension is not None and row_dimension.hidden:
+                        raise PatchValidationError(
+                            f"Whitespace-tail target is on hidden row {patch.sheet}!{target.row}"
+                        )
+                    if is_column_hidden(worksheet, target.column):
+                        raise PatchValidationError(
+                            f"Whitespace-tail target is in hidden column {patch.sheet}!{coordinate}"
+                        )
+                    if any(coordinate in merged for merged in worksheet.merged_cells.ranges):
+                        raise PatchValidationError(
+                            f"Whitespace-tail target intersects a merged range: "
+                            f"{patch.sheet}!{coordinate}"
+                        )
             if patch.kind == PatchKind.COPY_STYLE:
                 if not patch.source_cell:
                     raise PatchValidationError(f"Style patch {patch.id} has no source cell")
@@ -397,6 +519,25 @@ def _verify_preconditions(
                     raise PatchValidationError(
                         f"Style patch {patch.id} would change pivot-button semantics"
                     )
+            elif patch.kind == PatchKind.COPY_BORDER:
+                if not patch.source_cell:
+                    raise PatchValidationError(f"Border patch {patch.id} has no source cell")
+                source_cell = worksheet[patch.source_cell]
+                if not isinstance(source_cell, Cell):
+                    raise PatchValidationError(
+                        f"Border patch source is not a writable cell: "
+                        f"{patch.sheet}!{patch.source_cell}"
+                    )
+                source_row = worksheet.row_dimensions.get(source_cell.row)
+                if source_row is not None and source_row.hidden:
+                    raise PatchValidationError(
+                        f"Border patch source is on hidden row {patch.sheet}!{source_cell.row}"
+                    )
+                if is_column_hidden(worksheet, source_cell.column):
+                    raise PatchValidationError(
+                        f"Border patch source is in a hidden column: "
+                        f"{patch.sheet}!{patch.source_cell}"
+                    )
     finally:
         workbook.close()
 
@@ -407,6 +548,7 @@ def _select_patches(
     safe_only: bool,
     *,
     enforce_safety: bool = True,
+    accept_layout_risk: bool = False,
 ) -> list[PatchOperation]:
     by_id = {patch.id: patch for patch in plan.patches}
     if len(by_id) != len(plan.patches):
@@ -414,9 +556,21 @@ def _select_patches(
     if safe_only and selected_ids:
         raise UsageError("--safe-only and --patch-id are mutually exclusive")
     if safe_only:
-        selected = [
-            patch for patch in plan.patches if patch.safe and float(patch.confidence) >= 0.95
-        ]
+        selected = [patch for patch in plan.patches if patch.safe_only_eligible]
+        selected_set = {patch.id for patch in selected}
+        incomplete_safe_groups = {
+            patch.atomic_group
+            for patch in selected
+            if patch.atomic_group
+            and any(
+                member.atomic_group == patch.atomic_group and member.id not in selected_set
+                for member in plan.patches
+            )
+        }
+        if incomplete_safe_groups:
+            selected = [
+                patch for patch in selected if patch.atomic_group not in incomplete_safe_groups
+            ]
     else:
         if not selected_ids:
             raise UsageError("Select at least one --patch-id or pass --safe-only")
@@ -427,18 +581,39 @@ def _select_patches(
     if not selected:
         raise UsageError("No eligible patches were selected")
     if enforce_safety:
-        unsafe = [
-            patch.id for patch in selected if not patch.safe or float(patch.confidence) < 0.95
-        ]
-        if unsafe:
+        rejected: list[str] = []
+        for patch in selected:
+            risk = str(getattr(patch.risk, "value", patch.risk))
+            if risk == "layout_review":
+                if safe_only or not accept_layout_risk or float(patch.confidence) < 0.95:
+                    rejected.append(patch.id)
+                continue
+            if not patch.safe or float(patch.confidence) < 0.95:
+                rejected.append(patch.id)
+        if rejected:
             raise UsageError(
-                "WorkbookLens 2.1 refuses patches below the safe 0.95 threshold: "
-                + ", ".join(unsafe)
+                "WorkbookLens refuses patches outside the authorized repair risk boundary: "
+                + ", ".join(rejected)
             )
+    selected_set = {patch.id for patch in selected}
+    incomplete_groups = sorted(
+        {
+            patch.atomic_group
+            for patch in selected
+            if patch.atomic_group
+            and any(
+                member.atomic_group == patch.atomic_group and member.id not in selected_set
+                for member in plan.patches
+            )
+        }
+    )
+    if incomplete_groups:
+        raise UsageError(
+            "Atomic patch groups must be selected in full: " + ", ".join(incomplete_groups)
+        )
     domains: dict[tuple[str, str, str], list[str]] = {}
     for patch in selected:
-        domain = "style" if patch.kind == PatchKind.COPY_STYLE else "content"
-        domains.setdefault((patch.sheet, patch.cell, domain), []).append(patch.id)
+        domains.setdefault(patch_target_key(patch), []).append(patch.id)
     conflicts = [
         f"{sheet}!{cell} ({domain}: {', '.join(sorted(patch_ids))})"
         for (sheet, cell, domain), patch_ids in sorted(domains.items())
@@ -446,6 +621,25 @@ def _select_patches(
     ]
     if conflicts:
         raise UsageError("Conflicting patches target the same cell: " + "; ".join(conflicts))
+    tails = [patch for patch in selected if patch.kind == PatchKind.CLEAR_FORMATTING_TAIL]
+    for tail in tails:
+        cells, rows = tail_authorization(tail)
+        for patch in selected:
+            if patch.id == tail.id or patch.sheet != tail.sheet:
+                continue
+            patch_row, _ = coordinate_to_tuple(patch.cell)
+            if patch.cell in cells or patch_row in rows:
+                raise UsageError(f"Patch {patch.id} intersects formatting-tail cleanup {tail.id}")
+    whitespace_tails = [
+        patch for patch in selected if patch.kind == PatchKind.REMOVE_WHITESPACE_TAIL_CELLS
+    ]
+    for tail in whitespace_tails:
+        cells = whitespace_tail_authorization(tail)
+        for patch in selected:
+            if patch.id == tail.id or patch.sheet != tail.sheet:
+                continue
+            if patch.cell in cells:
+                raise UsageError(f"Patch {patch.id} intersects whitespace-tail cleanup {tail.id}")
     return selected
 
 
@@ -484,11 +678,61 @@ def _apply_to_parts(
         by_part.setdefault(part, []).append(patch)
     modified: dict[str, bytes] = {}
     formula_changed = False
+    styles: StylesEditor | None = None
+    if any(needs_styles(patch.kind) for patch in selected):
+        styles_name = "xl/styles.xml"
+        if styles_name not in archive.namelist():
+            raise PatchValidationError("Workbook package is missing xl/styles.xml")
+        styles = StylesEditor.from_root(parse_xml_part(archive.read(styles_name), styles_name))
     for part, patches in by_part.items():
         root = parse_xml_part(archive.read(part), part)
+        legacy_dimension_update = False
         for patch in patches:
+            if patch.kind == PatchKind.SET_COLUMN_WIDTH:
+                apply_column_width(root, patch)
+                continue
+            if patch.kind == PatchKind.SET_ROW_HEIGHT:
+                apply_row_height(root, patch)
+                continue
+            if patch.kind == PatchKind.SET_SHEET_VIEW:
+                apply_sheet_view(root, patch)
+                continue
+            if patch.kind == PatchKind.CLEAR_FORMATTING_TAIL:
+                apply_clear_formatting_tail(archive, part, patch.sheet, root, patch)
+                continue
+            if patch.kind == PatchKind.REMOVE_WHITESPACE_TAIL_CELLS:
+                apply_remove_whitespace_tail_cells(archive, part, patch.sheet, root, patch)
+                continue
             _assert_not_in_advanced_formula_range(root, patch.cell)
-            _assert_not_in_merged_range(root, patch.cell)
+            _assert_not_in_merged_range(
+                root,
+                patch.cell,
+                allow_anchor=patch.kind in {PatchKind.SET_WRAP_TEXT, PatchKind.SET_SHRINK_TO_FIT},
+            )
+            if patch.kind == PatchKind.SET_WRAP_TEXT:
+                if styles is None:
+                    raise PatchValidationError("Styles editor was not initialized")
+                apply_alignment(root, patch, styles, shrink=False)
+                continue
+            if patch.kind == PatchKind.SET_SHRINK_TO_FIT:
+                if styles is None:
+                    raise PatchValidationError("Styles editor was not initialized")
+                apply_alignment(root, patch, styles, shrink=True)
+                continue
+            if patch.kind == PatchKind.SET_TEXT:
+                if styles is None:
+                    raise PatchValidationError("Styles editor was not initialized")
+                apply_set_text(root, patch, styles)
+                formula_changed = True
+                continue
+            if patch.kind == PatchKind.COPY_BORDER:
+                if styles is None:
+                    raise PatchValidationError("Styles editor was not initialized")
+                if patch.source_cell:
+                    _assert_not_in_advanced_formula_range(root, patch.source_cell)
+                    _assert_not_in_merged_range(root, patch.source_cell)
+                apply_copy_border(root, patch, styles)
+                continue
             target = _find_or_create_cell(root, patch.cell)
             _assert_simple_formula_cell(target, f"target {patch.sheet}!{patch.cell}")
             source_element = None
@@ -510,16 +754,21 @@ def _apply_to_parts(
                     raise PatchValidationError(f"Patch {patch.id} has a non-string formula")
                 _set_formula(target, patch.after)
                 formula_changed = True
+                legacy_dimension_update = True
             elif patch.kind == PatchKind.SET_NUMERIC:
                 _set_numeric(target, patch.after)
+                legacy_dimension_update = True
             elif patch.kind == PatchKind.COPY_STYLE:
                 if source_element is None:
                     raise PatchValidationError(f"Style patch {patch.id} has no source cell")
                 _copy_style(target, source_element)
             else:
                 raise PatchValidationError(f"Unsupported patch kind: {patch.kind}")
-        _update_dimension(root)
+        if legacy_dimension_update:
+            _update_dimension(root)
         modified[part] = _serialize_xml(root)
+    if styles is not None and styles.dirty:
+        modified["xl/styles.xml"] = _serialize_xml(styles.root)
     if formula_changed:
         modified["xl/workbook.xml"] = _mark_full_recalculation(archive.read("xl/workbook.xml"))
     return modified, formula_changed
@@ -628,6 +877,9 @@ def _validate_semantics(output: Path, selected: list[PatchOperation]) -> None:
                 raise PatchValidationError(
                     f"Patched worksheet is missing from output: {patch.sheet!r}"
                 )
+            if is_layout_kind(patch.kind):
+                validate_layout_semantics(worksheet, patch)
+                continue
             cell = worksheet[patch.cell]
             if (
                 patch.kind
@@ -641,8 +893,23 @@ def _validate_semantics(output: Path, selected: list[PatchOperation]) -> None:
                 raise PatchValidationError(f"Formula verification failed for patch {patch.id}")
             if patch.kind == PatchKind.SET_NUMERIC and cell.value != patch.after:
                 raise PatchValidationError(f"Numeric verification failed for patch {patch.id}")
-            if patch.kind == PatchKind.COPY_STYLE and cell.style_id != patch.after:
-                raise PatchValidationError(f"Style verification failed for patch {patch.id}")
+            if patch.kind == PatchKind.COPY_STYLE:
+                if not patch.source_cell:
+                    raise PatchValidationError(f"Style patch {patch.id} has no source cell")
+                try:
+                    source_row, source_column = coordinate_to_tuple(patch.source_cell)
+                except (TypeError, ValueError) as exc:
+                    raise PatchValidationError(
+                        f"Style patch {patch.id} has an invalid source cell"
+                    ) from exc
+                source_cell = worksheet._cells.get((source_row, source_column))
+                if not isinstance(cell, Cell) or not isinstance(source_cell, Cell):
+                    raise PatchValidationError(
+                        f"Style patch source is missing from output: "
+                        f"{patch.sheet}!{patch.source_cell}"
+                    )
+                if cast(Any, cell)._style != cast(Any, source_cell)._style:
+                    raise PatchValidationError(f"Style verification failed for patch {patch.id}")
     finally:
         workbook.close()
     read_only = load_workbook(output, read_only=True, data_only=False, keep_links=False)
@@ -656,6 +923,7 @@ def patch_ooxml_package(
     *,
     selected_ids: set[str] | None = None,
     safe_only: bool = False,
+    accept_layout_risk: bool = False,
     limits: PackageLimits | None = None,
     canonical_plan: PatchPlan,
 ) -> tuple[OoxmlPatchOutput, list[PatchOperation]]:
@@ -676,10 +944,21 @@ def patch_ooxml_package(
     if output.exists():
         raise UsageError(f"Output already exists and will not be overwritten: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
-    selected = _select_patches(plan, selected_ids, safe_only, enforce_safety=False)
+    selected = _select_patches(
+        plan,
+        selected_ids,
+        safe_only,
+        enforce_safety=False,
+        accept_layout_risk=accept_layout_risk,
+    )
     _verify_preconditions(source, plan, selected, limits)
     _validate_canonical_plan(plan, canonical_plan)
-    selected = _select_patches(canonical_plan, selected_ids, safe_only)
+    selected = _select_patches(
+        canonical_plan,
+        selected_ids,
+        safe_only,
+        accept_layout_risk=accept_layout_risk,
+    )
     source_hash = sha256_file(source)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{output.stem}.", suffix=".xlsx", dir=output.parent

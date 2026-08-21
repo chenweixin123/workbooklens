@@ -82,7 +82,7 @@ jobs:
       - run: uv lock --check
       - run: uv build --out-dir dist
       - run: uvx --from twine twine check --strict dist/*
-      - run: python scripts/check_release_artifacts.py dist --version 2.1.0
+      - run: python scripts/check_release_artifacts.py dist --version 2.2.0
       - uses: actions/upload-artifact@v7
         with:
           name: workbooklens-distributions

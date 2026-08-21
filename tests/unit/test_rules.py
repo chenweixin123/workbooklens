@@ -4,10 +4,13 @@ from pathlib import Path
 
 import pytest
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Protection
+from openpyxl.formula.tokenizer import TokenizerError
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
 
+import workbooklens.rules.builtin as builtin_rules
 from workbooklens.demo.workflow import generate_demo_workbook
-from workbooklens.models import PatchKind
+from workbooklens.models import PatchKind, PatchRisk
+from workbooklens.rules.builtin import BUILTIN_RULES
 from workbooklens.scanner import ScanResult, scan_workbook
 
 
@@ -20,7 +23,7 @@ def demo_scan(tmp_path_factory: pytest.TempPathFactory) -> ScanResult:
     return scan_workbook(path, config=config)
 
 
-def test_demo_exercises_fourteen_rules_and_generated_patch_kinds(demo_scan: ScanResult) -> None:
+def test_demo_exercises_fifteen_rules_and_generated_patch_kinds(demo_scan: ScanResult) -> None:
     rule_ids = {finding.rule_id for finding in demo_scan.findings}
     assert rule_ids == {
         "WL001_BROKEN_REFERENCE",
@@ -37,9 +40,24 @@ def test_demo_exercises_fourteen_rules_and_generated_patch_kinds(demo_scan: Scan
         "WL013_BROKEN_DEFINED_NAME",
         "WL014_MERGED_CELL_IN_DATA_REGION",
         "WL015_INCONSISTENT_DATA_VALIDATION",
+        "WL016_TEXT_DISPLAY_RISK",
     }
-    assert {patch.kind for patch in demo_scan.patches} == set(PatchKind) - {PatchKind.EXTEND_SUM}
-    assert all(patch.safe and float(patch.confidence) >= 0.95 for patch in demo_scan.patches)
+    assert {patch.kind for patch in demo_scan.patches} == {
+        PatchKind.SET_FORMULA,
+        PatchKind.SET_NUMERIC,
+        PatchKind.COPY_STYLE,
+        PatchKind.CREATE_FORMULA,
+        PatchKind.SET_ROW_HEIGHT,
+        PatchKind.SET_WRAP_TEXT,
+    }
+    assert all(
+        patch.safe_only_eligible for patch in demo_scan.patches if patch.risk == PatchRisk.SAFE
+    )
+    assert all(
+        not patch.safe and patch.risk == PatchRisk.LAYOUT_REVIEW
+        for patch in demo_scan.patches
+        if patch.kind in {PatchKind.SET_ROW_HEIGHT, PatchKind.SET_WRAP_TEXT}
+    )
 
 
 def test_formula_pattern_outlier_rule_and_safe_proposal(tmp_path: Path) -> None:
@@ -672,6 +690,129 @@ def test_style_outlier_with_different_number_format_has_no_patch(tmp_path: Path)
     )
 
 
+@pytest.mark.parametrize("missing_side", ["left", "right"])
+def test_single_sided_shared_border_is_visually_equivalent(
+    tmp_path: Path, missing_side: str
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Context", "Amount", "Context"])
+    side = Side(style="thin", color="336699")
+    grid = Border(left=side, right=side, top=side, bottom=side)
+    for row in range(2, 22):
+        worksheet.append([f"L{row}", row * 100, f"R{row}"])
+        for cell in worksheet[row]:
+            cell.border = grid
+    target = worksheet["B10"]
+    target.border = Border(
+        left=None if missing_side == "left" else side,
+        right=None if missing_side == "right" else side,
+        top=side,
+        bottom=side,
+    )
+    path = tmp_path / f"shared-border-{missing_side}.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert not any(
+        finding.rule_id == "WL007_STYLE_OUTLIER" and finding.location == "B10"
+        for finding in scan.findings
+    )
+
+
+@pytest.mark.parametrize("component", ["font", "fill", "alignment", "number_format", "border"])
+def test_material_visual_style_difference_remains_an_outlier(
+    tmp_path: Path, component: str
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Context", "Amount"])
+    side = Side(style="thin", color="336699")
+    grid = Border(left=side, right=side, top=side, bottom=side)
+    for row in range(2, 22):
+        worksheet.append([f"R{row}", row * 100])
+        for cell in worksheet[row]:
+            cell.border = grid
+    target = worksheet["B10"]
+    if component == "font":
+        target.font = Font(bold=True)
+    elif component == "fill":
+        target.fill = PatternFill("solid", fgColor="FFF2CC")
+    elif component == "alignment":
+        target.alignment = Alignment(horizontal="right")
+    elif component == "number_format":
+        target.number_format = "0.00"
+    else:
+        target.border = Border(right=side, top=side, bottom=side)
+        worksheet["A10"].border = Border(left=side, top=side, bottom=side)
+    path = tmp_path / f"material-style-{component}.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL007_STYLE_OUTLIER" and finding.location == "B10"
+        for finding in scan.findings
+    )
+
+
+def test_row_local_sum_does_not_hide_a_style_outlier(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Item", "A", "B", "C", "Row total"])
+    for row in range(2, 22):
+        worksheet.append([f"R{row}", row, row + 1, row + 2, f"=SUM(B{row}:D{row})+$A$1"])
+    worksheet["C10"].font = Font(bold=True)
+    path = tmp_path / "row-local-sum-style-outlier.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+
+    assert any(
+        finding.rule_id == "WL007_STYLE_OUTLIER" and finding.location == "C10"
+        for finding in scan.findings
+    )
+
+
+def test_unlabelled_cross_row_sum_still_marks_a_summary_row(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Item", "Amount"])
+    for row in range(2, 22):
+        worksheet.append([f"R{row}", row * 10])
+    worksheet.append(["Result", "=SUM(B2:B21)"])
+    worksheet["B22"].font = Font(bold=True)
+    path = tmp_path / "unlabelled-summary-row.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+
+    assert not any(
+        finding.rule_id == "WL007_STYLE_OUTLIER" and finding.location == "B22"
+        for finding in scan.findings
+    )
+
+
+@pytest.mark.parametrize("error_type", [ValueError, IndexError, TokenizerError])
+def test_malformed_aggregate_formula_is_handled_conservatively(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    def reject_formula(_formula: str):
+        raise error_type("malformed aggregate formula")
+
+    monkeypatch.setattr(builtin_rules, "Tokenizer", reject_formula)
+
+    assert builtin_rules._aggregate_formula_spans_other_rows("=SUM(A1:A2)", 3)
+
+
 def test_pivot_button_only_difference_is_not_a_visual_style_outlier(tmp_path: Path) -> None:
     workbook = Workbook()
     worksheet = workbook.active
@@ -718,7 +859,9 @@ def test_multiple_style_outliers_are_findings_only(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("label", ["Grand Total", "Summary", "总金额", "累计金额", "期末余额"])
-def test_summary_row_style_outliers_are_never_auto_copied(tmp_path: Path, label: str) -> None:
+def test_summary_row_style_outliers_are_not_reported_or_auto_copied(
+    tmp_path: Path, label: str
+) -> None:
     workbook = Workbook()
     worksheet = workbook.active
     assert worksheet is not None
@@ -733,6 +876,10 @@ def test_summary_row_style_outliers_are_never_auto_copied(tmp_path: Path, label:
     workbook.close()
 
     scan = scan_workbook(path)
+    assert not any(
+        finding.rule_id == "WL007_STYLE_OUTLIER" and finding.location in {"A22", "B22"}
+        for finding in scan.findings
+    )
     assert not any(
         patch.kind == PatchKind.COPY_STYLE and patch.cell in {"A22", "B22"}
         for patch in scan.patches
@@ -841,7 +988,7 @@ def test_visually_marked_blank_formula_gap_is_findings_only(tmp_path: Path) -> N
     assert not any(patch.cell == "B10" for patch in scan.patches)
 
 
-def test_summary_label_outside_inferred_region_blocks_numeric_and_style_patches(
+def test_summary_label_outside_inferred_region_suppresses_style_finding_and_patches(
     tmp_path: Path,
 ) -> None:
     workbook = Workbook()
@@ -862,7 +1009,7 @@ def test_summary_label_outside_inferred_region_blocks_numeric_and_style_patches(
     scan = scan_workbook(path)
     findings = {(finding.rule_id, finding.location) for finding in scan.findings}
     assert ("WL006_NUMERIC_TEXT", "D10") in findings
-    assert ("WL007_STYLE_OUTLIER", "D10") in findings
+    assert ("WL007_STYLE_OUTLIER", "D10") not in findings
     assert not any(patch.cell == "D10" for patch in scan.patches)
 
 
@@ -1236,22 +1383,8 @@ def test_hidden_literal_is_never_replaced(tmp_path: Path) -> None:
     assert not any(patch.cell == "B10" for patch in scan.patches)
 
 
-def test_all_fifteen_builtin_rule_ids_are_stable(demo_scan: ScanResult, tmp_path: Path) -> None:
-    workbook = Workbook()
-    worksheet = workbook.active
-    assert worksheet is not None
-    for column in range(1, 21):
-        worksheet.cell(1, column, column)
-        worksheet.cell(2, column, f"={worksheet.cell(1, column).coordinate}*2")
-    worksheet["J2"] = "=J1*3"
-    path = tmp_path / "rule-two.xlsx"
-    workbook.save(path)
-    workbook.close()
-    second_scan = scan_workbook(path)
-    all_ids = {finding.rule_id for finding in demo_scan.findings} | {
-        finding.rule_id for finding in second_scan.findings
-    }
-    assert all_ids == {
+def test_all_twenty_one_builtin_rule_ids_are_stable() -> None:
+    assert {rule.rule_id for rule in BUILTIN_RULES} == {
         f"WL{number:03d}_{suffix}"
         for number, suffix in enumerate(
             [
@@ -1270,6 +1403,12 @@ def test_all_fifteen_builtin_rule_ids_are_stable(demo_scan: ScanResult, tmp_path
                 "BROKEN_DEFINED_NAME",
                 "MERGED_CELL_IN_DATA_REGION",
                 "INCONSISTENT_DATA_VALIDATION",
+                "TEXT_DISPLAY_RISK",
+                "BORDER_EDGE_INCONSISTENCY",
+                "USED_RANGE_INFLATION",
+                "IDENTIFIER_SCIENTIFIC_NOTATION",
+                "SAVED_VIEW_OFF_CONTENT",
+                "WHITESPACE_ONLY_TAIL",
             ],
             start=1,
         )

@@ -188,29 +188,44 @@ def _inspect_content_types(
     if root.tag != f"{{{CONTENT_TYPES_NS}}}Types":
         raise UnsafeWorkbookError("Unexpected root element in '[Content_Types].xml'")
 
-    workbook_content_types: set[str] = set()
+    overrides: dict[str, set[str]] = {}
+    defaults: dict[str, set[str]] = {}
     has_macro_content_type = False
     for declaration in root:
-        content_type = declaration.get("ContentType", "")
-        lowered = content_type.lower()
-        if "vbaproject" in lowered or "macroenabled" in lowered:
+        content_type = declaration.get("ContentType", "").strip().lower()
+        if "vbaproject" in content_type or "macroenabled" in content_type:
             has_macro_content_type = True
-        if declaration.tag != f"{{{CONTENT_TYPES_NS}}}Override":
-            continue
-        declared_part = declaration.get("PartName", "").lstrip("/")
-        if declared_part == "xl/workbook.xml" and content_type:
-            workbook_content_types.add(content_type)
+        if declaration.tag == f"{{{CONTENT_TYPES_NS}}}Override":
+            declared_part = declaration.get("PartName", "").strip().lstrip("/")
+            if declared_part:
+                overrides.setdefault(declared_part, set()).add(content_type)
+        elif declaration.tag == f"{{{CONTENT_TYPES_NS}}}Default":
+            extension = declaration.get("Extension", "").strip().lstrip(".").lower()
+            if extension:
+                defaults.setdefault(extension, set()).add(content_type)
 
-    if len(workbook_content_types) > 1:
-        raise UnsafeWorkbookError("Workbook has conflicting content-type declarations")
+    for declared_part, content_types in overrides.items():
+        if len(content_types) > 1:
+            raise UnsafeWorkbookError(
+                f"Part {declared_part!r} has conflicting Override content-type declarations"
+            )
+    for extension, content_types in defaults.items():
+        if len(content_types) > 1:
+            raise UnsafeWorkbookError(
+                f"Extension {extension!r} has conflicting Default content-type declarations"
+            )
+
+    workbook_content_types = overrides.get("xl/workbook.xml")
+    if workbook_content_types is None:
+        workbook_content_types = defaults.get("xml")
     if not workbook_content_types:
         return None, has_macro_content_type
 
     workbook_content_type = next(iter(workbook_content_types))
-    if workbook_content_type == XLSX_WORKBOOK_CONTENT_TYPE:
+    if workbook_content_type == XLSX_WORKBOOK_CONTENT_TYPE.lower():
         return "xlsx", has_macro_content_type
-    if workbook_content_type == XLSM_WORKBOOK_CONTENT_TYPE or "macroenabled" in (
-        workbook_content_type.lower()
+    if workbook_content_type == XLSM_WORKBOOK_CONTENT_TYPE.lower() or "macroenabled" in (
+        workbook_content_type
     ):
         return "xlsm", True
     return None, has_macro_content_type
@@ -235,7 +250,7 @@ def inspect_package(path: Path, limits: PackageLimits | None = None) -> PackageI
         raise UsageError(f"Workbook does not exist or is not a file: {path}")
     suffix = resolved.suffix.lower()
     if suffix not in {".xlsx", ".xlsm"}:
-        raise UsageError("WorkbookLens 2.1 accepts only .xlsx and read-only .xlsm inputs")
+        raise UsageError("WorkbookLens 2.2 accepts only .xlsx and read-only .xlsm inputs")
     file_size = resolved.stat().st_size
     if file_size > active_limits.max_file_bytes:
         raise UnsafeWorkbookError(
