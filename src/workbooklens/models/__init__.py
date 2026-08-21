@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, RootModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, RootModel, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -79,6 +79,12 @@ class SheetSnapshot(StrictModel):
     state: Literal["visible", "hidden", "veryHidden"]
     max_row: int
     max_column: int
+    declared_dimension: str | None = None
+    content_dimension: str | None = None
+    row_heights: dict[str, float] = Field(default_factory=dict)
+    column_widths: dict[str, float] = Field(default_factory=dict)
+    view_top_left_cell: str | None = None
+    view_zoom_scale: int | None = None
     cells: dict[str, CellSnapshot] = Field(default_factory=dict)
     merged_ranges: list[str] = Field(default_factory=list)
     hidden_rows: list[int] = Field(default_factory=list)
@@ -115,6 +121,37 @@ class PatchKind(StrEnum):
     COPY_STYLE = "copy_style"
     EXTEND_SUM = "extend_sum"
     CREATE_FORMULA = "create_formula"
+    SET_COLUMN_WIDTH = "set_column_width"
+    SET_ROW_HEIGHT = "set_row_height"
+    SET_WRAP_TEXT = "set_wrap_text"
+    SET_SHRINK_TO_FIT = "set_shrink_to_fit"
+    SET_TEXT = "set_text"
+    SET_SHEET_VIEW = "set_sheet_view"
+    COPY_BORDER = "copy_border"
+    CLEAR_FORMATTING_TAIL = "clear_formatting_tail"
+    REMOVE_WHITESPACE_TAIL_CELLS = "remove_whitespace_tail_cells"
+
+
+class PatchRisk(StrEnum):
+    """Review boundary for repair selection, independent of rule confidence."""
+
+    SAFE = "safe"
+    LAYOUT_REVIEW = "layout_review"
+
+
+LAYOUT_REVIEW_PATCH_KINDS = frozenset(
+    {
+        PatchKind.SET_COLUMN_WIDTH,
+        PatchKind.SET_ROW_HEIGHT,
+        PatchKind.SET_WRAP_TEXT,
+        PatchKind.SET_SHRINK_TO_FIT,
+        PatchKind.SET_TEXT,
+        PatchKind.SET_SHEET_VIEW,
+        PatchKind.COPY_BORDER,
+        PatchKind.CLEAR_FORMATTING_TAIL,
+        PatchKind.REMOVE_WHITESPACE_TAIL_CELLS,
+    }
+)
 
 
 class PatchPrecondition(StrictModel):
@@ -124,6 +161,7 @@ class PatchPrecondition(StrictModel):
     expected_value: Any = None
     expected_formula: str | None = None
     expected_style_id: int | None = None
+    layout_fingerprint: str | None = None
 
 
 class PatchOperation(StrictModel):
@@ -138,8 +176,49 @@ class PatchOperation(StrictModel):
     source_cell: str | None = None
     confidence: Confidence
     safe: bool
+    risk: PatchRisk = PatchRisk.SAFE
     description: str
     precondition: PatchPrecondition
+    atomic_group: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_layout_review_risk(cls, value: Any) -> Any:
+        """Keep legacy constructors working while never inferring layout safety from confidence."""
+
+        if not isinstance(value, dict) or "risk" in value:
+            return value
+        kind = value.get("kind")
+        try:
+            if isinstance(kind, PatchKind):
+                patch_kind = kind
+            elif isinstance(kind, str):
+                patch_kind = PatchKind(kind)
+            else:
+                return value
+        except ValueError:
+            return value
+        if patch_kind not in LAYOUT_REVIEW_PATCH_KINDS:
+            return value
+        normalized = dict(value)
+        normalized["risk"] = PatchRisk.LAYOUT_REVIEW
+        return normalized
+
+    @model_validator(mode="after")
+    def require_layout_review(self) -> PatchOperation:
+        """Prevent callers from marking layout-changing operations safe-only eligible."""
+
+        if self.kind in LAYOUT_REVIEW_PATCH_KINDS and self.risk != PatchRisk.LAYOUT_REVIEW:
+            raise ValueError(f"{self.kind.value} patches require risk='layout_review'")
+        if self.risk == PatchRisk.LAYOUT_REVIEW and self.safe:
+            raise ValueError("layout_review patches require safe=false")
+        return self
+
+    @property
+    def safe_only_eligible(self) -> bool:
+        """Return whether ``--safe-only`` may select this operation."""
+
+        return self.safe and self.risk == PatchRisk.SAFE and float(self.confidence) >= 0.95
 
 
 class Finding(StrictModel):
@@ -165,7 +244,7 @@ class Finding(StrictModel):
 class PatchPlan(StrictModel):
     """A source-bound collection of proposed patches for explicit review."""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     tool_version: str
     source_name: str
     source_sha256: str
@@ -277,6 +356,7 @@ __all__ = [
     "PatchPlan",
     "PatchPrecondition",
     "PatchResult",
+    "PatchRisk",
     "Region",
     "Severity",
     "SheetSnapshot",

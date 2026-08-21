@@ -56,8 +56,10 @@
   </section>
   {% endif %}
   <section class="card" style="margin-top:16px"><h2>Sheet overview</h2>
-    <div class="table-wrap"><table><thead><tr><th>Sheet</th><th>State</th><th>Relevant cells</th><th>Used bounds</th></tr></thead><tbody>
-      {% for sheet in sheets %}<tr><td>{{ sheet.name }}</td><td>{{ sheet.state }}</td><td>{{ sheet.cells|length }}</td><td>{{ sheet.max_row }} rows × {{ sheet.max_column }} columns</td></tr>{% endfor %}
+    <div class="table-wrap"><table><thead><tr><th>Sheet</th><th>State</th><th>Relevant cells</th><th>Content range</th><th>Declared range</th><th>Saved view</th></tr></thead><tbody>
+      {% for sheet in sheets %}<tr><td>{{ sheet.name }}</td><td>{{ sheet.state }}</td><td>{{ sheet.cells|length }}</td>
+        <td><code>{{ sheet.content_dimension or '—' }}</code></td><td><code>{{ sheet.declared_dimension or '—' }}</code></td>
+        <td><code>{{ sheet.view_top_left_cell or 'A1' }}</code>{% if sheet.view_zoom_scale %} · {{ sheet.view_zoom_scale }}%{% endif %}</td></tr>{% endfor %}
     </tbody></table></div></section>
   <section class="card" style="margin-top:16px"><h2>Findings</h2>
     <div class="controls">
@@ -80,7 +82,7 @@
           {% if finding.evidence.peers %}<p><b>Peers:</b> {{ finding.evidence.peers|join(', ') }}</p>{% endif %}
           <p><b>Suggested action:</b> {{ finding.suggested_action }}</p>
           {% for patch_id in finding.patch_ids %}{% set patch = patch_map.get(patch_id) %}{% if patch %}
-          <p><b>Patch {{ patch.id }}</b> ({{ patch.kind.value }}, safe={{ patch.safe }}):
+          <p><b>Patch {{ patch.id }}</b> ({{ patch.kind.value }}, risk={{ patch.risk.value }}, safe-only={{ patch.safe_only_eligible }}):
             <code>{{ patch.before }}</code> → <code>{{ patch.after }}</code></p>{% endif %}{% endfor %}
         </details></td></tr>{% endfor %}
     </tbody></table></div>

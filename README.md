@@ -3,14 +3,48 @@
 **Deterministic linting, regression testing, semantic diffing, and conservative repair for
 Excel workbooks.**
 
-WorkbookLens 2.1 works locally without Microsoft Excel, LibreOffice, an AI key, or a cloud service.
+WorkbookLens 2.2 works locally without Microsoft Excel, LibreOffice, an AI key, or a cloud service.
 It does not calculate formulas, execute VBA, open embedded objects, or fetch external links.
 .xlsx files support scan, test, diff, and safe-copy repair; .xlsm files remain read-only.
 
 > **Release status:** GitHub Releases are authoritative for source archives and attached artifacts.
-> Version 2.1.0 may not be published to [PyPI](https://pypi.org/project/workbooklens/); use the
-> source-install instructions below unless PyPI explicitly lists that version. Do not assume pipx
-> or uvx can install a GitHub-only release.
+> Version 2.2.0 may not be published to [PyPI](https://pypi.org/project/workbooklens/); use the
+> downloaded wheel or source checkout instructions below unless PyPI explicitly lists that version.
+> Do not assume pipx or uvx can install a GitHub-only release by package name.
+
+## What is new in 2.2
+
+- Layout-aware snapshots and semantic diffs now record declared/content dimensions, explicit row
+  heights, column widths, and saved worksheet views.
+- `WL016_TEXT_DISPLAY_RISK` detects likely clipped wrapped text and blocked horizontal overflow. It
+  can propose bounded row-height, wrap, or repeated-column-width changes.
+- `WL017_BORDER_EDGE_INCONSISTENCY` treats either side of a shared cell edge as visually present,
+  reducing false positives. It also detects fully borderless holes and missing outer edges inside a
+  dense rectangular table, and proposes only edges supported by at least 95% peer consensus.
+- `WL018_USED_RANGE_INFLATION` identifies separated, format-only tails and can remove only the
+  enumerated blank styled cells and empty row records after reference and structure checks.
+- `WL019_IDENTIFIER_SCIENTIFIC_NOTATION` detects long numeric identifiers under identifier-like
+  headers. Ten- and eleven-digit values can receive a font-aware width-only proposal that preserves
+  the stored numeric value and type. General-formatted values of 12-15 digits remain findings-only
+  because Excel can keep scientific notation even in a wide column; longer values may already have
+  lost precision.
+- `WL020_SAVED_VIEW_OFF_CONTENT` detects sheets saved with their first content scrolled away or at a
+  zoom unlikely to show a compact sheet's full content width and height in a typical desktop window.
+  A reviewed repair can restore the first visible content cell and lower the saved zoom only when the
+  saved zoom actually exceeds the two-dimensional estimated fit. Merged content contributes its full
+  extent, visible border/fill templates count toward the layout, and earlier width/height proposals are
+  included in the estimate. A pure zoom repair may preserve an unshifted frozen pane byte-for-byte;
+  shifted frozen panes and split panes remain findings-only.
+- `WL021_WHITESPACE_ONLY_TAIL` detects connected literal-space cells outside the visible layout
+  envelope. Its reviewed cleanup deletes only default-style nodes; styled cells are cleared while
+  their font, alignment, protection, style ID, and custom blank-row heights are preserved. Referenced
+  or structurally significant targets are refused.
+- Single-row merged titles are treated as bounded display regions, same-column width requests are
+  coalesced to the largest sufficient proposal, and border repair is limited to genuine internal
+  shared edges with materialized peers.
+- Layout-changing proposals are labeled `layout_review`, excluded from `--safe-only`, and require
+  explicit patch selection plus `--accept-layout-risk`. Related wrap/height changes form atomic
+  groups and cannot be applied partially.
 
 ## What is new in 2.1
 
@@ -39,6 +73,45 @@ It does not calculate formulas, execute VBA, open embedded objects, or fetch ext
 - CI tests Python 3.11–3.14 on Linux, Windows, and macOS, then installs the built wheel in fresh
   environments.
 
+## Install the downloaded local package
+
+The `.whl` attached to the GitHub Release is a local Python application package, not a hosted
+upload service. Workbook processing stays on the user's computer. Installing the wheel may contact
+the configured Python package index once to obtain dependencies; scanning, planning, repair, diff,
+and the loopback web UI do not upload workbooks.
+
+Download `workbooklens-2.2.0-py3-none-any.whl`, `workbooklens-2.2.0.tar.gz`, and
+`SHA256SUMS` from the official
+[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.2.0), verify the
+checksum, and install it with Python 3.11+ and `uv`.
+
+### PowerShell
+
+~~~powershell
+Get-Content .\SHA256SUMS
+(Get-FileHash .\workbooklens-2.2.0-py3-none-any.whl -Algorithm SHA256).Hash
+uv tool install .\workbooklens-2.2.0-py3-none-any.whl
+workbooklens --version
+workbooklens serve --port 8765
+~~~
+
+### Bash
+
+~~~bash
+sha256sum -c SHA256SUMS
+uv tool install ./workbooklens-2.2.0-py3-none-any.whl
+workbooklens --version
+workbooklens serve --port 8765
+~~~
+
+Then open `http://127.0.0.1:8765/`. The browser page and temporary upload directory are local to
+that process. Sensitive workbooks should use the CLI or this loopback UI rather than a hosted CI
+runner.
+
+WorkbookLens 2.2.0 does not provide a signed standalone Windows `.exe` or installer. Do not install
+unofficial repackaged executables. A separately validated Windows portable build can be added in a
+future patch release without changing the local-processing model.
+
 ## Install from this source checkout
 
 WorkbookLens requires Python 3.11 or newer and [uv](https://docs.astral.sh/uv/).
@@ -63,11 +136,11 @@ uv run workbooklens --version
 uv run workbooklens demo --out .artifacts/demo
 ~~~
 
-If PyPI lists version 2.1.0, isolated installation is:
+If PyPI lists version 2.2.0, isolated installation is:
 
 ~~~bash
-uvx --from workbooklens==2.1.0 workbooklens --help
-pipx install workbooklens==2.1.0
+uvx --from workbooklens==2.2.0 workbooklens --help
+pipx install workbooklens==2.2.0
 ~~~
 
 ## Core workflows
@@ -89,6 +162,9 @@ workbooklens scan INPUT.xlsx --source-scope models/INPUT.xlsx --baseline previou
 workbooklens plan INPUT.xlsx --config workbooklens.yml --out repair-plan.json
 workbooklens apply INPUT.xlsx repair-plan.json --patch-id patch-0123456789abcdef --out INPUT.fixed.xlsx
 workbooklens apply INPUT.xlsx repair-plan.json --safe-only --out INPUT.fixed.xlsx
+
+# Apply an explicitly reviewed layout patch or atomic layout group
+workbooklens apply INPUT.xlsx repair-plan.json --patch-id patch-fedcba9876543210 --accept-layout-risk --out INPUT.layout-fixed.xlsx
 
 # Semantic before/after comparison
 workbooklens diff BEFORE.xlsx AFTER.xlsx --out diff.html
@@ -142,7 +218,7 @@ confidentiality as the input workbook.
 
 ## GitHub Action
 
-After the v2.1.0 tag exists:
+After the v2.2.0 tag exists:
 
 ~~~yaml
 permissions:
@@ -154,7 +230,7 @@ steps:
     with:
       fetch-depth: 0
 
-  - uses: chenweixin123/workbooklens@v2.1.0
+  - uses: chenweixin123/workbooklens@v2.2.0
     with:
       mode: scan
       path: workbooks
@@ -168,7 +244,7 @@ steps:
 Assertion mode requires config and deliberately rejects baseline/new-only:
 
 ~~~yaml
-- uses: chenweixin123/workbooklens@v2.1.0
+- uses: chenweixin123/workbooklens@v2.2.0
   with:
     mode: test
     path: workbooks
@@ -183,9 +259,14 @@ by the Action.
 
 ## Repair safety
 
-Repair plans bind every operation to the complete source SHA-256 and a target-cell fingerprint.
-Before writing, the engine rescans the source and requires the serialized plan to match the canonical
-plan field-for-field; only canonical operations marked safe with confidence at least 0.95 execute.
+Repair plans bind every operation to the complete source SHA-256 and target preconditions. Before
+writing, the engine rescans the source and requires the serialized plan to match the canonical plan
+field-for-field. Ordinary operations execute only when marked safe with confidence at least 0.95.
+Layout-changing operations are always `safe=false` with risk `layout_review`; `--safe-only` cannot
+select them. They require one or more explicit `--patch-id` selections, confidence at least 0.95,
+and `--accept-layout-risk`. This opt-in never authorizes any other unsafe operation. Selecting one
+member of an atomic group selects the complete group.
+
 Automatic operations are withheld for merged targets, summary rows, non-visible sheets, hidden rows
 or columns, and protected worksheets. The low-level patcher independently rechecks protection and
 visibility so an edited or stale plan cannot bypass the scanner's safety boundary. Numeric conversion
@@ -200,6 +281,9 @@ without a dominant template causes automatic repair to be withheld.
 The engine writes a new OOXML package directly, verifies the exact changed-part allowlist, reopens
 the result, rescans it, and removes partial output after validation failure. Formula edits remove
 stale caches and request Excel recalculation; WorkbookLens never claims to have calculated the result.
+Layout repairs additionally verify row, column, view, or exact-tail fingerprints. Formatting-tail
+cleanup fails closed when an authorized cell or row intersects formulas, names, table or validation
+ranges, comments, links, page breaks, drawing anchors, or other guarded worksheet structures.
 
 ## Security boundaries
 
@@ -219,6 +303,15 @@ workbook to a public issue.
   not proof that the adjacent row belongs in the aggregate.
 - Structured references can be scanned but are not translated for repair.
 - Region inference is conservative and can miss sparse or unusually formatted tables.
+- Text width and row-height estimates are deterministic approximations, not Excel's rendering
+  engine. Results can vary with fonts, printer metrics, DPI, locale, and application version; review
+  layout changes in the target spreadsheet application.
+- A saved zoom reset is a conservative opening view, not a guarantee that every column fits every
+  screen. Frozen or split panes are preserved and block automatic saved-view repair.
+- Border repair requires strong local peer consensus and changes one reviewed edge only; irregular
+  tables can remain findings-only or undetected.
+- Format-tail cleanup ignores broad column styling by itself and refuses ambiguous references or
+  structures. It is not a general "reset UsedRange" command.
 - Rule and region detection are deterministic heuristics. Passing a scan does not prove that every
   real-world workbook error has been found, and a finding does not by itself prove the proposed
   business meaning.
@@ -236,7 +329,7 @@ uv run mypy src
 uv run python -m pytest -q
 uv build --out-dir dist
 uvx --from twine twine check --strict dist/*
-python scripts/check_release_artifacts.py dist --version 2.1.0
+python scripts/check_release_artifacts.py dist --version 2.2.0
 ~~~
 
 See [CONTRIBUTING.md](CONTRIBUTING.md), [the architecture guide](docs/architecture.md),

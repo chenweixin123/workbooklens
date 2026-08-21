@@ -32,22 +32,24 @@ reproducer.
 
 | Version | Security support |
 |---|---|
-| 2.1.x | Supported |
-| 2.0.x and earlier | Upgrade required |
+| 2.2.x | Supported |
+| 2.1.x and earlier | Upgrade required |
 
 Security fixes land on main and are included in the next supported patch release. A GitHub
 Security Advisory may remain private until users have an upgrade path.
 
 ## Security model
 
-WorkbookLens 2.1 does not execute formulas, VBA, embedded objects, or external links. It rejects
+WorkbookLens 2.2 does not execute formulas, VBA, embedded objects, or external links. It rejects
 packages that exceed entry, compressed/uncompressed size, compression-ratio, member-path,
 relationship, or XML limits. DTDs and entities are forbidden. .xlsm remains read-only.
 
 Repairs require a matching source hash, matching target fingerprints, explicit safe patches, an
 exact changed-part allowlist, successful reopen, and a clean post-repair scan. Partial output is
-removed on failure. The web server binds to 127.0.0.1 and stores uploads in a process-owned
-temporary directory.
+removed on failure. The web server binds to 127.0.0.1, rejects non-loopback Host headers and
+cross-origin or invalid-token form submissions, and sends restrictive browser security headers.
+Uploads stay in a process-owned temporary directory that is removed on normal shutdown; an abrupt
+process or operating-system stop can leave files until manual or operating-system cleanup.
 
 Release artifacts are built from an explicit allowlist and audited for unexpected roots,
 environments, caches, bytecode, secret-like files, and oversized members. These controls reduce

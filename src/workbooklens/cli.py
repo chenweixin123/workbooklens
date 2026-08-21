@@ -14,7 +14,7 @@ from workbooklens import __version__
 from workbooklens.demo import run_demo
 from workbooklens.diff import compare_workbooks, write_diff_report
 from workbooklens.exceptions import ExitCode, UsageError, WorkbookLensError
-from workbooklens.models import SEVERITY_RANK, Severity
+from workbooklens.models import SEVERITY_RANK, PatchRisk, Severity
 from workbooklens.ooxml.safety import PackageLimits
 from workbooklens.policy import apply_finding_policy, load_baseline, source_scope_for_path
 from workbooklens.repair import apply_patch_plan, build_patch_plan
@@ -182,9 +182,13 @@ def plan(
         )
         patch_plan = build_patch_plan(result)
         write_patch_plan(out, patch_plan)
-        safe_count = sum(patch.safe for patch in patch_plan.patches)
+        safe_count = sum(patch.safe_only_eligible for patch in patch_plan.patches)
+        layout_review_count = sum(
+            patch.risk == PatchRisk.LAYOUT_REVIEW for patch in patch_plan.patches
+        )
         console.print(
-            f"[green]Planned[/green] {len(patch_plan.patches)} patches ({safe_count} safe) → {out}"
+            f"[green]Planned[/green] {len(patch_plan.patches)} patches "
+            f"({safe_count} safe, {layout_review_count} layout review) → {out}"
         )
     except typer.Exit:
         raise
@@ -205,14 +209,21 @@ def apply(
         help="Selected patch ID; repeat for multiple patches.",
     ),
     safe_only: bool = typer.Option(
-        False, "--safe-only", help="Apply every safe patch at confidence ≥0.95."
+        False,
+        "--safe-only",
+        help="Apply every safe patch at confidence ≥0.95; excludes layout-review patches.",
+    ),
+    accept_layout_risk: bool = typer.Option(
+        False,
+        "--accept-layout-risk",
+        help="Allow explicitly selected layout-review patches; never enables other unsafe patches.",
     ),
     config: Path | None = typer.Option(
         None, "--config", help="Optional workbooklens YAML configuration."
     ),
     max_file_mb: int = typer.Option(100, min=1, help="Maximum compressed input size."),
 ) -> None:
-    """Apply explicitly selected safe patches to a validated new workbook copy."""
+    """Apply selected patches to a validated new workbook copy."""
 
     try:
         plan_model = load_patch_plan(repair_plan)
@@ -220,8 +231,9 @@ def apply(
             input_workbook,
             plan_model,
             out,
-            selected_ids=set(patch_id or []),
+            selected_ids=patch_id,
             safe_only=safe_only,
+            accept_layout_risk=accept_layout_risk,
             config=_optional_config(config),
             limits=_limits(max_file_mb),
         )

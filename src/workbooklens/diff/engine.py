@@ -169,6 +169,41 @@ def _list_change(
         )
 
 
+def _mapping_change(
+    changes: list[StructuralChange],
+    change_type: str,
+    subject_prefix: str,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    importance: Severity = Severity.INFO,
+) -> None:
+    """Record deterministic additions, removals, and value changes in layout maps."""
+
+    for key in sorted(before.keys() | after.keys()):
+        before_value = before.get(key)
+        after_value = after.get(key)
+        if before_value == after_value:
+            continue
+        changes.append(
+            StructuralChange(
+                change_type=change_type,
+                subject=f"{subject_prefix}{key}",
+                before=before_value,
+                after=after_value,
+                importance=importance,
+            )
+        )
+
+
+def _style_only_blank(cell: CellSnapshot | None) -> bool:
+    return bool(
+        cell is not None
+        and cell.formula is None
+        and cell.value is None
+        and _style_fingerprint(cell) != "default"
+    )
+
+
 def compare_snapshots(before: WorkbookSnapshot, after: WorkbookSnapshot) -> WorkbookDiff:
     """Compare two already-extracted snapshots deterministically."""
 
@@ -234,6 +269,60 @@ def compare_snapshots(before: WorkbookSnapshot, after: WorkbookSnapshot) -> Work
                     importance=Severity.WARNING,
                 )
             )
+        if before_sheet.declared_dimension != after_sheet.declared_dimension:
+            structural.append(
+                StructuralChange(
+                    change_type="declared_dimension",
+                    subject=display_name,
+                    before=before_sheet.declared_dimension,
+                    after=after_sheet.declared_dimension,
+                    importance=Severity.INFO,
+                )
+            )
+        if before_sheet.content_dimension != after_sheet.content_dimension:
+            structural.append(
+                StructuralChange(
+                    change_type="content_dimension",
+                    subject=display_name,
+                    before=before_sheet.content_dimension,
+                    after=after_sheet.content_dimension,
+                    importance=Severity.WARNING,
+                )
+            )
+        _mapping_change(
+            structural,
+            "row_height",
+            f"{display_name}!row ",
+            before_sheet.row_heights,
+            after_sheet.row_heights,
+        )
+        _mapping_change(
+            structural,
+            "column_width",
+            f"{display_name}!column ",
+            before_sheet.column_widths,
+            after_sheet.column_widths,
+        )
+        if before_sheet.view_top_left_cell != after_sheet.view_top_left_cell:
+            structural.append(
+                StructuralChange(
+                    change_type="view_top_left_cell",
+                    subject=display_name,
+                    before=before_sheet.view_top_left_cell,
+                    after=after_sheet.view_top_left_cell,
+                    importance=Severity.INFO,
+                )
+            )
+        if before_sheet.view_zoom_scale != after_sheet.view_zoom_scale:
+            structural.append(
+                StructuralChange(
+                    change_type="view_zoom_scale",
+                    subject=display_name,
+                    before=before_sheet.view_zoom_scale,
+                    after=after_sheet.view_zoom_scale,
+                    importance=Severity.INFO,
+                )
+            )
         _list_change(
             structural,
             "merged_range",
@@ -264,7 +353,44 @@ def compare_snapshots(before: WorkbookSnapshot, after: WorkbookSnapshot) -> Work
             before_sheet.data_validations,
             after_sheet.data_validations,
         )
-        for coordinate in sorted(before_sheet.cells.keys() | after_sheet.cells.keys()):
+        all_coordinates = before_sheet.cells.keys() | after_sheet.cells.keys()
+        removed_style_only = {
+            coordinate
+            for coordinate in all_coordinates
+            if _style_only_blank(before_sheet.cells.get(coordinate))
+            and after_sheet.cells.get(coordinate) is None
+        }
+        added_style_only = {
+            coordinate
+            for coordinate in all_coordinates
+            if before_sheet.cells.get(coordinate) is None
+            and _style_only_blank(after_sheet.cells.get(coordinate))
+        }
+        suppressed_style_only: set[str] = set()
+        dimension_changed = before_sheet.declared_dimension != after_sheet.declared_dimension
+        if dimension_changed and len(removed_style_only) >= 16:
+            suppressed_style_only.update(removed_style_only)
+            structural.append(
+                StructuralChange(
+                    change_type="formatting_tail_cells_removed",
+                    subject=display_name,
+                    before=len(removed_style_only),
+                    after=0,
+                    importance=Severity.INFO,
+                )
+            )
+        if dimension_changed and len(added_style_only) >= 16:
+            suppressed_style_only.update(added_style_only)
+            structural.append(
+                StructuralChange(
+                    change_type="formatting_tail_cells_added",
+                    subject=display_name,
+                    before=0,
+                    after=len(added_style_only),
+                    importance=Severity.INFO,
+                )
+            )
+        for coordinate in sorted(all_coordinates - suppressed_style_only):
             cell_changes.extend(
                 _compare_cell(
                     display_name,

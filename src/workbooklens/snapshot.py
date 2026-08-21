@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import posixpath
+import zipfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from lxml import etree
 from openpyxl import load_workbook
 from openpyxl.cell.cell import Cell
+from openpyxl.utils.cell import get_column_letter
 from openpyxl.workbook.workbook import Workbook
 from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
 from openpyxl.worksheet.worksheet import Worksheet
 
+from workbooklens.exceptions import PatchValidationError
 from workbooklens.models import CellSnapshot, SheetSnapshot, WorkbookSnapshot
-from workbooklens.ooxml.safety import PackageLimits, inspect_package
+from workbooklens.ooxml.safety import PackageLimits, inspect_package, parse_xml_part
 from workbooklens.utils import sha256_bytes, sha256_file, stable_json_bytes
 from workbooklens.worksheet_state import hidden_column_labels, is_column_hidden
 
@@ -51,9 +56,12 @@ def cell_semantic_payload(cell: Cell) -> dict[str, Any]:
 
 
 def cell_fingerprint(cell: Cell) -> str:
-    """Hash the semantic state relevant to every supported patch operation."""
+    """Hash effective cell semantics without workbook-local style table IDs."""
 
-    return sha256_bytes(stable_json_bytes(cell_semantic_payload(cell)))
+    payload = cell_semantic_payload(cell)
+    payload.pop("style_id", None)
+    payload["style_fingerprint"] = style_fingerprint(cell)
+    return sha256_bytes(stable_json_bytes(payload))
 
 
 def _xml_component_payload(component: Any) -> dict[str, Any]:
@@ -113,10 +121,11 @@ def _snapshot_cell(cell: Cell, worksheet: Worksheet) -> CellSnapshot:
     payload = cell_semantic_payload(cell)
     snapshot_payload = dict(payload)
     snapshot_payload.pop("quote_prefix", None)
+    row_dimension = worksheet.row_dimensions.get(cell.row)
     return CellSnapshot(
         **snapshot_payload,
         style_fingerprint=style_fingerprint(cell),
-        row_hidden=bool(worksheet.row_dimensions[cell.row].hidden),
+        row_hidden=bool(row_dimension.hidden) if row_dimension is not None else False,
         column_hidden=is_column_hidden(worksheet, cell.column),
     )
 
@@ -131,9 +140,127 @@ def _defined_names(workbook: Workbook) -> dict[str, str]:
     return dict(sorted(names.items()))
 
 
+def _resolve_part(base_part: str, target: str) -> str:
+    """Resolve one internal OOXML relationship without allowing package-root escape."""
+
+    if "\\" in target or "\x00" in target:
+        raise PatchValidationError(f"Unsafe relationship target: {target!r}")
+    candidate = (
+        target.lstrip("/")
+        if target.startswith("/")
+        else posixpath.join(posixpath.dirname(base_part), target)
+    )
+    normalized = posixpath.normpath(candidate)
+    if normalized in {"", ".", ".."} or normalized.startswith("../"):
+        raise PatchValidationError(f"Relationship target escapes package root: {target!r}")
+    return normalized
+
+
+def _declared_sheet_dimensions(path: Path) -> dict[str, str | None]:
+    """Read raw worksheet ``dimension`` refs before openpyxl normalizes sparse state."""
+
+    with zipfile.ZipFile(path, "r") as archive:
+        workbook_part = "xl/workbook.xml"
+        relationships_part = "xl/_rels/workbook.xml.rels"
+        workbook_root = parse_xml_part(archive.read(workbook_part), workbook_part)
+        relationships_root = parse_xml_part(archive.read(relationships_part), relationships_part)
+        relationships: dict[str, tuple[str, str]] = {}
+        for relationship in relationships_root:
+            if etree.QName(relationship).localname != "Relationship":
+                continue
+            identifier = relationship.get("Id")
+            target = relationship.get("Target")
+            relationship_type = relationship.get("Type", "")
+            if identifier and target:
+                relationships[identifier] = (relationship_type, target)
+
+        dimensions: dict[str, str | None] = {}
+        for sheet in workbook_root.iter():
+            if etree.QName(sheet).localname != "sheet":
+                continue
+            name = sheet.get("name")
+            relationship_id = next(
+                (
+                    value
+                    for attribute, value in sheet.attrib.items()
+                    if etree.QName(attribute).localname == "id"
+                ),
+                None,
+            )
+            if not name or not relationship_id or relationship_id not in relationships:
+                raise PatchValidationError(
+                    "Workbook contains a sheet with a malformed relationship"
+                )
+            relationship_type, target = relationships[relationship_id]
+            if relationship_type.endswith("/chartsheet"):
+                continue
+            if not relationship_type.endswith("/worksheet"):
+                raise PatchValidationError(
+                    "Workbook contains an unsupported sheet relationship type: "
+                    f"{relationship_type!r}"
+                )
+            part = _resolve_part(workbook_part, target)
+            if part not in archive.namelist():
+                raise PatchValidationError(f"Worksheet package part is missing: {part}")
+            worksheet_root = parse_xml_part(archive.read(part), part)
+            dimension = next(
+                (
+                    element
+                    for element in worksheet_root
+                    if etree.QName(element).localname == "dimension"
+                ),
+                None,
+            )
+            dimensions[name] = dimension.get("ref") if dimension is not None else None
+        return dimensions
+
+
+def _content_bounds(worksheet: Worksheet, cells: list[Cell]) -> str | None:
+    """Return content bounds while preserving the visible extent of merged ranges."""
+
+    meaningful = [cell for cell in cells if cell.value is not None]
+    row_bounds = [cell.row for cell in meaningful]
+    column_bounds = [cell.column for cell in meaningful]
+    for merged in worksheet.merged_cells.ranges:
+        row_bounds.extend((merged.min_row, merged.max_row))
+        column_bounds.extend((merged.min_col, merged.max_col))
+    if not row_bounds or not column_bounds:
+        return None
+    start = f"{get_column_letter(min(column_bounds))}{min(row_bounds)}"
+    end = f"{get_column_letter(max(column_bounds))}{max(row_bounds)}"
+    return start if start == end else f"{start}:{end}"
+
+
+def _row_heights(worksheet: Worksheet) -> dict[str, float]:
+    return {
+        str(index): float(dimension.height)
+        for index, dimension in sorted(worksheet.row_dimensions.items())
+        if dimension.height is not None
+    }
+
+
+def _column_widths(worksheet: Worksheet) -> dict[str, float]:
+    entries: list[tuple[int, int, str, float]] = []
+    for key, dimension in worksheet.column_dimensions.items():
+        if dimension.width is None:
+            continue
+        minimum = int(dimension.min or 0)
+        maximum = int(dimension.max or minimum)
+        if minimum < 1 or maximum < minimum or maximum > 16_384:
+            raise PatchValidationError(
+                f"Invalid column dimension span for {worksheet.title!r}: {key!r}"
+            )
+        start = get_column_letter(minimum)
+        end = get_column_letter(maximum)
+        label = start if start == end else f"{start}:{end}"
+        entries.append((minimum, maximum, label, float(dimension.width)))
+    return {label: width for _, _, label, width in sorted(entries)}
+
+
 def snapshot_from_workbook(workbook: Workbook, path: Path, source_sha256: str) -> WorkbookSnapshot:
     """Build a deterministic snapshot from an already-open, non-read-only workbook."""
 
+    declared_dimensions = _declared_sheet_dimensions(path)
     sheets: list[SheetSnapshot] = []
     for index, worksheet in enumerate(workbook.worksheets):
         cells: dict[str, CellSnapshot] = {}
@@ -166,6 +293,16 @@ def snapshot_from_workbook(workbook: Workbook, path: Path, source_sha256: str) -
                 state=worksheet.sheet_state,
                 max_row=max((cell.row for cell in sparse_cells), default=0),
                 max_column=max((cell.column for cell in sparse_cells), default=0),
+                declared_dimension=declared_dimensions.get(worksheet.title),
+                content_dimension=_content_bounds(worksheet, sparse_cells),
+                row_heights=_row_heights(worksheet),
+                column_widths=_column_widths(worksheet),
+                view_top_left_cell=worksheet.sheet_view.topLeftCell,
+                view_zoom_scale=(
+                    int(worksheet.sheet_view.zoomScale)
+                    if worksheet.sheet_view.zoomScale is not None
+                    else None
+                ),
                 cells=cells,
                 merged_ranges=sorted(str(item) for item in worksheet.merged_cells.ranges),
                 hidden_rows=sorted(

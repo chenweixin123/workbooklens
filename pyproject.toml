@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workbooklens"
-version = "2.1.0"
+version = "2.2.0"
 description = "Local-first linting, testing, semantic diffing, and safe repair for Excel workbooks"
 readme = "README.md"
 requires-python = ">=3.11"

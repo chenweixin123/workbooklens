@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 from openpyxl import Workbook
 from typer.testing import CliRunner
@@ -10,6 +11,13 @@ from typer.testing import CliRunner
 import workbooklens.cli as cli_module
 from workbooklens.cli import app
 from workbooklens.demo.workflow import generate_demo_workbook
+from workbooklens.models import (
+    PatchKind,
+    PatchOperation,
+    PatchPlan,
+    PatchPrecondition,
+    PatchRisk,
+)
 from workbooklens.utils import sha256_file
 
 runner = CliRunner()
@@ -22,7 +30,62 @@ def test_help_version_and_required_commands() -> None:
         assert command in help_result.stdout
     version_result = runner.invoke(app, ["--version"])
     assert version_result.exit_code == 0
-    assert "WorkbookLens 2.1.0" in version_result.stdout
+    assert "WorkbookLens 2.2.0" in version_result.stdout
+
+
+def test_apply_help_explains_layout_review_opt_in() -> None:
+    result = runner.invoke(app, ["apply", "--help"])
+
+    assert result.exit_code == 0
+    assert "--accept-layout-risk" in result.stdout
+    assert "--safe-only" in result.stdout
+    assert "layout-review" in result.stdout
+
+
+def test_plan_reports_safe_and_layout_review_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    safe_patch = PatchOperation(
+        id="safe-patch",
+        kind=PatchKind.SET_FORMULA,
+        sheet="Sheet1",
+        cell="A1",
+        after="=1+1",
+        confidence=0.99,
+        safe=True,
+        description="safe test patch",
+        precondition=PatchPrecondition(cell_fingerprint="safe-fingerprint"),
+    )
+    review_patch = PatchOperation(
+        id="review-patch",
+        kind=PatchKind.SET_COLUMN_WIDTH,
+        sheet="Sheet1",
+        cell="A1",
+        before=8.43,
+        after=16.0,
+        confidence=0.99,
+        safe=False,
+        risk=PatchRisk.LAYOUT_REVIEW,
+        description="layout test patch",
+        precondition=PatchPrecondition(cell_fingerprint="review-fingerprint"),
+    )
+    patch_plan = PatchPlan(
+        tool_version="2.1.0",
+        source_name="input.xlsx",
+        source_sha256="abc123",
+        patches=[safe_patch, review_patch],
+    )
+    monkeypatch.setattr(cli_module, "scan_workbook", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli_module, "build_patch_plan", lambda _scan: patch_plan)
+
+    result = runner.invoke(
+        app,
+        ["plan", str(tmp_path / "input.xlsx"), "--out", str(tmp_path / "plan.json")],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "(1 safe, 1 layout review)" in result.stdout
 
 
 def test_scan_outputs_and_fail_on_exit_code(tmp_path: Path) -> None:

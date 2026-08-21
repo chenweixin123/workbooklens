@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,7 @@ from workbooklens.exceptions import PatchValidationError
 from workbooklens.models import PatchPlan, PatchResult, Severity
 from workbooklens.ooxml.safety import PackageLimits
 from workbooklens.repair.ooxml_patch import patch_ooxml_package
-from workbooklens.repair.planning import build_patch_plan
+from workbooklens.repair.planning import build_patch_plan, resolve_patch_selection
 from workbooklens.scanner import scan_workbook
 
 
@@ -18,21 +19,29 @@ def apply_patch_plan(
     plan: PatchPlan,
     output: Path,
     *,
-    selected_ids: set[str] | None = None,
+    selected_ids: Collection[str] | None = None,
     safe_only: bool = False,
+    accept_layout_risk: bool = False,
     config: dict[str, Any] | None = None,
     limits: PackageLimits | None = None,
 ) -> PatchResult:
     """Apply, reopen, rescan, compare findings, and delete invalid output."""
 
+    resolved_ids = resolve_patch_selection(
+        plan,
+        selected_ids,
+        safe_only,
+        accept_layout_risk=accept_layout_risk,
+    )
     before_scan = scan_workbook(source, config=config, limits=limits)
     canonical_plan = build_patch_plan(before_scan)
     low_level, selected = patch_ooxml_package(
         source,
         plan,
         output,
-        selected_ids=selected_ids,
-        safe_only=safe_only,
+        selected_ids=resolved_ids,
+        safe_only=False,
+        accept_layout_risk=accept_layout_risk,
         limits=limits,
         canonical_plan=canonical_plan,
     )
@@ -40,6 +49,25 @@ def apply_patch_plan(
         after_scan = scan_workbook(output, config=config, limits=limits)
         before_ids = {finding.id for finding in before_scan.findings}
         after_ids = {finding.id for finding in after_scan.findings}
+        selected_patch_ids = {patch.id for patch in selected}
+        targeted_keys = {
+            (finding.rule_id, finding.sheet, finding.location)
+            for finding in before_scan.findings
+            if finding.patch_ids and set(finding.patch_ids).issubset(selected_patch_ids)
+        }
+        unresolved_targets = [
+            finding
+            for finding in after_scan.findings
+            if (finding.rule_id, finding.sheet, finding.location) in targeted_keys
+        ]
+        if unresolved_targets:
+            targets = ", ".join(
+                sorted(
+                    f"{finding.rule_id}:{finding.sheet}!{finding.location}"
+                    for finding in unresolved_targets
+                )
+            )
+            raise PatchValidationError(f"Repair did not resolve targeted findings: {targets}")
         new_findings = [finding for finding in after_scan.findings if finding.id not in before_ids]
         dangerous_new = [
             finding

@@ -24,6 +24,7 @@ class RuleContext:
     data_regions: dict[str, list[Region]]
     formula_bands: dict[str, list[Region]]
     unsupported_formula_ranges: dict[str, tuple[CellRange, ...]] = field(default_factory=dict)
+    prior_patches: tuple[PatchOperation, ...] = field(default_factory=tuple)
 
 
 @dataclass(slots=True)

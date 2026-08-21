@@ -31,6 +31,7 @@ RELATIONSHIPS_NS = "http://schemas.openxmlformats.org/package/2006/relationships
 XLSM_WORKBOOK_CONTENT_TYPE = "application/vnd.ms-excel.sheet.macroEnabled.main+xml"
 VBA_CONTENT_TYPE = "application/vnd.ms-office.vbaProject"
 VBA_RELATIONSHIP_TYPE = "http://schemas.microsoft.com/office/2006/relationships/vbaProject"
+SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 SCAN_CONFIG = {"keys": [{"sheet": "Sales", "range": "A2:A22", "ignore_blank": True}]}
 
 
@@ -86,7 +87,7 @@ def _mutate_cell(patch: PatchOperation) -> None:
     ("field", "mutate", "expected_error"),
     [
         ("after", _mutate_after, PatchValidationError),
-        ("safe", _mutate_safe, PatchValidationError),
+        ("safe", _mutate_safe, UsageError),
         ("confidence", _mutate_confidence, PatchValidationError),
         ("kind", _mutate_kind, PatchValidationError),
         ("source_cell", _mutate_source_cell, PatchValidationError),
@@ -306,3 +307,80 @@ def test_low_level_style_copy_rejects_semantic_mismatch(
 
     with pytest.raises(PatchValidationError, match=expected_message):
         ooxml_patch._verify_preconditions(source, plan, [patch], None)
+
+
+def _append_duplicate_cell_xf(path: Path, style_id: int) -> int:
+    rewritten = path.with_name(f"{path.stem}-duplicate-xf{path.suffix}")
+    with zipfile.ZipFile(path, "r") as source, zipfile.ZipFile(rewritten, "w") as output:
+        for info in source.infolist():
+            data = source.read(info.filename)
+            if info.filename == "xl/styles.xml":
+                root = etree.fromstring(data)
+                cell_xfs = root.find(f"{{{SPREADSHEET_NS}}}cellXfs")
+                assert cell_xfs is not None
+                assert 0 <= style_id < len(cell_xfs)
+                duplicate_id = len(cell_xfs)
+                cell_xfs.append(copy.deepcopy(cell_xfs[style_id]))
+                cell_xfs.set("count", str(len(cell_xfs)))
+                data = etree.tostring(
+                    root,
+                    xml_declaration=True,
+                    encoding="UTF-8",
+                    standalone=True,
+                )
+            output.writestr(info, data)
+    rewritten.replace(path)
+    return duplicate_id
+
+
+def test_copy_style_validation_uses_source_style_not_numeric_style_id(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "duplicate-cell-xfs.xlsx"
+    generate_demo_workbook(source)
+    plan = _plan(source)
+    patch = next(item for item in plan.patches if item.kind == PatchKind.COPY_STYLE)
+    assert patch.source_cell is not None
+
+    workbook = load_workbook(source)
+    source_style_id = workbook[patch.sheet][patch.source_cell].style_id
+    workbook.close()
+    assert patch.after == source_style_id
+    duplicate_style_id = _append_duplicate_cell_xf(source, source_style_id)
+    assert duplicate_style_id != source_style_id
+
+    plan.source_sha256 = sha256_file(source)
+    output = tmp_path / "duplicate-cell-xfs-fixed.xlsx"
+    ooxml_patch.patch_ooxml_package(
+        source,
+        plan,
+        output,
+        selected_ids={patch.id},
+        canonical_plan=plan,
+    )
+
+    workbook = load_workbook(output)
+    try:
+        worksheet = workbook[patch.sheet]
+        target = worksheet[patch.cell]
+        style_source = worksheet[patch.source_cell]
+        assert target._style == style_source._style
+        assert target.style_id == style_source.style_id
+        assert target.style_id == duplicate_style_id
+        assert target.style_id != patch.after
+    finally:
+        workbook.close()
+
+
+@pytest.mark.parametrize("source_cell", [None, "Z99"])
+def test_copy_style_semantic_validation_requires_materialized_source_cell(
+    tmp_path: Path,
+    source_cell: str | None,
+) -> None:
+    source = tmp_path / f"missing-style-source-{source_cell or 'none'}.xlsx"
+    generate_demo_workbook(source)
+    patch = next(item for item in _plan(source).patches if item.kind == PatchKind.COPY_STYLE)
+    patch.source_cell = source_cell
+
+    with pytest.raises(PatchValidationError, match=r"no source cell|source is missing"):
+        ooxml_patch._validate_semantics(source, [patch])

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from openpyxl import Workbook
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Border, PatternFill, Side
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 
@@ -14,6 +14,7 @@ from workbooklens.models import CellSnapshot, SheetSnapshot, WorkbookSnapshot
 from workbooklens.reports import write_scan_report
 from workbooklens.reports.scan import build_sarif
 from workbooklens.scanner import scan_workbook
+from workbooklens.snapshot import create_snapshot
 
 
 def _diff_workbooks(directory: Path) -> tuple[Path, Path]:
@@ -168,6 +169,73 @@ def test_ambiguous_sheet_rename_degrades_to_add_and_remove() -> None:
     assert not any(change.change_type == "sheet_renamed" for change in changes)
     assert [change.change_type for change in changes].count("sheet_removed") == 2
     assert [change.change_type for change in changes].count("sheet_added") == 1
+
+
+def test_snapshot_records_declared_content_and_saved_layout(tmp_path: Path) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet["A1"] = "Title"
+    sheet["G24"] = "Visible content"
+    sheet["IV27"].border = Border(left=Side(style="thin"))
+    sheet.row_dimensions[31].height = 66
+    sheet.column_dimensions["G"].width = 21.75
+    sheet.sheet_view.topLeftCell = "A3"
+    sheet.sheet_view.zoomScale = 115
+    path = tmp_path / "layout.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    snapshot = create_snapshot(path).sheets[0]
+
+    assert snapshot.declared_dimension == "A1:IV27"
+    assert snapshot.content_dimension == "A1:G24"
+    assert snapshot.row_heights["31"] == 66
+    assert snapshot.column_widths["G"] == 21.75
+    assert snapshot.view_top_left_cell == "A3"
+    assert snapshot.view_zoom_scale == 115
+
+
+def test_diff_summarizes_large_formatting_tail_and_layout_changes() -> None:
+    styled_blanks = {
+        f"{column}{row}": CellSnapshot(
+            coordinate=f"{column}{row}",
+            data_type="n",
+            style_id=1,
+            style_fingerprint="tail-style",
+        )
+        for row in (26, 27)
+        for column in ("AI", "AJ", "AK", "AL", "AM", "AN", "AO", "AP")
+    }
+    before_sheet = _sheet("Data", 0)
+    before_sheet.declared_dimension = "A1:AP31"
+    before_sheet.content_dimension = "A1:G28"
+    before_sheet.cells.update(styled_blanks)
+    before_sheet.row_heights = {"5": 30.0, "29": 18.0, "30": 18.0, "31": 66.0}
+    before_sheet.column_widths = {"G": 18.25}
+    before_sheet.view_top_left_cell = "A3"
+    before_sheet.view_zoom_scale = 115
+    after_sheet = _sheet("Data", 0)
+    after_sheet.declared_dimension = "A1:G28"
+    after_sheet.content_dimension = "A1:G28"
+    after_sheet.row_heights = {"5": 70.0}
+    after_sheet.column_widths = {"G": 21.75}
+    after_sheet.view_top_left_cell = "A1"
+    after_sheet.view_zoom_scale = 85
+
+    diff = compare_snapshots(
+        _snapshot_with_sheets(before_sheet, source="before"),
+        _snapshot_with_sheets(after_sheet, source="after"),
+    )
+
+    assert not [change for change in diff.cell_changes if change.cell in styled_blanks]
+    structural_types = [change.change_type for change in diff.structural_changes]
+    assert structural_types.count("formatting_tail_cells_removed") == 1
+    assert "declared_dimension" in structural_types
+    assert "row_height" in structural_types
+    assert "column_width" in structural_types
+    assert "view_top_left_cell" in structural_types
+    assert "view_zoom_scale" in structural_types
 
 
 def test_diff_report_is_self_contained_and_has_json_twin(tmp_path: Path) -> None:
