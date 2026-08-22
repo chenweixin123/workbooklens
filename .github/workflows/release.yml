@@ -18,6 +18,8 @@ jobs:
     if: github.repository == 'chenweixin123/workbooklens'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    outputs:
+      version: ${{ steps.project.outputs.version }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -26,6 +28,19 @@ jobs:
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
+      - name: Read project version
+        id: project
+        shell: python
+        run: |
+          import os
+          import pathlib
+          import tomllib
+
+          version = tomllib.loads(
+              pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          )["project"]["version"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version={version}", file=output)
       - name: Validate tag and project version
         if: github.ref_type == 'tag'
         shell: python
@@ -47,15 +62,271 @@ jobs:
       - run: uv run python -m pytest -q
       - run: uv build --out-dir dist
       - run: uvx --from twine twine check --strict dist/*
-      - run: python scripts/check_release_artifacts.py dist --version 2.2.0
-      - name: Create checksums
-        working-directory: dist
-        run: sha256sum workbooklens-*.whl workbooklens-*.tar.gz > ../SHA256SUMS
+      - run: python scripts/check_release_artifacts.py dist --version ${{ steps.project.outputs.version }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workbooklens-python-distributions-${{ github.run_id }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  portable:
+    if: github.repository == 'chenweixin123/workbooklens'
+    needs: verify
+    runs-on: windows-2025
+    timeout-minutes: 50
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: workbooklens-python-distributions-${{ github.run_id }}
+          path: dist
+      - name: Export locked portable constraints
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .artifacts | Out-Null
+          uv export --locked --python 3.12 --no-dev --group portable --no-emit-project --no-hashes --no-header --no-annotate --output-file .artifacts/portable-constraints.txt
+      - name: Build Windows x64 portable ZIP from the wheel
+        shell: pwsh
+        run: |
+          $wheels = @(Get-ChildItem -LiteralPath dist -Filter '*.whl')
+          if ($wheels.Count -ne 1) {
+            throw "Expected exactly one wheel, found $($wheels.Count)."
+          }
+          $python = (Get-Command python.exe).Source
+          & $python scripts/build_portable_windows.py --wheel $wheels[0].FullName --python $python --expected-version ${{ needs.verify.outputs.version }} --constraints .artifacts/portable-constraints.txt --output-dir portable-dist
+      - name: Inspect and smoke-test the frozen artifact
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem -LiteralPath portable-dist -Filter '*.zip')
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one portable ZIP, found $($archives.Count)."
+          }
+          $python = (Get-Command python.exe).Source
+          & $python scripts/check_portable_artifact.py $archives[0].FullName --expected-version ${{ needs.verify.outputs.version }}
+          & $python scripts/smoke_portable.py $archives[0].FullName --expected-version ${{ needs.verify.outputs.version }}
+      - name: Locate or install Inno Setup 6
+        shell: pwsh
+        run: |
+          $expectedIsccVersion = '6.7.0'
+          function Get-IsccCompilerVersion([string]$Path) {
+            $probeBase = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+            $probeRoot = [IO.Path]::GetFullPath(
+              (Join-Path $probeBase ("workbooklens-iscc-probe-" + [guid]::NewGuid().ToString('N')))
+            )
+            $requiredPrefix = $probeBase.TrimEnd('\') + '\'
+            if (-not $probeRoot.StartsWith($requiredPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "ISCC probe path escaped RUNNER_TEMP: $probeRoot"
+            }
+            $probeScript = Join-Path $probeRoot 'version-probe.iss'
+            $probeOutput = Join-Path $probeRoot 'Output'
+            [void][IO.Directory]::CreateDirectory($probeRoot)
+            try {
+              $probeContent = @(
+                '[Setup]',
+                'AppName=WorkbookLens ISCC Version Probe',
+                'AppVersion=0.0.0',
+                'DefaultDirName={tmp}\WorkbookLensISCCProbe',
+                'Output=no',
+                'Uninstallable=no',
+                'PrivilegesRequired=lowest'
+              ) -join "`n"
+              [IO.File]::WriteAllText(
+                $probeScript,
+                $probeContent,
+                [Text.UTF8Encoding]::new($false)
+              )
+              $output = @(& $Path $probeScript 2>&1)
+              $exitCode = $LASTEXITCODE
+              if ($exitCode -ne 0) {
+                return $null
+              }
+              $banner = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+              $match = [regex]::Match(
+                $banner,
+                '(?m)^Compiler engine version:\s+Inno Setup\s+(\d+\.\d+\.\d+)\s*$'
+              )
+              if (-not $match.Success) {
+                return $null
+              }
+              return $match.Groups[1].Value
+            } finally {
+              if ([IO.File]::Exists($probeScript)) {
+                [IO.File]::Delete($probeScript)
+              }
+              if ([IO.Directory]::Exists($probeOutput)) {
+                [IO.Directory]::Delete($probeOutput, $false)
+              }
+              if ([IO.Directory]::Exists($probeRoot)) {
+                [IO.Directory]::Delete($probeRoot, $false)
+              }
+            }
+          }
+
+          function Get-IsccCandidates {
+            $candidates = @()
+            $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($command) {
+              $candidates += $command.Source
+            }
+            $candidates += @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+            )
+            if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+              $candidates += "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+            }
+            return @(
+              $candidates |
+                Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+                Select-Object -Unique
+            )
+          }
+
+          function Find-ExpectedIscc([string]$ExpectedVersion) {
+            foreach ($candidate in @(Get-IsccCandidates)) {
+              $candidateVersion = Get-IsccCompilerVersion $candidate
+              if ($candidateVersion -eq $ExpectedVersion) {
+                return $candidate
+              }
+              $displayVersion = if ($candidateVersion) { $candidateVersion } else { 'unreadable' }
+              Write-Host "Ignoring ISCC candidate $candidate (compiler banner version=$displayVersion)."
+            }
+            return $null
+          }
+
+          $iscc = Find-ExpectedIscc $expectedIsccVersion
+          if (-not $iscc) {
+            choco install innosetup --version=6.7.0 --allow-downgrade --force --no-progress --yes
+            if ($LASTEXITCODE -ne 0) {
+              throw "Chocolatey could not install Inno Setup $expectedIsccVersion."
+            }
+            $iscc = Find-ExpectedIscc $expectedIsccVersion
+          }
+          if (-not $iscc) {
+            throw "Inno Setup compiler $expectedIsccVersion was not found after exact installation."
+          }
+          $actualIsccVersion = Get-IsccCompilerVersion $iscc
+          if ($actualIsccVersion -ne $expectedIsccVersion) {
+            throw "Inno Setup compiler banner version '$actualIsccVersion' does not match required version $expectedIsccVersion."
+          }
+          Write-Host "Using Inno Setup compiler $iscc (CompilerEngineVersion=$actualIsccVersion)."
+          "WORKBOOKLENS_ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build and smoke-test the Windows installer
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem -LiteralPath portable-dist -Filter '*.zip')
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one portable ZIP, found $($archives.Count)."
+          }
+          $python = (Get-Command python.exe).Source
+          & $python scripts/build_installer_windows.py --portable-zip $archives[0].FullName --expected-version ${{ needs.verify.outputs.version }} --iscc $env:WORKBOOKLENS_ISCC --output-dir installer-dist
+          $installers = @(Get-ChildItem -LiteralPath installer-dist -Filter '*.exe')
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one setup executable, found $($installers.Count)."
+          }
+          & $python scripts/check_installer_artifact.py $installers[0].FullName --expected-version ${{ needs.verify.outputs.version }}
+          & $python scripts/smoke_installer_windows.py $installers[0].FullName --portable-zip $archives[0].FullName --expected-version ${{ needs.verify.outputs.version }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workbooklens-windows-portable-${{ github.run_id }}
+          path: |
+            portable-dist/*.zip
+            portable-dist/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workbooklens-windows-installer-${{ github.run_id }}
+          path: |
+            installer-dist/*.exe
+            installer-dist/*.exe.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  assemble:
+    if: github.repository == 'chenweixin123/workbooklens'
+    needs: [verify, portable]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: workbooklens-python-distributions-${{ github.run_id }}
+          path: release
+      - uses: actions/download-artifact@v8
+        with:
+          name: workbooklens-windows-portable-${{ github.run_id }}
+          path: release
+      - uses: actions/download-artifact@v8
+        with:
+          name: workbooklens-windows-installer-${{ github.run_id }}
+          path: release
+      - name: Validate the combined candidate and create SHA256SUMS
+        shell: python
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          import hashlib
+          import os
+          import pathlib
+
+          directory = pathlib.Path("release")
+          version = os.environ["VERSION"]
+          payload_names = {
+              f"workbooklens-{version}-py3-none-any.whl",
+              f"workbooklens-{version}.tar.gz",
+              f"WorkbookLens-{version}-windows-x64-portable.zip",
+              f"WorkbookLens-{version}-windows-x64-setup.exe",
+          }
+          sidecar_names = {
+              f"WorkbookLens-{version}-windows-x64-portable.zip.sha256",
+              f"WorkbookLens-{version}-windows-x64-setup.exe.sha256",
+          }
+          expected = payload_names | sidecar_names
+          actual = {path.name for path in directory.iterdir() if path.is_file()}
+          if actual != expected:
+              raise SystemExit(
+                  f"combined candidate mismatch; expected {sorted(expected)}, got {sorted(actual)}"
+              )
+
+          for payload_name in (
+              f"WorkbookLens-{version}-windows-x64-portable.zip",
+              f"WorkbookLens-{version}-windows-x64-setup.exe",
+          ):
+              payload = directory / payload_name
+              digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+              sidecar = (directory / f"{payload_name}.sha256").read_text(
+                  encoding="ascii"
+              ).strip()
+              if sidecar != f"{digest}  {payload.name}":
+                  raise SystemExit(f"SHA256 sidecar does not match {payload.name}")
+
+          lines = []
+          for name in sorted(payload_names, key=str.casefold):
+              path = directory / name
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              lines.append(f"{digest}  {name}")
+          (directory / "SHA256SUMS").write_text(
+              "\n".join(lines) + "\n",
+              encoding="ascii",
+              newline="\n",
+          )
       - uses: actions/upload-artifact@v7
         with:
           name: workbooklens-release-candidate-${{ github.run_id }}
-          path: |
-            dist
-            SHA256SUMS
+          path: release
           if-no-files-found: error
           retention-days: 30

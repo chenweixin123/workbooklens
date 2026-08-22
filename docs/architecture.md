@@ -2,14 +2,19 @@
 
 ## Trust boundary
 
-Every workbook path enters through `ooxml.safety.inspect_package`. The safety layer validates the
-filesystem type and extension, ZIP member/resource limits, XML parser configuration, and internal
-relationship resolution before `openpyxl` or a rule sees the file. External relationships are
-recorded but never dereferenced.
+Every normal OOXML scan or repair path enters through `ooxml.safety.inspect_package`. The safety
+layer validates the filesystem type and extension, ZIP member/resource limits, XML parser
+configuration, and internal relationship resolution before `openpyxl` or a rule sees the file.
+External relationships are recorded but never dereferenced. Legacy `.xls` conversion is a separate
+pre-OOXML trust boundary and accepts only user-designated trusted input: an installed Microsoft Excel
+or LibreOffice process opens the workbook and may recalculate formulas or process workbook-defined
+behavior before the resulting `.xlsx` enters the normal safety gate.
 
 ```mermaid
 flowchart LR
     A["Untrusted .xlsx/.xlsm"] --> B["ZIP and XML safety gate"]
+    X["Trusted, opt-in legacy .xls"] --> Y["OLE signature and installed local converter"]
+    Y --> B
     B --> C["Read-only semantic and layout snapshot"]
     C --> D["Region, formula, and layout analysis"]
     D --> E["21-rule registry"]
@@ -36,6 +41,9 @@ flowchart LR
 - `diff`: semantic and layout comparison independent of ZIP serialization.
 - `testing`: bounded YAML assertions, not a general formula evaluator.
 - `reports`: self-contained HTML/JSON/SARIF serialization.
+- `conversion`: optional Microsoft Excel or LibreOffice bridge for trusted legacy OLE-based `.xls`
+  input; the provider may recalculate formulas or process workbook-defined behavior, and generated
+  `.xlsx` files must re-enter through the normal package safety gate.
 - `web`: loopback-only FastAPI workflow backed by process-owned temporary storage.
 - `demo`: generated defects and end-to-end learning artifact.
 
@@ -74,7 +82,9 @@ an OOXML dimension such as `A1:XFD1048576`. Format-tail cleanup authorizes bound
 lists, then rejects intersections with formulas, names, tables, validations, comments, hyperlinks,
 page breaks, drawings, or unsupported row metadata. YAML assertions independently cap expanded
 ranges at 100,000 cells. Web uploads stream in 1 MiB chunks and stop at the configured compressed-file
-limit.
+limit. Legacy conversion uses the same request limit, a bounded provider timeout, a process-owned
+temporary directory, and the normal output package limits. Download completion removes the conversion
+directory; lifespan cleanup remains the fallback after disconnects or failures.
 
 ## Extension model
 

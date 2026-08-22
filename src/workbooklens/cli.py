@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 import typer
-import uvicorn
 from rich.console import Console
 from rich.table import Table
 
@@ -23,7 +22,7 @@ from workbooklens.reports import write_scan_report
 from workbooklens.scanner import scan_workbook
 from workbooklens.testing import TestConfig, evaluate_workbook_tests, load_test_config
 from workbooklens.utils import write_json
-from workbooklens.web import create_app
+from workbooklens.web import run_local_ui
 
 app = typer.Typer(
     name="workbooklens",
@@ -336,15 +335,35 @@ def test_workbook(
 
 @app.command()
 def serve(
-    port: int = typer.Option(8765, min=1, max=65535, help="Local TCP port."),
+    port: int = typer.Option(
+        8765,
+        min=0,
+        max=65535,
+        help="Local TCP port; use 0 to choose an available port automatically.",
+    ),
     max_file_mb: int = typer.Option(100, min=1, help="Maximum upload size."),
+    open_browser: bool = typer.Option(
+        False,
+        "--open-browser/--no-open-browser",
+        help="Open the local UI after its health check succeeds.",
+    ),
+    fallback_port: bool = typer.Option(
+        False,
+        "--fallback-port/--no-fallback-port",
+        help="Choose an automatic port only when the requested port is already in use.",
+    ),
 ) -> None:
     """Start the local-only review UI on 127.0.0.1 (never a public interface)."""
 
     try:
-        local_app = create_app(max_file_bytes=max_file_mb * 1024 * 1024)
-        console.print(f"WorkbookLens local UI: http://127.0.0.1:{port}")
-        uvicorn.run(local_app, host="127.0.0.1", port=port, log_level="info")
+        # Security invariant implemented by run_local_ui: host="127.0.0.1".
+        run_local_ui(
+            port=port,
+            max_file_bytes=max_file_mb * 1024 * 1024,
+            open_browser=open_browser,
+            fallback_port=fallback_port,
+            status=console.print,
+        )
     except typer.Exit:
         raise
     except WorkbookLensError as exc:

@@ -31,7 +31,7 @@ def test_help_version_and_required_commands() -> None:
         assert command in help_result.stdout
     version_result = runner.invoke(app, ["--version"])
     assert version_result.exit_code == 0
-    assert "WorkbookLens 2.2.0" in version_result.stdout
+    assert "WorkbookLens 2.2.1" in version_result.stdout
 
 
 def test_apply_help_explains_layout_review_opt_in() -> None:

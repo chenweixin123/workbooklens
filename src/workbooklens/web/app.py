@@ -14,10 +14,12 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from jinja2 import Environment, select_autoescape
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from workbooklens import __version__, conversion
 from workbooklens.diff import compare_workbooks, write_diff_report
 from workbooklens.exceptions import WorkbookLensError
 from workbooklens.models import Finding, PatchPlan, PatchRisk
@@ -51,13 +53,18 @@ INDEX_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>WorkbookLens</title>
 <style>:root{color-scheme:light dark;--bg:#f5f7fb;--card:#fff;--ink:#172033;--line:#dce3ee;--accent:#3157d5}
 @media(prefers-color-scheme:dark){:root{--bg:#10131a;--card:#181d27;--ink:#edf2f7;--line:#303849;--accent:#8da2ff}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 Arial,sans-serif}main{max-width:920px;margin:auto;padding:32px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;margin:18px 0}button{font:inherit;background:var(--accent);color:white;border:0;border-radius:8px;padding:10px 16px;font-weight:700}input[type=file]{display:block;margin:16px 0}.privacy{border-left:5px solid var(--accent)}</style></head>
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 Arial,sans-serif}main{max-width:920px;margin:auto;padding:32px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;margin:18px 0}button{font:inherit;background:var(--accent);color:white;border:0;border-radius:8px;padding:10px 16px;font-weight:700}button:disabled{opacity:.6;cursor:not-allowed}input[type=file]{display:block;margin:16px 0}.privacy{border-left:5px solid var(--accent)}</style></head>
 <body><main><h1>WorkbookLens</h1><p>Lint, review, and safely repair an Excel workbook on this computer.</p>
-<section class="card privacy"><b>Private by design.</b> Files remain in a process-owned temporary local directory and are removed on normal server shutdown. An abrupt crash or power loss can leave temporary files until they are removed manually or by operating-system cleanup. Formulas, macros, external links, and embedded objects are never executed.</section>
+<section class="card privacy"><b>Private by design.</b> Files remain in a process-owned temporary local directory and are removed on normal server shutdown. An abrupt crash or power loss can leave temporary files until they are removed manually or by operating-system cleanup. Normal .xlsx/.xlsm scanning and .xlsx copy repair do not calculate formulas, execute macros, fetch external links, or open embedded objects. Legacy .xls conversion is a separate trust boundary described below.</section>
 <form id="scan-form" class="card" action="/scan" method="post" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><h2>1. Choose a workbook</h2>
 <label for="workbook">Supported: .xlsx; .xlsm is scan-only</label><input id="workbook" name="workbook" type="file" accept=".xlsx,.xlsm" required>
-<button id="scan-button" type="submit">Scan locally</button><p id="scan-status" aria-live="polite">The upload limit is {{ max_mb }} MB.</p></form></main>
-<script>document.querySelector('#scan-form').addEventListener('submit',()=>{const button=document.querySelector('#scan-button');button.disabled=true;button.textContent='Scanning…';document.querySelector('#scan-status').textContent='Validating the package and running deterministic rules locally…'});</script></body></html>"""
+<button id="scan-button" type="submit">Scan locally</button><p id="scan-status" aria-live="polite">The upload limit is {{ max_mb }} MB.</p></form>
+<form id="convert-form" class="card" action="/convert" method="post" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><h2>Convert a legacy workbook</h2>
+<label for="legacy-workbook">Choose a trusted binary .xls file to create a local .xlsx copy.</label><input id="legacy-workbook" name="legacy_workbook" type="file" accept=".xls" required>
+<p><b>Trusted files only:</b> Microsoft Excel or LibreOffice opens the workbook locally and may recalculate formulas or process workbook-defined behavior supported by that application.</p>
+{% if converter_names %}<button id="convert-button" type="submit">Convert to .xlsx</button><p id="convert-status" aria-live="polite">Available locally: {{ converter_names|join(', then ') }}. Conversion fidelity depends on that application; review the downloaded copy.</p>
+{% else %}<button id="convert-button" type="submit" disabled>Converter unavailable</button><p id="convert-status" aria-live="polite">Install Microsoft Excel or LibreOffice, then restart WorkbookLens. Cloud conversion is never used.</p>{% endif %}</form></main>
+<script>document.querySelector('#scan-form').addEventListener('submit',()=>{const button=document.querySelector('#scan-button');button.disabled=true;button.textContent='Scanning…';document.querySelector('#scan-status').textContent='Validating the package and running deterministic rules locally…'});document.querySelector('#convert-form').addEventListener('submit',()=>{const button=document.querySelector('#convert-button');button.disabled=true;button.textContent='Converting…';document.querySelector('#convert-status').textContent='Opening the legacy workbook with an installed local spreadsheet application…'});</script></body></html>"""
 
 RESULT_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WorkbookLens findings</title>
 <style>:root{color-scheme:light dark;--bg:#f5f7fb;--card:#fff;--ink:#172033;--line:#dce3ee;--accent:#3157d5;--error:#c24135;--warning:#a15c00;--info:#1769aa}
@@ -151,11 +158,22 @@ def _origin(value: str) -> tuple[str, str, int] | None:
     return scheme, host, port
 
 
+def _allowed_form_source(value: str, request_origin: tuple[str, str, int] | None) -> bool:
+    if value == "null":
+        return True
+    submitted_origin = _origin(value)
+    if request_origin is None or submitted_origin is None:
+        return False
+    request_scheme, _request_host, request_port = request_origin
+    submitted_scheme, _submitted_host, submitted_port = submitted_origin
+    return submitted_scheme == request_scheme and submitted_port == request_port
+
+
 def _validate_post_request(request: Request, csrf_token: str) -> None:
     request_origin = _origin(str(request.url))
     for header in ("origin", "referer"):
         value = request.headers.get(header)
-        if value is not None and _origin(value) != request_origin:
+        if value is not None and not _allowed_form_source(value, request_origin):
             raise HTTPException(status_code=403, detail="Cross-origin form submission rejected")
     expected = str(request.app.state.csrf_token)
     if not csrf_token or not secrets.compare_digest(csrf_token, expected):
@@ -176,7 +194,7 @@ def _content_length(scope: Scope) -> int | None:
 
 
 def _request_body_limit(path: str, max_file_bytes: int) -> int:
-    if path == "/scan":
+    if path in {"/convert", "/scan"}:
         return max_file_bytes + MAX_MULTIPART_OVERHEAD_BYTES
     return MAX_FORM_BODY_BYTES
 
@@ -227,7 +245,7 @@ class _LocalRequestGuard:
         request_origin = _origin(str(request.url))
         for header in ("origin", "referer"):
             value = request.headers.get(header)
-            if value is not None and _origin(value) != request_origin:
+            if value is not None and not _allowed_form_source(value, request_origin):
                 await reject(403, "Cross-origin form submission rejected")
                 return
 
@@ -245,7 +263,7 @@ class _LocalRequestGuard:
         body_limit = _request_body_limit(request.url.path, self.max_file_bytes)
         content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
         if (
-            request.url.path == "/scan"
+            request.url.path in {"/convert", "/scan"}
             and content_type == "multipart/form-data"
             and declared_length is None
         ):
@@ -296,6 +314,7 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
 
     app = FastAPI(
         title="WorkbookLens",
+        version=__version__,
         docs_url=None,
         redoc_url=None,
         lifespan=lifespan,
@@ -326,10 +345,14 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
+        converter_names = [
+            provider.label for provider in conversion.available_conversion_providers()
+        ]
         response = HTMLResponse(
             environment.from_string(INDEX_TEMPLATE).render(
                 max_mb=max_file_bytes // 1024**2,
                 csrf_token=app.state.csrf_token,
+                converter_names=converter_names,
             )
         )
         response.set_cookie(
@@ -340,6 +363,41 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
             path="/",
         )
         return response
+
+    @app.post("/convert")
+    async def convert_upload(
+        request: Request,
+        legacy_workbook: UploadFile,
+        csrf_token: str = Form(default=""),
+    ) -> FileResponse:
+        _validate_post_request(request, csrf_token)
+        filename = Path(legacy_workbook.filename or "workbook.xls").name
+        if Path(filename).suffix.lower() != ".xls":
+            raise HTTPException(status_code=400, detail="Upload must be a binary .xls workbook")
+        conversion_id = secrets.token_urlsafe(18)
+        conversion_root = request.app.state.root / f"convert-{conversion_id}"
+        conversion_root.mkdir(parents=True)
+        source = conversion_root / "input.xls"
+        output = conversion_root / "converted.xlsx"
+        try:
+            await _store_upload(legacy_workbook, source, max_file_bytes)
+            result = await run_in_threadpool(
+                conversion.convert_xls_to_xlsx,
+                source,
+                output,
+                max_output_bytes=max_file_bytes,
+            )
+        except BaseException:
+            shutil.rmtree(conversion_root, ignore_errors=True)
+            raise
+        download_name = f"{Path(filename).stem or 'workbook'}.xlsx"
+        return FileResponse(
+            result.output,
+            media_type=conversion.XLSX_MEDIA_TYPE,
+            filename=download_name,
+            headers={"X-WorkbookLens-Converter": result.provider.label},
+            background=BackgroundTask(shutil.rmtree, conversion_root, ignore_errors=True),
+        )
 
     @app.post("/scan", response_class=HTMLResponse)
     async def scan_upload(
