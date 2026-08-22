@@ -76,7 +76,7 @@ jobs:
     if: github.repository == 'chenweixin123/workbooklens'
     needs: verify
     runs-on: windows-2025
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -114,12 +114,142 @@ jobs:
           $python = (Get-Command python.exe).Source
           & $python scripts/check_portable_artifact.py $archives[0].FullName --expected-version ${{ needs.verify.outputs.version }}
           & $python scripts/smoke_portable.py $archives[0].FullName --expected-version ${{ needs.verify.outputs.version }}
+      - name: Locate or install Inno Setup 6
+        shell: pwsh
+        run: |
+          $expectedIsccVersion = '6.7.0'
+          function Get-IsccCompilerVersion([string]$Path) {
+            $probeBase = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+            $probeRoot = [IO.Path]::GetFullPath(
+              (Join-Path $probeBase ("workbooklens-iscc-probe-" + [guid]::NewGuid().ToString('N')))
+            )
+            $requiredPrefix = $probeBase.TrimEnd('\') + '\'
+            if (-not $probeRoot.StartsWith($requiredPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "ISCC probe path escaped RUNNER_TEMP: $probeRoot"
+            }
+            $probeScript = Join-Path $probeRoot 'version-probe.iss'
+            $probeOutput = Join-Path $probeRoot 'Output'
+            [void][IO.Directory]::CreateDirectory($probeRoot)
+            try {
+              $probeContent = @(
+                '[Setup]',
+                'AppName=WorkbookLens ISCC Version Probe',
+                'AppVersion=0.0.0',
+                'DefaultDirName={tmp}\WorkbookLensISCCProbe',
+                'Output=no',
+                'Uninstallable=no',
+                'PrivilegesRequired=lowest'
+              ) -join "`n"
+              [IO.File]::WriteAllText(
+                $probeScript,
+                $probeContent,
+                [Text.UTF8Encoding]::new($false)
+              )
+              $output = @(& $Path $probeScript 2>&1)
+              $exitCode = $LASTEXITCODE
+              if ($exitCode -ne 0) {
+                return $null
+              }
+              $banner = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+              $match = [regex]::Match(
+                $banner,
+                '(?m)^Compiler engine version:\s+Inno Setup\s+(\d+\.\d+\.\d+)\s*$'
+              )
+              if (-not $match.Success) {
+                return $null
+              }
+              return $match.Groups[1].Value
+            } finally {
+              if ([IO.File]::Exists($probeScript)) {
+                [IO.File]::Delete($probeScript)
+              }
+              if ([IO.Directory]::Exists($probeOutput)) {
+                [IO.Directory]::Delete($probeOutput, $false)
+              }
+              if ([IO.Directory]::Exists($probeRoot)) {
+                [IO.Directory]::Delete($probeRoot, $false)
+              }
+            }
+          }
+
+          function Get-IsccCandidates {
+            $candidates = @()
+            $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($command) {
+              $candidates += $command.Source
+            }
+            $candidates += @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+            )
+            if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+              $candidates += "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+            }
+            return @(
+              $candidates |
+                Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+                Select-Object -Unique
+            )
+          }
+
+          function Find-ExpectedIscc([string]$ExpectedVersion) {
+            foreach ($candidate in @(Get-IsccCandidates)) {
+              $candidateVersion = Get-IsccCompilerVersion $candidate
+              if ($candidateVersion -eq $ExpectedVersion) {
+                return $candidate
+              }
+              $displayVersion = if ($candidateVersion) { $candidateVersion } else { 'unreadable' }
+              Write-Host "Ignoring ISCC candidate $candidate (compiler banner version=$displayVersion)."
+            }
+            return $null
+          }
+
+          $iscc = Find-ExpectedIscc $expectedIsccVersion
+          if (-not $iscc) {
+            choco install innosetup --version=6.7.0 --allow-downgrade --force --no-progress --yes
+            if ($LASTEXITCODE -ne 0) {
+              throw "Chocolatey could not install Inno Setup $expectedIsccVersion."
+            }
+            $iscc = Find-ExpectedIscc $expectedIsccVersion
+          }
+          if (-not $iscc) {
+            throw "Inno Setup compiler $expectedIsccVersion was not found after exact installation."
+          }
+          $actualIsccVersion = Get-IsccCompilerVersion $iscc
+          if ($actualIsccVersion -ne $expectedIsccVersion) {
+            throw "Inno Setup compiler banner version '$actualIsccVersion' does not match required version $expectedIsccVersion."
+          }
+          Write-Host "Using Inno Setup compiler $iscc (CompilerEngineVersion=$actualIsccVersion)."
+          "WORKBOOKLENS_ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build and smoke-test the Windows installer
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem -LiteralPath portable-dist -Filter '*.zip')
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one portable ZIP, found $($archives.Count)."
+          }
+          $python = (Get-Command python.exe).Source
+          & $python scripts/build_installer_windows.py --portable-zip $archives[0].FullName --expected-version ${{ needs.verify.outputs.version }} --iscc $env:WORKBOOKLENS_ISCC --output-dir installer-dist
+          $installers = @(Get-ChildItem -LiteralPath installer-dist -Filter '*.exe')
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one setup executable, found $($installers.Count)."
+          }
+          & $python scripts/check_installer_artifact.py $installers[0].FullName --expected-version ${{ needs.verify.outputs.version }}
+          & $python scripts/smoke_installer_windows.py $installers[0].FullName --portable-zip $archives[0].FullName --expected-version ${{ needs.verify.outputs.version }}
       - uses: actions/upload-artifact@v7
         with:
           name: workbooklens-windows-portable-${{ github.run_id }}
           path: |
             portable-dist/*.zip
             portable-dist/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workbooklens-windows-installer-${{ github.run_id }}
+          path: |
+            installer-dist/*.exe
+            installer-dist/*.exe.sha256
           if-no-files-found: error
           retention-days: 30
 
@@ -137,6 +267,10 @@ jobs:
         with:
           name: workbooklens-windows-portable-${{ github.run_id }}
           path: release
+      - uses: actions/download-artifact@v8
+        with:
+          name: workbooklens-windows-installer-${{ github.run_id }}
+          path: release
       - name: Validate the combined candidate and create SHA256SUMS
         shell: python
         env:
@@ -152,20 +286,30 @@ jobs:
               f"workbooklens-{version}-py3-none-any.whl",
               f"workbooklens-{version}.tar.gz",
               f"WorkbookLens-{version}-windows-x64-portable.zip",
+              f"WorkbookLens-{version}-windows-x64-setup.exe",
           }
-          sidecar_name = f"WorkbookLens-{version}-windows-x64-portable.zip.sha256"
-          expected = payload_names | {sidecar_name}
+          sidecar_names = {
+              f"WorkbookLens-{version}-windows-x64-portable.zip.sha256",
+              f"WorkbookLens-{version}-windows-x64-setup.exe.sha256",
+          }
+          expected = payload_names | sidecar_names
           actual = {path.name for path in directory.iterdir() if path.is_file()}
           if actual != expected:
               raise SystemExit(
                   f"combined candidate mismatch; expected {sorted(expected)}, got {sorted(actual)}"
               )
 
-          portable = directory / f"WorkbookLens-{version}-windows-x64-portable.zip"
-          portable_digest = hashlib.sha256(portable.read_bytes()).hexdigest()
-          sidecar = (directory / sidecar_name).read_text(encoding="ascii").strip()
-          if sidecar != f"{portable_digest}  {portable.name}":
-              raise SystemExit("portable SHA256 sidecar does not match the ZIP")
+          for payload_name in (
+              f"WorkbookLens-{version}-windows-x64-portable.zip",
+              f"WorkbookLens-{version}-windows-x64-setup.exe",
+          ):
+              payload = directory / payload_name
+              digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+              sidecar = (directory / f"{payload_name}.sha256").read_text(
+                  encoding="ascii"
+              ).strip()
+              if sidecar != f"{digest}  {payload.name}":
+                  raise SystemExit(f"SHA256 sidecar does not match {payload.name}")
 
           lines = []
           for name in sorted(payload_names, key=str.casefold):

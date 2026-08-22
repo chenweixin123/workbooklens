@@ -10,10 +10,14 @@ from httpx import Response
 from starlette import formparsers
 from starlette.types import Message, Scope
 
+import workbooklens.conversion as conversion
 from workbooklens import __version__
+from workbooklens.conversion import ConversionProvider, ConversionResult
 from workbooklens.demo.workflow import generate_demo_workbook
 from workbooklens.web import create_app
 from workbooklens.web.app import CSRF_COOKIE_NAME, MAX_MULTIPART_OVERHEAD_BYTES
+
+OLE_SIGNATURE = bytes.fromhex("D0CF11E0A1B11AE1")
 
 
 def _csrf_token(html: str) -> str:
@@ -158,6 +162,92 @@ def test_local_web_scan_apply_and_download_workflow(tmp_path: Path) -> None:
         assert client.get(f"/sessions/{session_id}/apply-report").status_code == 200
 
 
+def test_web_converts_legacy_xls_with_an_installed_local_provider(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    provider = ConversionProvider("excel", "Microsoft Excel", Path("powershell.exe"))
+    monkeypatch.setattr(conversion, "available_conversion_providers", lambda: (provider,))
+
+    def fake_convert(
+        source: Path,
+        output: Path,
+        *,
+        max_output_bytes: int,
+    ) -> ConversionResult:
+        assert source.read_bytes().startswith(OLE_SIGNATURE)
+        assert max_output_bytes == 5 * 1024 * 1024
+        generate_demo_workbook(output)
+        return ConversionResult(output, provider)
+
+    monkeypatch.setattr(conversion, "convert_xls_to_xlsx", fake_convert)
+    app = create_app(max_file_bytes=5 * 1024 * 1024)
+    with _client(app) as client:
+        home = client.get("/")
+        token = _csrf_token(home.text)
+        assert "Available locally: Microsoft Excel" in home.text
+        assert (
+            "Normal .xlsx/.xlsm scanning and .xlsx copy repair do not calculate formulas"
+            in home.text
+        )
+        assert "Trusted files only:" in home.text
+        assert "may recalculate formulas or process workbook-defined behavior" in home.text
+        response = client.post(
+            "/convert",
+            data={"csrf_token": token},
+            headers={"origin": "http://localhost"},
+            files={
+                "legacy_workbook": (
+                    "附件5：贵州省2025年研究生科研基金项目立项推荐汇总表_杨双艳.xls",  # noqa: RUF001
+                    OLE_SIGNATURE + b"legacy workbook",
+                    "application/vnd.ms-excel",
+                )
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.content.startswith(b"PK")
+        assert response.headers["content-type"].startswith(conversion.XLSX_MEDIA_TYPE)
+        assert response.headers["x-workbooklens-converter"] == "Microsoft Excel"
+        assert ".xlsx" in response.headers["content-disposition"]
+        assert not list(Path(app.state.root).glob("convert-*"))
+
+
+def test_web_disables_conversion_button_without_a_local_provider(monkeypatch) -> None:
+    monkeypatch.setattr(conversion, "available_conversion_providers", lambda: ())
+    app = create_app()
+
+    with _client(app) as client:
+        home = client.get("/")
+
+    assert "Converter unavailable" in home.text
+    assert "Install Microsoft Excel or LibreOffice" in home.text
+
+
+def test_web_rejects_wrong_or_oversized_legacy_upload(monkeypatch) -> None:
+    monkeypatch.setattr(conversion, "available_conversion_providers", lambda: ())
+    app = create_app(max_file_bytes=10)
+    with _client(app) as client:
+        token = _csrf_token(client.get("/").text)
+        wrong = client.post(
+            "/convert",
+            data={"csrf_token": token},
+            files={"legacy_workbook": ("book.xlsx", b"PK", "application/octet-stream")},
+        )
+        assert wrong.status_code == 400
+        oversized = client.post(
+            "/convert",
+            data={"csrf_token": token},
+            files={
+                "legacy_workbook": (
+                    "book.xls",
+                    OLE_SIGNATURE + b"x" * 11,
+                    "application/vnd.ms-excel",
+                )
+            },
+        )
+        assert oversized.status_code == 413
+
+
 def test_web_rejects_wrong_extension_and_oversized_upload() -> None:
     app = create_app(max_file_bytes=10)
     with _client(app) as client:
@@ -192,6 +282,31 @@ def test_xlsm_web_scan_does_not_offer_repairs(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert 'name="patch_id"' not in response.text
     assert "No safe deterministic patches are available" in response.text
+
+
+def test_web_accepts_unicode_filename_with_loopback_alias_and_null_origin(tmp_path: Path) -> None:
+    workbook = tmp_path / "source.xlsx"
+    generate_demo_workbook(workbook)
+    app = create_app(max_file_bytes=5 * 1024 * 1024)
+    filename = "附件5：贵州省2025年研究生科研基金项目立项推荐汇总表_杨双艳.xlsx"  # noqa: RUF001
+    with _client(app) as client:
+        token = _csrf_token(client.get("/").text)
+        for origin in ("http://localhost", "null"):
+            with workbook.open("rb") as handle:
+                response = client.post(
+                    "/scan",
+                    data={"csrf_token": token},
+                    headers={"origin": origin},
+                    files={
+                        "workbook": (
+                            filename,
+                            handle,
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
+                    },
+                )
+            assert response.status_code == 200, response.text
+            assert filename in response.text
 
 
 def test_web_errors_are_recoverable_html_pages() -> None:
@@ -230,6 +345,22 @@ def test_web_accepts_only_exact_loopback_host_headers() -> None:
             _assert_security_headers(response)
 
 
+def test_web_rejects_external_and_loopback_lookalike_origins() -> None:
+    app = create_app()
+    with _client(app) as client:
+        token = _csrf_token(client.get("/").text)
+        for origin in ("http://example.com", "http://localhost.example"):
+            response = client.post(
+                "/scan",
+                data={"csrf_token": token},
+                headers={"origin": origin},
+                files={"workbook": ("book.xlsx", b"not parsed", "application/octet-stream")},
+            )
+            assert response.status_code == 403
+            assert response.text == "Cross-origin form submission rejected"
+            _assert_security_headers(response)
+
+
 def test_web_rejects_missing_invalid_and_cross_origin_csrf() -> None:
     app = create_app()
     with _client(app) as client:
@@ -239,6 +370,8 @@ def test_web_rejects_missing_invalid_and_cross_origin_csrf() -> None:
             ({}, {}),
             ({"csrf_token": "not-the-server-token"}, {}),
             ({"csrf_token": token}, {"origin": "https://example.com"}),
+            ({"csrf_token": token}, {"origin": "http://127.0.0.1:81"}),
+            ({"csrf_token": token}, {"origin": "https://127.0.0.1"}),
             ({"csrf_token": token}, {"referer": "http://localhost.example/form"}),
         ):
             response = client.post(
@@ -258,6 +391,16 @@ def test_web_rejects_missing_invalid_and_cross_origin_csrf() -> None:
         assert same_origin.status_code == 400
         assert "Upload must be .xlsx or .xlsm" in same_origin.text
 
+        client.cookies.clear()
+        client.cookies.set(CSRF_COOKIE_NAME, "wrong-cookie")
+        wrong_cookie = client.post(
+            "/scan",
+            data={"csrf_token": token},
+            headers={"origin": "null"},
+            files={"workbook": ("notes.txt", b"hello", "text/plain")},
+        )
+        assert wrong_cookie.status_code == 403
+
 
 def test_early_guard_rejects_before_multipart_tempfile(
     monkeypatch,
@@ -272,13 +415,14 @@ def test_early_guard_rejects_before_multipart_tempfile(
 
         monkeypatch.setattr(formparsers, "SpooledTemporaryFile", unexpected_spool)
 
-        cross_site = client.post(
-            "/scan",
-            data={"csrf_token": token},
-            headers={"origin": "https://example.com"},
-            files={"workbook": ("book.xlsx", b"small", "application/octet-stream")},
-        )
-        assert cross_site.status_code == 403
+        for origin in ("https://example.com", "http://127.0.0.1:81"):
+            rejected = client.post(
+                "/scan",
+                data={"csrf_token": token},
+                headers={"origin": origin},
+                files={"workbook": ("book.xlsx", b"small", "application/octet-stream")},
+            )
+            assert rejected.status_code == 403
 
         oversized = client.post(
             "/scan",

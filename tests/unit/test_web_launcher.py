@@ -103,6 +103,7 @@ def test_run_local_ui_passes_prebound_socket_to_uvicorn(
     assert config["http"] == "h11"
     assert config["ws"] == "none"
     assert config["lifespan"] == "on"
+    assert config["proxy_headers"] is False
     assert len(captured["sockets"]) == 1
     assert captured["sockets"][0].fileno() == -1
     assert messages == [

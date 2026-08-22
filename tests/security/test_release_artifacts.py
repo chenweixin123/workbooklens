@@ -25,6 +25,7 @@ VERSION = "2.2.1"
 def _write_valid_distributions(
     directory: Path,
     *,
+    excluded_wheel_member: str | None = None,
     excluded_sdist_member: str | None = None,
 ) -> None:
     wheel = directory / f"workbooklens-{VERSION}-py3-none-any.whl"
@@ -32,6 +33,7 @@ def _write_valid_distributions(
     wheel_members = {
         "workbooklens/__init__.py": b"safe",
         "workbooklens/console.py": b"safe",
+        "workbooklens/conversion.py": b"safe",
         "workbooklens/diff/templates/diff.html.j2": b"safe",
         "workbooklens/reports/templates/scan.html.j2": b"safe",
         "workbooklens/web/launcher.py": b"safe",
@@ -43,6 +45,8 @@ def _write_valid_distributions(
         ),
         f"{dist_info}/licenses/LICENSE": b"safe",
     }
+    if excluded_wheel_member is not None:
+        wheel_members.pop(excluded_wheel_member)
     record_lines = []
     for name, payload in wheel_members.items():
         digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=")
@@ -62,16 +66,21 @@ def _write_valid_distributions(
         "README.md",
         "packaging/windows/README-PORTABLE.txt",
         "packaging/windows/Start-WorkbookLens.cmd",
+        "packaging/windows/WorkbookLens.iss",
         "packaging/windows/WorkbookLens.spec",
         "packaging/windows/entry.py",
         "pyproject.toml",
         "scripts/action_scan.py",
+        "scripts/build_installer_windows.py",
         "scripts/build_portable_windows.py",
+        "scripts/check_installer_artifact.py",
         "scripts/check_portable_artifact.py",
         "scripts/check_release_artifacts.py",
+        "scripts/smoke_installer_windows.py",
         "scripts/smoke_portable.py",
         "src/workbooklens/__init__.py",
         "src/workbooklens/console.py",
+        "src/workbooklens/conversion.py",
         "src/workbooklens/web/launcher.py",
     )
     with tarfile.open(sdist, "w:gz") as archive:
@@ -100,6 +109,15 @@ def test_release_directory_accepts_exact_expected_files(tmp_path: Path) -> None:
     _write_valid_distributions(tmp_path)
 
     check_distribution(tmp_path, VERSION)
+
+
+def test_wheel_requires_conversion_module(tmp_path: Path) -> None:
+    missing = "workbooklens/conversion.py"
+    _write_valid_distributions(tmp_path, excluded_wheel_member=missing)
+
+    with pytest.raises(ArtifactError) as error:
+        check_distribution(tmp_path, VERSION)
+    assert missing in str(error.value)
 
 
 @pytest.mark.parametrize("content", (b"*", b"*\n", b"*\r\n"))
@@ -151,11 +169,16 @@ def test_release_directory_rejects_linked_uv_generated_ignore(
         "packaging/windows/entry.py",
         "packaging/windows/Start-WorkbookLens.cmd",
         "packaging/windows/README-PORTABLE.txt",
+        "packaging/windows/WorkbookLens.iss",
+        "scripts/build_installer_windows.py",
+        "scripts/check_installer_artifact.py",
+        "scripts/smoke_installer_windows.py",
         "src/workbooklens/console.py",
+        "src/workbooklens/conversion.py",
         "src/workbooklens/web/launcher.py",
     ),
 )
-def test_sdist_requires_portable_build_inputs(tmp_path: Path, missing: str) -> None:
+def test_sdist_requires_windows_build_inputs(tmp_path: Path, missing: str) -> None:
     _write_valid_distributions(tmp_path, excluded_sdist_member=missing)
 
     with pytest.raises(ArtifactError) as error:
@@ -329,3 +352,45 @@ def test_sdist_rejects_hidden_bytes_in_member_padding(tmp_path: Path) -> None:
 
     with pytest.raises(ArtifactError, match="tar padding"):
         check_distribution(tmp_path, VERSION)
+
+
+@pytest.mark.parametrize("workflow_name", ("ci.yml", "release.yml"))
+def test_windows_installer_workflows_pin_inno_setup_version(workflow_name: str) -> None:
+    workflow = (Path(__file__).parents[2] / ".github" / "workflows" / workflow_name).read_text(
+        encoding="utf-8"
+    )
+
+    expected_declaration = "$expectedIsccVersion = '6.7.0'"
+    exact_install = (
+        "choco install innosetup --version=6.7.0 --allow-downgrade --force --no-progress --yes"
+    )
+    post_install_check = "$actualIsccVersion = Get-IsccCompilerVersion $iscc"
+    environment_export = '"WORKBOOKLENS_ISCC=$iscc"'
+
+    assert expected_declaration in workflow
+    assert ".VersionInfo.ProductVersion" not in workflow
+    assert "Get-IsccCompilerVersion $candidate" in workflow
+    assert "Compiler engine version:" in workflow
+    assert "Output=no" in workflow
+    assert "[IO.Directory]::Delete($probeRoot, $false)" in workflow
+    assert exact_install in workflow
+    assert post_install_check in workflow
+    assert "does not match required version" in workflow
+    assert workflow.index(exact_install) < workflow.index(post_install_check)
+    assert workflow.index(post_install_check) < workflow.index(environment_export)
+
+
+def test_windows_installer_workflows_share_the_iscc_lock_block() -> None:
+    blocks = []
+    for workflow_name in ("ci.yml", "release.yml"):
+        workflow = (Path(__file__).parents[2] / ".github" / "workflows" / workflow_name).read_text(
+            encoding="utf-8"
+        )
+        start = workflow.index("      - name: Locate or install Inno Setup 6")
+        end = workflow.index(
+            "      - name: Build and smoke-test the Windows installer",
+            start,
+        )
+        blocks.append(workflow[start:end])
+
+    assert blocks[0] == blocks[1]

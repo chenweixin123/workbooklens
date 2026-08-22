@@ -24,6 +24,7 @@ datas += collect_data_files(
 hiddenimports = sorted(
     {
         "python_multipart.multipart",
+        "winreg",
         "workbooklens.rules.builtin",
         *collect_submodules("uvicorn"),
     }

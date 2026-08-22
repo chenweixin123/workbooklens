@@ -152,6 +152,7 @@ def run_local_ui(
             http="h11",
             ws="none",
             lifespan="on",
+            proxy_headers=False,
         )
         server = uvicorn.Server(config)
         if open_browser:

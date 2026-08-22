@@ -109,6 +109,25 @@ def test_inspect_and_extract_valid_artifact(tmp_path: Path) -> None:
     assert (extracted / "WorkbookLens.exe").read_bytes() == _fake_pe()
 
 
+def test_allows_windows_api_debug_runtime_dll(tmp_path: Path) -> None:
+    repository = _repository_templates(tmp_path / "repo")
+    members = _base_members(repository)
+    members[f"{ROOT}/_internal/api-ms-win-core-debug-l1-1-0.dll"] = _fake_pe(version="runtime")
+    archive = _write_artifact(tmp_path, repository, members=members)
+
+    inspect_artifact(archive, expected_version=VERSION, repository_root=repository)
+
+
+def test_rejects_other_sensitive_internal_filename(tmp_path: Path) -> None:
+    repository = _repository_templates(tmp_path / "repo")
+    members = _base_members(repository)
+    members[f"{ROOT}/_internal/debug-secrets.txt"] = b"not for release"
+    archive = _write_artifact(tmp_path, repository, members=members)
+
+    with pytest.raises(PortableArtifactError, match="sensitive filename token"):
+        inspect_artifact(archive, expected_version=VERSION, repository_root=repository)
+
+
 @pytest.mark.parametrize(
     "unsafe_name",
     [

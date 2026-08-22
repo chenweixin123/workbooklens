@@ -29,12 +29,16 @@
 - [ ] Adversarial ZIP/XML/relationship and web-limit tests pass.
 - [ ] CodeQL, dependency review, and locked-runtime vulnerability audit pass.
 - [ ] GitHub Actions and dependencies have reviewed updates.
+- [ ] Windows CI and release jobs compile an `Output=no` probe and accept only the ISCC compiler
+  banner version exactly 6.7.0; record the `CompilerEngineVersion` emitted by the workflow.
 - [ ] uv build --out-dir dist and twine check --strict dist/* pass.
 - [ ] scripts/check_release_artifacts.py passes for the release version.
 - [ ] Unpacked wheel/sdist contain no environment, cache, bytecode, environment file, credential,
   private key, or unexpected top-level path.
 - [ ] The Windows portable ZIP passes traversal, duplicate/case-collision, symlink, encryption,
   compression, expanded-size, sensitive-file, PE x64, and version checks.
+- [ ] The Windows setup executable passes filename, size, PE bootstrap, version-resource, and
+  exact SHA-256 sidecar checks.
 
 ## Installation
 
@@ -46,6 +50,16 @@
   server answers `/health` and `/`, listens only on `127.0.0.1`, exits cleanly, and releases its port.
 - [ ] `Start-WorkbookLens.cmd` opens the browser only after readiness and falls back when port 8765
   is occupied. The console documents `Ctrl+C` as the clean stop mechanism.
+- [ ] The exact setup executable installs for the current user, preserves every portable payload
+  hash, creates the WorkbookLens Start-menu and selected desktop shortcuts, registers the correct
+  Installed apps version, rejects forged `HKCU` uninstall paths without changing their files,
+  writes and validates the installer ownership marker, rejects reparse points in the install tree,
+  runs without Python on `PATH`, and uninstalls without residual test state.
+- [ ] When the immediately previous release has Windows installer and portable artifacts, run
+  `scripts/smoke_installer_windows.py` with both `--previous-installer` and
+  `--previous-portable-zip` and record the exact previous artifact hashes. Version 2.2.1 is the
+  first Windows-installer release, so the published 2.2.0 wheel/sdist-only assets cannot supply this
+  baseline; do not substitute an unpinned or same-version download.
 - [ ] README Bash and PowerShell commands match a clean checkout.
 - [ ] Representative layout repairs are opened in the target spreadsheet application; text is not
   clipped, identifiers are exact, the initial viewport is useful, and printer/page layout is reviewed.
@@ -56,8 +70,8 @@
   generates SHA256SUMS, and uploads workflow artifacts.
 - [ ] Inspect the downloaded artifacts before external publication.
 - [ ] Record whether the release is GitHub-only or also publishes to PyPI.
-- [ ] Attach the validated wheel, sdist, Windows x64 portable ZIP, and checksums to the GitHub
-  Release. Attach a provenance attestation only when the release workflow produces one.
+- [ ] Attach the validated wheel, sdist, Windows x64 setup executable, portable ZIP, and checksums
+  to the GitHub Release. Attach a provenance attestation only when the release workflow produces one.
 - [ ] If publishing to PyPI, configure the GitHub pypi environment and trusted publisher for
   chenweixin123/workbooklens, then publish only from the validated tag using OIDC; do not add a
   long-lived PyPI token.

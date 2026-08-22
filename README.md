@@ -3,9 +3,14 @@
 **Deterministic linting, regression testing, semantic diffing, and conservative repair for
 Excel workbooks.**
 
-WorkbookLens 2.2 works locally without Microsoft Excel, LibreOffice, an AI key, or a cloud service.
-It does not calculate formulas, execute VBA, open embedded objects, or fetch external links.
-.xlsx files support scan, test, diff, and safe-copy repair; .xlsm files remain read-only.
+WorkbookLens 2.2 core scan, test, diff, and repair workflows work locally without Microsoft Excel,
+LibreOffice, an AI key, or a cloud service. Those normal OOXML workflows do not calculate formulas,
+execute VBA, open embedded objects, or fetch external links. .xlsx files support scan, test, diff,
+and safe-copy repair; .xlsm files remain read-only. The optional local `.xls` conversion button is a
+separate trust boundary and should be used only with trusted files: Microsoft Excel (preferred) or
+LibreOffice opens the workbook locally and may recalculate formulas or process workbook-defined
+behavior supported by that application. Conversion never uses a cloud service and does not claim
+that every legacy workbook feature can be preserved.
 
 > **Release status:** GitHub Releases are authoritative for source archives and attached artifacts.
 > Version 2.2.1 may not be published to [PyPI](https://pypi.org/project/workbooklens/); use the
@@ -73,9 +78,34 @@ It does not calculate formulas, execute VBA, open embedded objects, or fetch ext
 - CI tests Python 3.11–3.14 on Linux, Windows, and macOS, then installs the built wheel in fresh
   environments.
 
+## Windows installer (recommended)
+
+For the normal Windows experience, download
+`WorkbookLens-2.2.1-windows-x64-setup.exe` and `SHA256SUMS` from the official
+[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.2.1). Verify the
+published checksum before running the installer:
+
+~~~powershell
+(Get-FileHash .\WorkbookLens-2.2.1-windows-x64-setup.exe -Algorithm SHA256).Hash
+~~~
+
+The installer uses the current Windows account and does not require administrator access. Its
+wizard provides the normal **Install** button, adds **WorkbookLens** to the Start menu, offers a
+desktop shortcut by default, and registers a standard entry in Windows **Installed apps**. Open the
+Start-menu or desktop shortcut to launch the local interface directly; the WorkbookLens console
+starts the loopback service and the default browser opens after it is ready. Keep that console open
+while using WorkbookLens, and press `Ctrl+C` there to stop it cleanly.
+
+Uninstall from Windows **Settings > Apps > Installed apps**, or choose
+**Uninstall WorkbookLens** in the WorkbookLens Start-menu folder. The installer and application are
+currently unsigned, so Microsoft SmartScreen may display an unfamiliar-app warning. Download only
+from the official release and verify the SHA-256 value; do not disable antivirus protection. The
+installed application exposes the same local scan, repair, report, and optional `.xls` conversion
+interface as the portable build.
+
 ## Windows portable ZIP
 
-The official `WorkbookLens-2.2.1-windows-x64-portable.zip` is the simplest local Windows option.
+The official `WorkbookLens-2.2.1-windows-x64-portable.zip` is the no-install Windows option.
 It bundles a 64-bit CPython 3.12 runtime, so users do not need to install Python, `uv`, Microsoft
 Excel, LibreOffice, an AI key, or a cloud client. It is a portable folder rather than an installer:
 it does not request administrator access, modify the registry, create file associations, or add an
@@ -97,6 +127,14 @@ health check, and opens the default browser. It prefers port 8765 and selects an
 port if that port is already in use. Press `Ctrl+C` in the WorkbookLens console to stop the server
 cleanly. Workbook files and generated reports stay on the computer; the portable runtime does not
 upload them.
+
+The local home page also offers **Convert to .xlsx** for legacy binary `.xls` workbooks. Conversion
+is enabled only when WorkbookLens detects Microsoft Excel or LibreOffice on that computer. Excel is
+preferred for fidelity; LibreOffice is a fallback. Macros and events are disabled for the automated
+Excel open, external links are not updated, and the generated file must pass the same bounded OOXML
+safety inspection used by normal WorkbookLens inputs before it is downloaded. Conversion can still
+change unsupported legacy features, cached formula results, fonts, print layout, or vendor-specific
+objects, so review the `.xlsx` copy before relying on it.
 
 The executable is currently unsigned, so Microsoft SmartScreen may display a warning. Verify the
 checksum and download only from the official release. The portable build guarantees the built-in
@@ -128,7 +166,8 @@ workbooklens serve --port 8765
 ### Bash
 
 ~~~bash
-sha256sum -c SHA256SUMS
+grep -E '  workbooklens-2\.2\.1-py3-none-any\.whl$' SHA256SUMS | sha256sum -c -
+grep -E '  workbooklens-2\.2\.1\.tar\.gz$' SHA256SUMS | sha256sum -c -
 uv tool install ./workbooklens-2.2.1-py3-none-any.whl
 workbooklens --version
 workbooklens serve --port 8765
@@ -138,8 +177,9 @@ Then open `http://127.0.0.1:8765/`. The browser page and temporary upload direct
 that process. Sensitive workbooks should use the CLI or this loopback UI rather than a hosted CI
 runner.
 
-The wheel and portable ZIP are two distributions of the same local application. The wheel is the
-extensible option for Python users; the portable ZIP is the no-install option for Windows users.
+The setup executable, portable ZIP, and wheel are distributions of the same local application. The
+installer is the normal Windows option, the portable ZIP makes no installation changes, and the
+wheel is the extensible option for Python users.
 
 ## Install from this source checkout
 
@@ -321,12 +361,23 @@ ratios, entry and package sizes, required parts, XML size, DTD/entity declaratio
 relationships. Default limits include a 100 MiB compressed file, 10,000 entries, 1 GiB total
 uncompressed data, 100 MiB per entry, and 50 MiB per XML part.
 
+Legacy `.xls` conversion is a separate, explicit trust boundary because binary BIFF is not parsed by
+the normal OOXML safety layer. WorkbookLens first requires the OLE compound-file signature, then
+opens the temporary copy with an installed local spreadsheet application under restricted automation
+settings. Use this path only for trusted legacy files: Microsoft Excel or LibreOffice may recalculate
+formulas or process workbook-defined behavior supported by that application while opening or saving
+the workbook. Only the resulting macro-free `.xlsx` package enters the normal safety layer.
+Temporary conversion files are deleted after the download response completes and again on normal
+server shutdown.
+
 See [SECURITY.md](SECURITY.md) for private reporting. Never attach a confidential production
 workbook to a public issue.
 
 ## Honest limitations
 
-- No Excel calculation engine, VBA execution, external-link fetching, or embedded-object opening.
+- Normal OOXML scan, test, diff, and repair have no Excel calculation engine, VBA execution,
+  external-link fetching, or embedded-object opening. This guarantee does not describe the optional
+  local `.xls` conversion path.
 - No automatic repair for shared, array, data-table, spilled, or dynamic-array formulas.
 - Suspicious SUM boundaries are findings-only; the expected formula is evidence for human review,
   not proof that the adjacent row belongs in the aggregate.
@@ -344,7 +395,10 @@ workbook to a public issue.
 - Rule and region detection are deterministic heuristics. Passing a scan does not prove that every
   real-world workbook error has been found, and a finding does not by itself prove the proposed
   business meaning.
-- .xls, .xlsb, .ods, and Google Sheets are unsupported.
+- `.xls` cannot be scanned directly. The local web UI can convert an OLE-based binary `.xls` to
+  `.xlsx` when Microsoft Excel or LibreOffice is installed. Use only trusted input because that
+  application may recalculate formulas or process workbook-defined behavior; exact fidelity is not
+  guaranteed. `.xlsb`, `.ods`, and Google Sheets remain unsupported.
 - OOXML is extensible; preservation tests reduce risk but do not prove compatibility with every
   vendor extension.
 
@@ -378,7 +432,22 @@ $archive = @(Get-ChildItem -LiteralPath .artifacts/portable-dist -Filter '*.zip'
 if ($archive.Count -ne 1) { throw "Expected exactly one ZIP, found $($archive.Count)." }
 & $python scripts/check_portable_artifact.py $archive[0].FullName --expected-version 2.2.1
 & $python scripts/smoke_portable.py $archive[0].FullName --expected-version 2.2.1
+$iscc = (Resolve-Path "$env:LOCALAPPDATA/Programs/Inno Setup 6/ISCC.exe").Path
+& $python scripts/build_installer_windows.py --portable-zip $archive[0].FullName --expected-version 2.2.1 --iscc $iscc --output-dir .artifacts/installer-dist
+$installer = @(Get-ChildItem -LiteralPath .artifacts/installer-dist -Filter '*.exe')
+if ($installer.Count -ne 1) { throw "Expected exactly one installer, found $($installer.Count)." }
+& $python scripts/check_installer_artifact.py $installer[0].FullName --expected-version 2.2.1
+& $python scripts/smoke_installer_windows.py $installer[0].FullName --portable-zip $archive[0].FullName --expected-version 2.2.1
 ~~~
+
+The installer smoke test requires a user account without an existing WorkbookLens installation. It
+rejects custom directories and a forged per-user uninstall entry, installs only to the fixed
+`%LOCALAPPDATA%\Programs\WorkbookLens` directory, verifies the ownership marker, exact portable
+payload, Start-menu and desktop shortcuts, the Installed apps record, and the installed executable,
+then uninstalls and confirms that all test-created state was removed. Starting with the release after
+2.2.1, also pass the pinned preceding release's setup executable and portable ZIP through
+`--previous-installer` and `--previous-portable-zip`; the published 2.2.0 release did not contain
+Windows artifacts and therefore cannot be used as an installer-upgrade baseline.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md), [the architecture guide](docs/architecture.md),
 [CLI exit codes](docs/cli-exit-codes.md), and [the release checklist](docs/release-checklist.md).

@@ -130,6 +130,9 @@ INTERNAL_SENSITIVE_TOKENS: Final = {
     "secret",
     "secrets",
 }
+INTERNAL_ALLOWED_SENSITIVE_FILES: Final = {
+    "api-ms-win-core-debug-l1-1-0.dll",
+}
 REQUIRED_INTERNAL_FILES: Final = {
     "base_library.zip",
     "python312.dll",
@@ -543,7 +546,7 @@ def _validate_scoped_member(
     if suffix in INTERNAL_FORBIDDEN_SUFFIXES:
         _fail(f"unexpected source, data, or executable file under _internal: {info.filename!r}")
     tokens = {token for token in re.split(r"[^a-z0-9]+", leaf) if token}
-    if tokens & INTERNAL_SENSITIVE_TOKENS:
+    if tokens & INTERNAL_SENSITIVE_TOKENS and leaf not in INTERNAL_ALLOWED_SENSITIVE_FILES:
         _fail(f"sensitive filename token under _internal: {info.filename!r}")
 
 

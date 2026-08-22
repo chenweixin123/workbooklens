@@ -158,3 +158,4 @@ def test_windows_frozen_runtime_enables_utf8_before_startup() -> None:
     )
 
     assert '("X utf8", None, "OPTION")' in spec
+    assert '"winreg"' in spec
