@@ -2,6 +2,44 @@
 
 All notable changes are documented here. WorkbookLens follows Semantic Versioning.
 
+## [2.2.1] - 2026-08-22
+
+### Added
+
+- Add an official Windows x64 portable ZIP built from the validated wheel with CPython 3.12 and
+  PyInstaller. It runs without a separately installed Python, writes no registry keys, requires no
+  administrator access, and includes project, Python, and bundled-dependency license notices.
+- Add a double-click launcher that starts the existing local UI, waits for its health endpoint, and
+  then opens the default browser. The full console CLI remains available in the same executable.
+- Add frozen-application smoke tests for CLI workflows, HTML templates, Chinese and spaced paths,
+  real CSRF-protected multipart workbook uploads, loopback-only serving, graceful shutdown, and
+  release archive safety.
+
+### Changed
+
+- The `serve` command can explicitly open a browser and can optionally fall back to a system-chosen
+  port. Both behaviors are opt-in, so existing CLI automation retains its previous defaults.
+- The double-click launcher opens a dedicated console so `Ctrl+C` stops the server without a second
+  batch-job confirmation. Redirected frozen-process output uses UTF-8 for non-ASCII paths.
+- The local OpenAPI document reports the installed WorkbookLens version.
+- Release artifact checks reject extra files in the distribution directory as well as duplicate,
+  case-colliding, encrypted, linked, oversized, or suspicious archive members. The only optional
+  build marker is uv's exact generated `.gitignore`, and the new frozen entry modules are required.
+- Portable license collection follows declared `License-File` metadata and recognizes both
+  `LICENSE*` and `LICENCE*` names, failing the build when a declared license file is missing.
+
+### Security
+
+- The local server reserves its `127.0.0.1` socket before Uvicorn starts, removing the port-probe
+  race. Browser launch waits for `/health` and bypasses system HTTP proxies.
+
+### Compatibility
+
+- The portable package supports 64-bit Windows 10 and 11. It is currently unsigned and may trigger
+  Microsoft SmartScreen; users should verify the published SHA-256 checksum.
+- Portable builds include the built-in rules. Third-party entry-point plugins continue to require a
+  normal Python wheel installation.
+
 ## [2.2.0] - 2026-08-22
 
 ### Added

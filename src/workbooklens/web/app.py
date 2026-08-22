@@ -18,6 +18,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from workbooklens import __version__
 from workbooklens.diff import compare_workbooks, write_diff_report
 from workbooklens.exceptions import WorkbookLensError
 from workbooklens.models import Finding, PatchPlan, PatchRisk
@@ -296,6 +297,7 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
 
     app = FastAPI(
         title="WorkbookLens",
+        version=__version__,
         docs_url=None,
         redoc_url=None,
         lifespan=lifespan,

@@ -48,7 +48,24 @@ uv run python -m pytest -q
 uv run workbooklens demo --out .artifacts/demo
 uv build --out-dir dist
 uvx --from twine twine check --strict dist/*
-python scripts/check_release_artifacts.py dist --version 2.2.0
+python scripts/check_release_artifacts.py dist --version 2.2.1
+~~~
+
+On 64-bit Windows, reproduce and exercise the portable artifact from the built wheel with:
+
+~~~powershell
+uv sync --locked --python 3.12
+New-Item -ItemType Directory -Force -Path .artifacts | Out-Null
+uv build --out-dir .artifacts/portable-python-dist
+uv export --locked --python 3.12 --no-dev --group portable --no-emit-project --no-hashes --no-header --no-annotate --output-file .artifacts/portable-constraints.txt
+$wheel = @(Get-ChildItem -LiteralPath .artifacts/portable-python-dist -Filter '*.whl')
+if ($wheel.Count -ne 1) { throw "Expected exactly one wheel, found $($wheel.Count)." }
+$python = (Resolve-Path .venv/Scripts/python.exe).Path
+& $python scripts/build_portable_windows.py --wheel $wheel[0].FullName --python $python --expected-version 2.2.1 --constraints .artifacts/portable-constraints.txt --output-dir .artifacts/portable-dist
+$archive = @(Get-ChildItem -LiteralPath .artifacts/portable-dist -Filter '*.zip')
+if ($archive.Count -ne 1) { throw "Expected exactly one ZIP, found $($archive.Count)." }
+& $python scripts/check_portable_artifact.py $archive[0].FullName --expected-version 2.2.1
+& $python scripts/smoke_portable.py $archive[0].FullName --expected-version 2.2.1
 ~~~
 
 Review for unsafe ZIP handling, unbounded memory/ranges, inaccurate documentation, source rewrites,

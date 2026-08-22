@@ -10,6 +10,7 @@ from httpx import Response
 from starlette import formparsers
 from starlette.types import Message, Scope
 
+from workbooklens import __version__
 from workbooklens.demo.workflow import generate_demo_workbook
 from workbooklens.web import create_app
 from workbooklens.web.app import CSRF_COOKIE_NAME, MAX_MULTIPART_OVERHEAD_BYTES
@@ -106,6 +107,7 @@ def test_local_web_scan_apply_and_download_workflow(tmp_path: Path) -> None:
         health = client.get("/health")
         assert health.json() == {"status": "ok"}
         _assert_security_headers(health)
+        assert client.get("/openapi.json").json()["info"]["version"] == __version__
         home = client.get("/")
         assert home.status_code == 200
         assert "removed on normal server shutdown" in home.text

@@ -79,14 +79,92 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Read project version
+        id: project
+        shell: python
+        run: |
+          import os
+          import pathlib
+          import tomllib
+
+          version = tomllib.loads(
+              pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          )["project"]["version"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version={version}", file=output)
       - run: uv lock --check
       - run: uv build --out-dir dist
       - run: uvx --from twine twine check --strict dist/*
-      - run: python scripts/check_release_artifacts.py dist --version 2.2.0
+      - run: python scripts/check_release_artifacts.py dist --version ${{ steps.project.outputs.version }}
       - uses: actions/upload-artifact@v7
         with:
           name: workbooklens-distributions
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  portable:
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: workbooklens-distributions
           path: dist
+      - name: Read project version
+        id: project
+        shell: python
+        run: |
+          import os
+          import pathlib
+          import tomllib
+
+          version = tomllib.loads(
+              pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          )["project"]["version"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version={version}", file=output)
+      - name: Export locked portable constraints
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .artifacts | Out-Null
+          uv export --locked --python 3.12 --no-dev --group portable --no-emit-project --no-hashes --no-header --no-annotate --output-file .artifacts/portable-constraints.txt
+      - name: Build Windows x64 portable ZIP from the wheel
+        shell: pwsh
+        run: |
+          $wheels = @(Get-ChildItem -LiteralPath dist -Filter '*.whl')
+          if ($wheels.Count -ne 1) {
+            throw "Expected exactly one wheel, found $($wheels.Count)."
+          }
+          $python = (Get-Command python.exe).Source
+          & $python scripts/build_portable_windows.py --wheel $wheels[0].FullName --python $python --expected-version ${{ steps.project.outputs.version }} --constraints .artifacts/portable-constraints.txt --output-dir portable-dist
+      - name: Inspect and smoke-test the frozen artifact
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem -LiteralPath portable-dist -Filter '*.zip')
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one portable ZIP, found $($archives.Count)."
+          }
+          $python = (Get-Command python.exe).Source
+          & $python scripts/check_portable_artifact.py $archives[0].FullName --expected-version ${{ steps.project.outputs.version }}
+          & $python scripts/smoke_portable.py $archives[0].FullName --expected-version ${{ steps.project.outputs.version }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workbooklens-windows-portable
+          path: |
+            portable-dist/*.zip
+            portable-dist/*.zip.sha256
           if-no-files-found: error
           retention-days: 7
 

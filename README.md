@@ -8,7 +8,7 @@ It does not calculate formulas, execute VBA, open embedded objects, or fetch ext
 .xlsx files support scan, test, diff, and safe-copy repair; .xlsm files remain read-only.
 
 > **Release status:** GitHub Releases are authoritative for source archives and attached artifacts.
-> Version 2.2.0 may not be published to [PyPI](https://pypi.org/project/workbooklens/); use the
+> Version 2.2.1 may not be published to [PyPI](https://pypi.org/project/workbooklens/); use the
 > downloaded wheel or source checkout instructions below unless PyPI explicitly lists that version.
 > Do not assume pipx or uvx can install a GitHub-only release by package name.
 
@@ -73,24 +73,54 @@ It does not calculate formulas, execute VBA, open embedded objects, or fetch ext
 - CI tests Python 3.11–3.14 on Linux, Windows, and macOS, then installs the built wheel in fresh
   environments.
 
-## Install the downloaded local package
+## Windows portable ZIP
+
+The official `WorkbookLens-2.2.1-windows-x64-portable.zip` is the simplest local Windows option.
+It bundles a 64-bit CPython 3.12 runtime, so users do not need to install Python, `uv`, Microsoft
+Excel, LibreOffice, an AI key, or a cloud client. It is a portable folder rather than an installer:
+it does not request administrator access, modify the registry, create file associations, or add an
+automatic updater.
+
+Download the ZIP and `SHA256SUMS` from the official
+[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.2.1), compare the
+published SHA-256 value, and extract the complete folder. In PowerShell:
+
+~~~powershell
+(Get-FileHash .\WorkbookLens-2.2.1-windows-x64-portable.zip -Algorithm SHA256).Hash
+Expand-Archive .\WorkbookLens-2.2.1-windows-x64-portable.zip -DestinationPath .\WorkbookLens
+Set-Location .\WorkbookLens\WorkbookLens-2.2.1-windows-x64
+.\Start-WorkbookLens.cmd
+~~~
+
+The launcher opens a dedicated WorkbookLens console, starts only on `127.0.0.1`, waits for the
+health check, and opens the default browser. It prefers port 8765 and selects an available local
+port if that port is already in use. Press `Ctrl+C` in the WorkbookLens console to stop the server
+cleanly. Workbook files and generated reports stay on the computer; the portable runtime does not
+upload them.
+
+The executable is currently unsigned, so Microsoft SmartScreen may display a warning. Verify the
+checksum and download only from the official release. The portable build guarantees the built-in
+rules; install the wheel in a normal Python environment when third-party entry-point plugins are
+required.
+
+## Install the downloaded wheel
 
 The `.whl` attached to the GitHub Release is a local Python application package, not a hosted
 upload service. Workbook processing stays on the user's computer. Installing the wheel may contact
 the configured Python package index once to obtain dependencies; scanning, planning, repair, diff,
 and the loopback web UI do not upload workbooks.
 
-Download `workbooklens-2.2.0-py3-none-any.whl`, `workbooklens-2.2.0.tar.gz`, and
+Download `workbooklens-2.2.1-py3-none-any.whl`, `workbooklens-2.2.1.tar.gz`, and
 `SHA256SUMS` from the official
-[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.2.0), verify the
+[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.2.1), verify the
 checksum, and install it with Python 3.11+ and `uv`.
 
 ### PowerShell
 
 ~~~powershell
 Get-Content .\SHA256SUMS
-(Get-FileHash .\workbooklens-2.2.0-py3-none-any.whl -Algorithm SHA256).Hash
-uv tool install .\workbooklens-2.2.0-py3-none-any.whl
+(Get-FileHash .\workbooklens-2.2.1-py3-none-any.whl -Algorithm SHA256).Hash
+uv tool install .\workbooklens-2.2.1-py3-none-any.whl
 workbooklens --version
 workbooklens serve --port 8765
 ~~~
@@ -99,7 +129,7 @@ workbooklens serve --port 8765
 
 ~~~bash
 sha256sum -c SHA256SUMS
-uv tool install ./workbooklens-2.2.0-py3-none-any.whl
+uv tool install ./workbooklens-2.2.1-py3-none-any.whl
 workbooklens --version
 workbooklens serve --port 8765
 ~~~
@@ -108,9 +138,8 @@ Then open `http://127.0.0.1:8765/`. The browser page and temporary upload direct
 that process. Sensitive workbooks should use the CLI or this loopback UI rather than a hosted CI
 runner.
 
-WorkbookLens 2.2.0 does not provide a signed standalone Windows `.exe` or installer. Do not install
-unofficial repackaged executables. A separately validated Windows portable build can be added in a
-future patch release without changing the local-processing model.
+The wheel and portable ZIP are two distributions of the same local application. The wheel is the
+extensible option for Python users; the portable ZIP is the no-install option for Windows users.
 
 ## Install from this source checkout
 
@@ -136,11 +165,11 @@ uv run workbooklens --version
 uv run workbooklens demo --out .artifacts/demo
 ~~~
 
-If PyPI lists version 2.2.0, isolated installation is:
+If PyPI lists version 2.2.1, isolated installation is:
 
 ~~~bash
-uvx --from workbooklens==2.2.0 workbooklens --help
-pipx install workbooklens==2.2.0
+uvx --from workbooklens==2.2.1 workbooklens --help
+pipx install workbooklens==2.2.1
 ~~~
 
 ## Core workflows
@@ -218,7 +247,7 @@ confidentiality as the input workbook.
 
 ## GitHub Action
 
-After the v2.2.0 tag exists:
+After the v2.2.1 tag exists:
 
 ~~~yaml
 permissions:
@@ -230,7 +259,7 @@ steps:
     with:
       fetch-depth: 0
 
-  - uses: chenweixin123/workbooklens@v2.2.0
+  - uses: chenweixin123/workbooklens@v2.2.1
     with:
       mode: scan
       path: workbooks
@@ -244,7 +273,7 @@ steps:
 Assertion mode requires config and deliberately rejects baseline/new-only:
 
 ~~~yaml
-- uses: chenweixin123/workbooklens@v2.2.0
+- uses: chenweixin123/workbooklens@v2.2.1
   with:
     mode: test
     path: workbooks
@@ -329,7 +358,26 @@ uv run mypy src
 uv run python -m pytest -q
 uv build --out-dir dist
 uvx --from twine twine check --strict dist/*
-python scripts/check_release_artifacts.py dist --version 2.2.0
+python scripts/check_release_artifacts.py dist --version 2.2.1
+~~~
+
+To reproduce the Windows x64 portable release candidate from the built wheel, run the following in
+PowerShell on 64-bit Windows. The final smoke test executes the frozen program, including the CLI,
+loopback web UI, occupied-port fallback, clean shutdown, and installation-directory hash check.
+
+~~~powershell
+uv sync --locked --python 3.12
+New-Item -ItemType Directory -Force -Path .artifacts | Out-Null
+uv build --out-dir .artifacts/portable-python-dist
+uv export --locked --python 3.12 --no-dev --group portable --no-emit-project --no-hashes --no-header --no-annotate --output-file .artifacts/portable-constraints.txt
+$wheel = @(Get-ChildItem -LiteralPath .artifacts/portable-python-dist -Filter '*.whl')
+if ($wheel.Count -ne 1) { throw "Expected exactly one wheel, found $($wheel.Count)." }
+$python = (Resolve-Path .venv/Scripts/python.exe).Path
+& $python scripts/build_portable_windows.py --wheel $wheel[0].FullName --python $python --expected-version 2.2.1 --constraints .artifacts/portable-constraints.txt --output-dir .artifacts/portable-dist
+$archive = @(Get-ChildItem -LiteralPath .artifacts/portable-dist -Filter '*.zip')
+if ($archive.Count -ne 1) { throw "Expected exactly one ZIP, found $($archive.Count)." }
+& $python scripts/check_portable_artifact.py $archive[0].FullName --expected-version 2.2.1
+& $python scripts/smoke_portable.py $archive[0].FullName --expected-version 2.2.1
 ~~~
 
 See [CONTRIBUTING.md](CONTRIBUTING.md), [the architecture guide](docs/architecture.md),
