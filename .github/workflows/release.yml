@@ -77,6 +77,9 @@ jobs:
     needs: verify
     runs-on: windows-2025
     timeout-minutes: 50
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6

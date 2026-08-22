@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import TextIO
 
 if __package__:
     from .check_portable_artifact import (
@@ -30,6 +31,42 @@ else:
 
 class PortableSmokeError(RuntimeError):
     pass
+
+
+def configure_utf8_stdio(
+    *,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+) -> None:
+    streams = (
+        sys.stdout if stdout is None else stdout,
+        sys.stderr if stderr is None else stderr,
+    )
+    for stream in streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError):
+            continue
+
+
+def _safe_print(message: str, *, stream: TextIO, flush: bool = False) -> None:
+    try:
+        print(message, file=stream, flush=flush)
+    except UnicodeEncodeError:
+        encoding = stream.encoding or "ascii"
+        escaped = message.encode(encoding, errors="backslashreplace").decode(encoding)
+        print(escaped, file=stream, flush=flush)
+
+
+def _log_command(command: list[str], *, stream: TextIO | None = None) -> None:
+    _safe_print(
+        f"+ {subprocess.list2cmdline(command)}",
+        stream=sys.stdout if stream is None else stream,
+        flush=True,
+    )
 
 
 def sanitized_windows_environment(source: dict[str, str] | None = None) -> dict[str, str]:
@@ -69,7 +106,7 @@ def _run_cli(
     timeout: float,
 ) -> str:
     command = [str(executable), *arguments]
-    print(f"+ {subprocess.list2cmdline(command)}", flush=True)
+    _log_command(command)
     try:
         completed = subprocess.run(  # noqa: S603 - executable is the validated artifact.
             command,
@@ -748,6 +785,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    configure_utf8_stdio()
     args = _build_parser().parse_args()
     try:
         smoke_portable(

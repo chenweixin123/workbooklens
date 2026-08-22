@@ -1,15 +1,50 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 from scripts.smoke_portable import (
     _build_multipart_upload,
     _extract_csrf_token,
+    _log_command,
+    configure_utf8_stdio,
     contains_text_ignoring_line_wraps,
     parse_windows_listener_endpoints,
     parse_windows_listeners,
     sanitized_windows_environment,
 )
+
+
+def test_configures_legacy_stdio_for_non_ascii_command_logs() -> None:
+    stdout_buffer = io.BytesIO()
+    stderr_buffer = io.BytesIO()
+    stdout = io.TextIOWrapper(stdout_buffer, encoding="cp1252", errors="strict")
+    stderr = io.TextIOWrapper(stderr_buffer, encoding="cp1252", errors="strict")
+    try:
+        configure_utf8_stdio(stdout=stdout, stderr=stderr)
+        _log_command([r"C:\workbooklens-测试\WorkbookLens.exe", "--version"], stream=stdout)
+        stdout.flush()
+
+        assert stdout.encoding == "utf-8"
+        assert stderr.encoding == "utf-8"
+        assert "测试" in stdout_buffer.getvalue().decode("utf-8")
+    finally:
+        stdout.detach()
+        stderr.detach()
+
+
+def test_command_log_escapes_non_ascii_for_unconfigured_cp1252_stream() -> None:
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="cp1252", errors="strict")
+    try:
+        _log_command([r"C:\workbooklens-测试\WorkbookLens.exe", "--version"], stream=stream)
+        stream.flush()
+
+        output = buffer.getvalue().decode("cp1252")
+        assert "\\u6d4b\\u8bd5" in output
+        assert "WorkbookLens.exe --version" in output
+    finally:
+        stream.detach()
 
 
 def test_sanitized_environment_removes_python_paths() -> None:
