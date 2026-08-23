@@ -165,7 +165,7 @@ jobs:
       - name: Locate or install Inno Setup 6
         shell: pwsh
         run: |
-          $expectedIsccVersion = '6.7.0'
+          $expectedIsccVersion = '6.7.1'
           function Get-IsccCompilerVersion([string]$Path) {
             $probeBase = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
             $probeRoot = [IO.Path]::GetFullPath(
@@ -254,7 +254,7 @@ jobs:
 
           $iscc = Find-ExpectedIscc $expectedIsccVersion
           if (-not $iscc) {
-            choco install innosetup --version=6.7.0 --allow-downgrade --force --no-progress --yes
+            choco install innosetup --version=6.7.1 --allow-downgrade --force --no-progress --yes
             if ($LASTEXITCODE -ne 0) {
               throw "Chocolatey could not install Inno Setup $expectedIsccVersion."
             }

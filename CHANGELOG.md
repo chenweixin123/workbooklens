@@ -2,6 +2,58 @@
 
 All notable changes are documented here. WorkbookLens follows Semantic Versioning.
 
+## [2.3.0] - 2026-08-23
+
+### Added
+
+- Add a native Windows desktop shell built with pywebview and Microsoft Edge WebView2. The
+  windowed `WorkbookLens.exe` starts the loopback-only FastAPI service silently, renders it inside
+  the named application window, supports downloads, and stops the service when the window closes.
+- Add a persistent Chinese/English selector. Pages, built-in findings, repair suggestions, scan
+  reports, semantic-diff reports, and safe error messages follow the selected language while stable
+  IDs, fingerprints, formulas, paths in structured data, JSON, and SARIF contracts remain canonical.
+- Add separate `WorkbookLens.exe` and `WorkbookLensCLI.exe` Windows entry points, with the branded
+  WorkbookLens icon applied to the desktop executable, installer, Start-menu entry, and shortcut.
+
+### Changed
+
+- Windows shortcuts and `Start-WorkbookLens.cmd` now open the no-console desktop application rather
+  than a server console and external browser. The console CLI remains available in
+  `WorkbookLensCLI.exe` and through normal Python package installation.
+- The desktop launcher verifies that pywebview selected EdgeChromium before starting the local
+  service and checks again after the window closes. A missing WebView2 runtime therefore produces
+  the localized startup dialog instead of silently falling back to the legacy MSHTML renderer.
+- The workbook picker is rendered by WorkbookLens itself, so its button, selected-file state, and
+  validation guidance follow the chosen Chinese or English language instead of mixing browser- or
+  operating-system-provided labels into the interface.
+- Excel-backed `.xls` conversion no longer fails merely because Office or endpoint-security policy
+  denies `Process.Path`. The path is an optional identity signal; the converter continues to bind
+  ownership to the held process handle, PID, creation time, and Windows session before cleanup.
+- After Excel automation requests a normal shutdown, conversion waits up to 15 seconds for that
+  verified process to exit before using its held process handle for termination. This avoids an
+  intermittent Windows access-denied race while refusing to stop pre-existing or identity-mismatched
+  Excel processes.
+- Conversion and desktop failures now return localized, stable error codes and diagnostic IDs.
+  `WL-CNV-001` through `WL-CNV-005` distinguish invalid input, unavailable providers, provider
+  failure, invalid output, and timeout without exposing PowerShell CLIXML or raw exception details.
+
+### Security
+
+- The native desktop shell remains local-only: its HTTP service binds to `127.0.0.1`, workbook
+  content is not uploaded to a cloud service, and persistent WebView data stays under the current
+  user's local application-data directory.
+- User-facing conversion errors redact workbook names, private paths, commands, stack traces, and
+  CLIXML payloads. Rotating local diagnostics use the stable diagnostic identifier to correlate a
+  failure without returning the raw provider payload to the interface.
+
+### Compatibility
+
+- The native Windows interface requires Microsoft Edge WebView2 Runtime. Windows 10 and 11 normally
+  provide it; a localized startup dialog identifies the missing runtime without showing a traceback.
+- Existing CLI commands, machine-readable schemas, rule and patch IDs, and Action inputs/outputs are
+  unchanged. Third-party plugin text remains in its original language when no trusted translation is
+  available.
+
 ## [2.2.1] - 2026-08-22
 
 ### Added

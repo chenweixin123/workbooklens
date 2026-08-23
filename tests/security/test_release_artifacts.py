@@ -19,7 +19,7 @@ from scripts.check_release_artifacts import (
     check_distribution,
 )
 
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 
 
 def _write_valid_distributions(
@@ -34,6 +34,7 @@ def _write_valid_distributions(
         "workbooklens/__init__.py": b"safe",
         "workbooklens/console.py": b"safe",
         "workbooklens/conversion.py": b"safe",
+        "workbooklens/desktop.py": b"safe",
         "workbooklens/diff/templates/diff.html.j2": b"safe",
         "workbooklens/reports/templates/scan.html.j2": b"safe",
         "workbooklens/web/launcher.py": b"safe",
@@ -68,6 +69,11 @@ def _write_valid_distributions(
         "packaging/windows/Start-WorkbookLens.cmd",
         "packaging/windows/WorkbookLens.iss",
         "packaging/windows/WorkbookLens.spec",
+        "packaging/windows/assets/LICENSE-LUCIDE.txt",
+        "packaging/windows/assets/WorkbookLens.ico",
+        "packaging/windows/assets/WorkbookLens.png",
+        "packaging/windows/assets/WorkbookLens.svg",
+        "packaging/windows/desktop_entry.py",
         "packaging/windows/entry.py",
         "pyproject.toml",
         "scripts/action_scan.py",
@@ -81,6 +87,7 @@ def _write_valid_distributions(
         "src/workbooklens/__init__.py",
         "src/workbooklens/console.py",
         "src/workbooklens/conversion.py",
+        "src/workbooklens/desktop.py",
         "src/workbooklens/web/launcher.py",
     )
     with tarfile.open(sdist, "w:gz") as archive:
@@ -167,6 +174,9 @@ def test_release_directory_rejects_linked_uv_generated_ignore(
     "missing",
     (
         "packaging/windows/entry.py",
+        "packaging/windows/desktop_entry.py",
+        "packaging/windows/assets/WorkbookLens.ico",
+        "packaging/windows/assets/LICENSE-LUCIDE.txt",
         "packaging/windows/Start-WorkbookLens.cmd",
         "packaging/windows/README-PORTABLE.txt",
         "packaging/windows/WorkbookLens.iss",
@@ -175,6 +185,7 @@ def test_release_directory_rejects_linked_uv_generated_ignore(
         "scripts/smoke_installer_windows.py",
         "src/workbooklens/console.py",
         "src/workbooklens/conversion.py",
+        "src/workbooklens/desktop.py",
         "src/workbooklens/web/launcher.py",
     ),
 )
@@ -278,8 +289,8 @@ def test_zip_file_directory_ancestor_conflict_is_rejected() -> None:
 
 
 def test_tar_file_directory_ancestor_conflict_is_rejected() -> None:
-    file_info = tarfile.TarInfo("workbooklens-2.2.1/conflict")
-    child_info = tarfile.TarInfo("workbooklens-2.2.1/conflict/child.py")
+    file_info = tarfile.TarInfo(f"workbooklens-{VERSION}/conflict")
+    child_info = tarfile.TarInfo(f"workbooklens-{VERSION}/conflict/child.py")
 
     with pytest.raises(ArtifactError, match="also used as a directory"):
         _check_tar_members([file_info, child_info])
@@ -360,9 +371,9 @@ def test_windows_installer_workflows_pin_inno_setup_version(workflow_name: str) 
         encoding="utf-8"
     )
 
-    expected_declaration = "$expectedIsccVersion = '6.7.0'"
+    expected_declaration = "$expectedIsccVersion = '6.7.1'"
     exact_install = (
-        "choco install innosetup --version=6.7.0 --allow-downgrade --force --no-progress --yes"
+        "choco install innosetup --version=6.7.1 --allow-downgrade --force --no-progress --yes"
     )
     post_install_check = "$actualIsccVersion = Get-IsccCompilerVersion $iscc"
     environment_export = '"WORKBOOKLENS_ISCC=$iscc"'
@@ -394,3 +405,47 @@ def test_windows_installer_workflows_share_the_iscc_lock_block() -> None:
         blocks.append(workflow[start:end])
 
     assert blocks[0] == blocks[1]
+
+
+def test_release_installer_smoke_verifies_pinned_upgrade_baseline() -> None:
+    repository_root = Path(__file__).parents[2]
+    release_workflow = (repository_root / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+    ci_workflow = (repository_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    baseline_step = "      - name: Download and verify the v2.2.1 upgrade baseline"
+    installer_step = "      - name: Build and smoke-test the Windows installer"
+    baseline_start = release_workflow.index(baseline_step)
+    installer_start = release_workflow.index(installer_step, baseline_start)
+    baseline = release_workflow[baseline_start:installer_start]
+    smoke = release_workflow[installer_start:]
+
+    assert (
+        "portable:\n    if: github.repository == 'chenweixin123/workbooklens'" in release_workflow
+    )
+    assert "GH_TOKEN: ${{ github.token }}" in baseline
+    assert "$baselineTag = 'v2.2.1'" in baseline
+    assert "gh release download $baselineTag --repo chenweixin123/workbooklens" in baseline
+    assert "WorkbookLens-2.2.1-windows-x64-portable.zip" in baseline
+    assert "WorkbookLens-2.2.1-windows-x64-setup.exe" in baseline
+    assert "c5b2eb0b6b4e1b97de2563918dc3b35b969c767a8dc3ce6a8ab5ceb9fe093538" in baseline
+    assert "d54b874e1c540df65e099e860b5df5a3c658dde507f46e20995ae93db7aa4fef" in baseline
+    assert "Get-FileHash -LiteralPath $path -Algorithm SHA256" in baseline
+    assert '$sidecarContents = "$actualHash  $name`n"' in baseline
+    assert (
+        "[IO.File]::WriteAllText($sidecarPath, $sidecarContents, [Text.Encoding]::ASCII)"
+        in baseline
+    )
+    assert "WORKBOOKLENS_PREVIOUS_INSTALLER" in smoke
+    assert "WORKBOOKLENS_PREVIOUS_PORTABLE_ZIP" in smoke
+    assert "--previous-installer $env:WORKBOOKLENS_PREVIOUS_INSTALLER" in smoke
+    assert "--previous-portable-zip $env:WORKBOOKLENS_PREVIOUS_PORTABLE_ZIP" in smoke
+    assert "--previous-installer" not in ci_workflow
+    assert "--previous-portable-zip" not in ci_workflow
+
+    download = baseline.index("gh release download")
+    hash_check = baseline.index("Get-FileHash -LiteralPath $path -Algorithm SHA256")
+    sidecar = baseline.index("[IO.File]::WriteAllText")
+    environment_export = baseline.index("WORKBOOKLENS_PREVIOUS_PORTABLE_ZIP=")
+    assert download < hash_check < sidecar < environment_export

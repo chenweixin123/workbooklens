@@ -1,12 +1,79 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 pytest.importorskip("winreg")
 
 from scripts import smoke_installer_windows as installer_smoke
+
+
+def test_previous_v2_2_1_portable_uses_legacy_profile_for_inspection_and_extraction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer_calls: list[tuple[Path, str | None]] = []
+    inspect_calls: list[dict[str, object]] = []
+    extract_calls: list[dict[str, object]] = []
+
+    class StopAfterPreviousExtraction(RuntimeError):
+        pass
+
+    def fake_inspect_installer(
+        path: Path,
+        *,
+        expected_version: str | None = None,
+    ) -> SimpleNamespace:
+        installer_calls.append((path, expected_version))
+        return SimpleNamespace(version=expected_version or "unexpected")
+
+    def fake_inspect_artifact(_path: Path, **kwargs: object) -> None:
+        inspect_calls.append(kwargs)
+
+    def fake_extract_artifact(
+        _path: Path,
+        _destination: Path,
+        **kwargs: object,
+    ) -> Path:
+        extract_calls.append(kwargs)
+        if len(extract_calls) == 2:
+            raise StopAfterPreviousExtraction
+        root = tmp_path / "current-portable-root"
+        root.mkdir()
+        (root / "payload.bin").write_bytes(b"current")
+        return root
+
+    monkeypatch.setattr(installer_smoke, "inspect_installer", fake_inspect_installer)
+    monkeypatch.setattr(installer_smoke, "inspect_artifact", fake_inspect_artifact)
+    monkeypatch.setattr(installer_smoke, "extract_checked_artifact", fake_extract_artifact)
+    monkeypatch.setattr(installer_smoke, "_shell_folder", lambda name: tmp_path / name)
+    monkeypatch.setattr(installer_smoke, "_default_install_dir", lambda: tmp_path / "install")
+    monkeypatch.setattr(installer_smoke, "_uninstall_entries", lambda: [])
+
+    current_installer = tmp_path / "WorkbookLens-2.3.0-windows-x64-setup.exe"
+    previous_installer = tmp_path / "WorkbookLens-2.2.1-windows-x64-setup.exe"
+    with pytest.raises(StopAfterPreviousExtraction):
+        installer_smoke.smoke_installer(
+            current_installer,
+            tmp_path / "WorkbookLens-2.3.0-windows-x64-portable.zip",
+            expected_version="2.3.0",
+            repository_root=tmp_path,
+            previous_installer=previous_installer,
+            previous_portable_zip=(tmp_path / "WorkbookLens-2.2.1-windows-x64-portable.zip"),
+        )
+
+    assert installer_calls == [
+        (current_installer, "2.3.0"),
+        (previous_installer, installer_smoke.LEGACY_V2_2_1_VERSION),
+    ]
+    assert "profile" not in inspect_calls[0]
+    assert inspect_calls[1]["expected_version"] == installer_smoke.LEGACY_V2_2_1_VERSION
+    assert inspect_calls[1]["profile"] == installer_smoke.LEGACY_V2_2_1_PROFILE
+    assert "profile" not in extract_calls[0]
+    assert extract_calls[1]["expected_version"] == installer_smoke.LEGACY_V2_2_1_VERSION
+    assert extract_calls[1]["profile"] == installer_smoke.LEGACY_V2_2_1_PROFILE
 
 
 def test_inno_cleanup_requires_fixed_path_marker_and_reparse_checks() -> None:

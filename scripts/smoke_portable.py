@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -31,6 +32,10 @@ else:
 
 class PortableSmokeError(RuntimeError):
     pass
+
+
+_RETRYABLE_WINDOWS_DELETE_ERRORS = frozenset({5, 32, 33, 145})
+_RETRYABLE_DELETE_ERRNOS = frozenset({errno.EACCES, errno.EBUSY, errno.ENOTEMPTY})
 
 
 def configure_utf8_stdio(
@@ -133,6 +138,35 @@ def _run_cli(
     except OSError as exc:
         raise PortableSmokeError(f"cannot run portable command {command!r}: {exc}") from exc
     return completed.stdout
+
+
+def _run_desktop_smoke(
+    executable: Path,
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float,
+) -> None:
+    command = [str(executable), "--workbooklens-smoke-test"]
+    _log_command(command)
+    try:
+        completed = subprocess.run(  # noqa: S603 - executable is the validated artifact.
+            command,
+            cwd=cwd,
+            env=env,
+            check=False,
+            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PortableSmokeError("native desktop smoke timed out") from exc
+    except OSError as exc:
+        raise PortableSmokeError(f"cannot run native desktop smoke: {exc}") from exc
+    if completed.returncode != 0:
+        raise PortableSmokeError(
+            f"native desktop smoke failed with exit code {completed.returncode}"
+        )
 
 
 def contains_text_ignoring_line_wraps(output: str, expected: str) -> bool:
@@ -364,6 +398,38 @@ def _directory_snapshot(root: Path) -> dict[str, tuple[int, str]]:
             ) from exc
         snapshot[path.relative_to(root).as_posix()] = (size, digest.hexdigest())
     return snapshot
+
+
+def _is_retryable_temporary_delete_error(error: OSError) -> bool:
+    winerror = getattr(error, "winerror", None)
+    if winerror is not None:
+        return winerror in _RETRYABLE_WINDOWS_DELETE_ERRORS
+    return error.errno in _RETRYABLE_DELETE_ERRNOS
+
+
+def _remove_temporary_tree(
+    path: Path,
+    *,
+    timeout: float = 15.0,
+    retry_delay: float = 0.25,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as exc:
+            if isinstance(exc, FileNotFoundError):
+                if not path.exists():
+                    return
+            elif not _is_retryable_temporary_delete_error(exc):
+                raise
+            if time.monotonic() >= deadline:
+                raise PortableSmokeError(
+                    f"portable smoke workspace could not be removed within {timeout:g}s: "
+                    f"{path}: {exc}"
+                ) from exc
+            time.sleep(retry_delay)
 
 
 def _stop_server(
@@ -652,8 +718,12 @@ def smoke_portable(
             expected_version=expected_version,
             repository_root=repository_root,
         )
-        executable = root / "WorkbookLens.exe"
+        desktop_executable = root / "WorkbookLens.exe"
+        executable = root / "WorkbookLensCLI.exe"
         env = sanitized_windows_environment()
+        local_app_data = temporary / "local app data"
+        local_app_data.mkdir()
+        env["LOCALAPPDATA"] = str(local_app_data)
         _assert_no_python_on_path(env, root)
         installation_snapshot = _directory_snapshot(root)
 
@@ -674,7 +744,7 @@ def smoke_portable(
             env=env,
             timeout=timeout,
         )
-        expected_demo_message = f"Demo complete in {demo}"
+        expected_demo_message = f"Demo complete {demo}"
         if not contains_text_ignoring_line_wraps(demo_output, expected_demo_message):
             raise PortableSmokeError(
                 f"demo output did not preserve its non-ASCII path: {demo_output!r}"
@@ -755,6 +825,12 @@ def smoke_portable(
             env=env,
             timeout=timeout,
         )
+        _run_desktop_smoke(
+            desktop_executable,
+            cwd=root,
+            env=env,
+            timeout=max(timeout, 30.0),
+        )
         if _directory_snapshot(root) != installation_snapshot:
             raise PortableSmokeError(
                 "portable commands modified files in the installation directory"
@@ -765,7 +841,7 @@ def smoke_portable(
         return None
     finally:
         if not keep_temp and temporary.exists():
-            shutil.rmtree(temporary)
+            _remove_temporary_tree(temporary)
 
 
 def _build_parser() -> argparse.ArgumentParser:

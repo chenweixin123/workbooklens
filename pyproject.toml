@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "workbooklens"
-version = "2.2.1"
+version = "2.3.0"
 description = "Local-first linting, testing, semantic diffing, and safe repair for Excel workbooks"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -61,6 +61,7 @@ dev = [
 ]
 portable = [
   "pyinstaller==6.22.2",
+  "pywebview==6.2.1; sys_platform == 'win32'",
 ]
 
 [tool.hatch.build.targets.wheel]

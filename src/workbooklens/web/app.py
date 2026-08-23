@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import secrets
 import shutil
 import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from jinja2 import Environment, select_autoescape
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
@@ -22,16 +26,31 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from workbooklens import __version__, conversion
 from workbooklens.diff import compare_workbooks, write_diff_report
 from workbooklens.exceptions import WorkbookLensError
-from workbooklens.models import Finding, PatchPlan, PatchRisk
+from workbooklens.i18n import (
+    DEFAULT_LANGUAGE,
+    Language,
+    UserFacingError,
+    localize_exception,
+    localize_finding,
+    localize_patch,
+    localized_error,
+    new_diagnostic_id,
+    normalize_language,
+    translate,
+)
+from workbooklens.models import Finding, PatchPlan, PatchResult, PatchRisk, WorkbookDiff
 from workbooklens.ooxml.safety import PackageLimits
 from workbooklens.repair import apply_patch_plan, build_patch_plan
 from workbooklens.repair.planning import write_patch_plan
 from workbooklens.reports import write_scan_report
-from workbooklens.scanner import scan_workbook
+from workbooklens.scanner import ScanResult, scan_workbook
 from workbooklens.utils import write_json
+from workbooklens.web.templates import template_loader
 
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1"})
 CSRF_COOKIE_NAME = "workbooklens_csrf"
+LANGUAGE_COOKIE_NAME = "workbooklens_language"
+LANGUAGE_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
 MAX_MULTIPART_OVERHEAD_BYTES = 16 * 1024
 MAX_FORM_BODY_BYTES = 1024 * 1024
 UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -49,35 +68,64 @@ SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
 }
 
-INDEX_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>WorkbookLens</title>
-<style>:root{color-scheme:light dark;--bg:#f5f7fb;--card:#fff;--ink:#172033;--line:#dce3ee;--accent:#3157d5}
-@media(prefers-color-scheme:dark){:root{--bg:#10131a;--card:#181d27;--ink:#edf2f7;--line:#303849;--accent:#8da2ff}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 Arial,sans-serif}main{max-width:920px;margin:auto;padding:32px}.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;margin:18px 0}button{font:inherit;background:var(--accent);color:white;border:0;border-radius:8px;padding:10px 16px;font-weight:700}button:disabled{opacity:.6;cursor:not-allowed}input[type=file]{display:block;margin:16px 0}.privacy{border-left:5px solid var(--accent)}</style></head>
-<body><main><h1>WorkbookLens</h1><p>Lint, review, and safely repair an Excel workbook on this computer.</p>
-<section class="card privacy"><b>Private by design.</b> Files remain in a process-owned temporary local directory and are removed on normal server shutdown. An abrupt crash or power loss can leave temporary files until they are removed manually or by operating-system cleanup. Normal .xlsx/.xlsm scanning and .xlsx copy repair do not calculate formulas, execute macros, fetch external links, or open embedded objects. Legacy .xls conversion is a separate trust boundary described below.</section>
-<form id="scan-form" class="card" action="/scan" method="post" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><h2>1. Choose a workbook</h2>
-<label for="workbook">Supported: .xlsx; .xlsm is scan-only</label><input id="workbook" name="workbook" type="file" accept=".xlsx,.xlsm" required>
-<button id="scan-button" type="submit">Scan locally</button><p id="scan-status" aria-live="polite">The upload limit is {{ max_mb }} MB.</p></form>
-<form id="convert-form" class="card" action="/convert" method="post" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><h2>Convert a legacy workbook</h2>
-<label for="legacy-workbook">Choose a trusted binary .xls file to create a local .xlsx copy.</label><input id="legacy-workbook" name="legacy_workbook" type="file" accept=".xls" required>
-<p><b>Trusted files only:</b> Microsoft Excel or LibreOffice opens the workbook locally and may recalculate formulas or process workbook-defined behavior supported by that application.</p>
-{% if converter_names %}<button id="convert-button" type="submit">Convert to .xlsx</button><p id="convert-status" aria-live="polite">Available locally: {{ converter_names|join(', then ') }}. Conversion fidelity depends on that application; review the downloaded copy.</p>
-{% else %}<button id="convert-button" type="submit" disabled>Converter unavailable</button><p id="convert-status" aria-live="polite">Install Microsoft Excel or LibreOffice, then restart WorkbookLens. Cloud conversion is never used.</p>{% endif %}</form></main>
-<script>document.querySelector('#scan-form').addEventListener('submit',()=>{const button=document.querySelector('#scan-button');button.disabled=true;button.textContent='Scanning…';document.querySelector('#scan-status').textContent='Validating the package and running deterministic rules locally…'});document.querySelector('#convert-form').addEventListener('submit',()=>{const button=document.querySelector('#convert-button');button.disabled=true;button.textContent='Converting…';document.querySelector('#convert-status').textContent='Opening the legacy workbook with an installed local spreadsheet application…'});</script></body></html>"""
+LOGGER = logging.getLogger(__name__)
 
-RESULT_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WorkbookLens findings</title>
-<style>:root{color-scheme:light dark;--bg:#f5f7fb;--card:#fff;--ink:#172033;--line:#dce3ee;--accent:#3157d5;--error:#c24135;--warning:#a15c00;--info:#1769aa}
-@media(prefers-color-scheme:dark){:root{--bg:#10131a;--card:#181d27;--ink:#edf2f7;--line:#303849;--accent:#8da2ff}}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 Arial,sans-serif}main{max-width:1100px;margin:auto;padding:28px}.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin:16px 0}.finding{border-left:5px solid var(--info)}.finding.error,.finding.critical{border-left-color:var(--error)}.finding.warning{border-left-color:var(--warning)}button,.button{display:inline-block;font:inherit;background:var(--accent);color:white;border:0;border-radius:8px;padding:9px 14px;text-decoration:none;font-weight:700}code{overflow-wrap:anywhere}.actions{display:flex;gap:10px;flex-wrap:wrap}label.patch{display:block;padding:10px;border:1px solid var(--line);border-radius:8px;margin:8px 0}</style></head>
-<body><main><a href="/">← New scan</a><h1>Findings for {{ filename }}</h1><div class="actions"><a class="button" href="/sessions/{{ session_id }}/report">Open full HTML report</a><a class="button" href="/sessions/{{ session_id }}/plan">Download JSON plan</a></div>
-<form class="card" action="/sessions/{{ session_id }}/apply" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><h2>2. Review patches</h2>
-{% if patches %}<p>Select only changes you have reviewed. The original file is never modified.</p>{% for patch in patches %}<label class="patch"><input type="checkbox" name="patch_id" value="{{ patch.id }}" data-risk="{{ patch.risk.value }}"> <b>{{ patch.sheet }}!{{ patch.cell }}</b> · {{ patch.kind.value }} · {{ '%.0f'|format(patch.confidence.root*100) }}% confidence · {{ patch.risk.value }}<br><code>{{ patch.before }}</code> → <code>{{ patch.after }}</code><br>{{ patch.description }}</label>{% endfor %}
-{% if has_layout_review %}<label class="patch"><input type="checkbox" name="accept_layout_risk" value="true"> <b>I reviewed the layout risk.</b> Row heights, column widths, saved view, wrapping, borders, or print pagination may change. Atomic patch groups are always applied together.</label>{% endif %}
-<button type="submit">Apply selected patches to a copy</button>{% else %}<p>No safe deterministic patches are available, and no layout-review patches were offered. Scan and report downloads remain available.</p>{% endif %}</form>
-<section><h2>All findings ({{ findings|length }})</h2>{% for finding in findings %}<article class="card finding {{ finding.severity.value }}"><b>{{ finding.severity.value|upper }} · {{ finding.rule_id }} · {{ finding.sheet or 'Workbook' }}{% if finding.location %}!{{ finding.location }}{% endif %}</b><h3>{{ finding.title }}</h3><p>{{ finding.explanation }}</p><details><summary>Evidence</summary><p>{{ finding.evidence.summary }}</p><code>{{ finding.evidence.observed }}</code></details></article>{% endfor %}{% if not findings %}<div class="card">No findings.</div>{% endif %}</section></main></body></html>"""
 
-APPLIED_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WorkbookLens repair complete</title><style>:root{color-scheme:light dark;--bg:#f5f7fb;--card:#fff;--ink:#172033;--line:#dce3ee;--accent:#3157d5}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 Arial,sans-serif}main{max-width:850px;margin:auto;padding:32px}.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;margin:16px 0}.button{display:inline-block;background:var(--accent);color:white;border-radius:8px;padding:10px 15px;text-decoration:none;font-weight:700;margin:5px}</style></head><body><main><h1>Validated copy created</h1><section class="card"><p>Applied {{ result.applied_patch_ids|length }} reviewed patches. The source hash remained {{ result.source_sha256 }}.</p><p>{{ result.resolved_finding_ids|length }} findings resolved; {{ result.new_finding_ids|length }} new informational/warning findings.</p>{% for message in result.validation_messages %}<p>✓ {{ message }}</p>{% endfor %}</section><div><a class="button" href="/sessions/{{ session_id }}/fixed">Download fixed workbook</a><a class="button" href="/sessions/{{ session_id }}/diff">Preview semantic diff</a><a class="button" href="/sessions/{{ session_id }}/apply-report">Download apply report</a></div></main></body></html>"""
-ERROR_TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WorkbookLens could not continue</title><style>:root{color-scheme:light dark;--bg:#f5f7fb;--card:#fff;--ink:#172033;--line:#dce3ee;--accent:#3157d5;--error:#c24135}@media(prefers-color-scheme:dark){:root{--bg:#10131a;--card:#181d27;--ink:#edf2f7;--line:#303849;--accent:#8da2ff}}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 Arial,sans-serif}main{max-width:760px;margin:auto;padding:32px}.card{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--error);border-radius:12px;padding:20px;margin:16px 0}.button{display:inline-block;background:var(--accent);color:white;border-radius:8px;padding:10px 15px;text-decoration:none;font-weight:700}</style></head><body><main><h1>WorkbookLens could not continue</h1><section class="card"><p>{{ message }}</p><p>The source workbook was not modified.</p></section><a class="button" href="/">Choose another workbook</a></main></body></html>"""
+def _request_operation(
+    request: Request,
+) -> Literal["conversion", "scan", "repair", "download", "request"]:
+    path = request.url.path
+    if path == "/convert":
+        return "conversion"
+    if path == "/scan":
+        return "scan"
+    if path.endswith("/apply"):
+        return "repair"
+    if path.startswith("/sessions/"):
+        return "download"
+    return "request"
+
+
+class _LocalizedHTTPException(HTTPException):
+    def __init__(self, status_code: int, detail: str, error_key: str) -> None:
+        super().__init__(status_code=status_code, detail=detail)
+        self.error_key = error_key
+
+
+def _http_error(status_code: int, detail: str, error_key: str) -> HTTPException:
+    return _LocalizedHTTPException(status_code, detail, error_key)
+
+
+def _conversion_error_key(exc: BaseException) -> str:
+    explicit = getattr(exc, "error_key", None)
+    if isinstance(explicit, str) and explicit.startswith("conversion."):
+        return explicit
+    message = str(exc).lower()
+    if any(
+        marker in message
+        for marker in (
+            "accepts only .xls",
+            "not a recognized binary excel .xls",
+            "legacy workbook does not exist",
+        )
+    ):
+        return "conversion.invalid_input"
+    if "no local .xls converter is available" in message:
+        return "conversion.unavailable"
+    if "timed out" in message or "did not terminate in time" in message:
+        return "conversion.timeout"
+    if any(
+        marker in message
+        for marker in (
+            "verified macro-free .xlsx",
+            "did not create the expected .xlsx",
+            "output is missing",
+            "output contains",
+            "output has no cell style table",
+        )
+    ):
+        return "conversion.output_invalid"
+    return "conversion.all_providers_failed"
 
 
 @dataclass(slots=True)
@@ -87,12 +135,16 @@ class WebSession:
     session_id: str
     filename: str
     source: Path
-    report: Path
     plan_path: Path
     plan: PatchPlan
+    scan: ScanResult
     findings: list[Finding]
+    language: Language
+    reports: dict[Language, Path]
     fixed: Path | None = None
-    diff: Path | None = None
+    result: PatchResult | None = None
+    semantic_diff: WorkbookDiff | None = None
+    diff_reports: dict[Language, Path] | None = None
     apply_report: Path | None = None
 
 
@@ -116,7 +168,95 @@ class _LimitedReceive:
 
 
 def _environment() -> Environment:
-    return Environment(autoescape=select_autoescape(default=True))
+    return Environment(
+        loader=template_loader(),
+        autoescape=select_autoescape(enabled_extensions=("html",), default=True),
+    )
+
+
+def _preferred_language(request: Request) -> Language:
+    for item in request.headers.get("accept-language", "").split(","):
+        tag = item.partition(";")[0].strip().lower()
+        if tag.startswith("zh"):
+            return "zh-CN"
+        if tag.startswith("en"):
+            return "en"
+    return DEFAULT_LANGUAGE
+
+
+def _request_language(
+    request: Request,
+    explicit: str | None = None,
+    *,
+    fallback: Language | None = None,
+) -> Language:
+    configured = getattr(request.app.state, "default_language", None)
+    browser_default = fallback or normalize_language(
+        configured,
+        fallback=_preferred_language(request),
+    )
+    cookie_value = request.cookies.get(LANGUAGE_COOKIE_NAME)
+    cookie_language = normalize_language(cookie_value, fallback=browser_default)
+    return normalize_language(explicit, fallback=cookie_language)
+
+
+def _set_language_cookie(response: HTMLResponse | RedirectResponse, language: Language) -> None:
+    response.set_cookie(
+        LANGUAGE_COOKIE_NAME,
+        language,
+        max_age=LANGUAGE_COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _display_value(value: Any, *, empty_label: str) -> str:
+    if value is None:
+        return empty_label
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _render_page(
+    environment: Environment,
+    template_name: str,
+    language: Language,
+    *,
+    page_title: str,
+    language_action: str,
+    view: str,
+    **context: Any,
+) -> str:
+    translator = partial(translate, language=language)
+    return environment.get_template(template_name).render(
+        language=language,
+        page_title=page_title,
+        language_action=language_action,
+        view=view,
+        version=__version__,
+        t=translator,
+        display_value=partial(
+            _display_value,
+            empty_label=translator("web.value_empty"),
+        ),
+        **context,
+    )
+
+
+def _language_response(
+    html: str,
+    language: Language,
+    *,
+    status_code: int = 200,
+) -> HTMLResponse:
+    response = HTMLResponse(html, status_code=status_code)
+    _set_language_cookie(response, language)
+    return response
 
 
 def _parse_local_authority(authority: str) -> tuple[str, int | None] | None:
@@ -174,10 +314,18 @@ def _validate_post_request(request: Request, csrf_token: str) -> None:
     for header in ("origin", "referer"):
         value = request.headers.get(header)
         if value is not None and not _allowed_form_source(value, request_origin):
-            raise HTTPException(status_code=403, detail="Cross-origin form submission rejected")
+            raise _http_error(
+                403,
+                "Cross-origin form submission rejected",
+                "security.cross_origin",
+            )
     expected = str(request.app.state.csrf_token)
     if not csrf_token or not secrets.compare_digest(csrf_token, expected):
-        raise HTTPException(status_code=403, detail="Invalid or missing form security token")
+        raise _http_error(
+            403,
+            "Invalid or missing form security token",
+            "security.csrf",
+        )
 
 
 def _content_length(scope: Scope) -> int | None:
@@ -230,12 +378,20 @@ class _LocalRequestGuard:
                 return
             await secure_send(message)
 
-        async def reject(status_code: int, detail: str) -> None:
-            response = PlainTextResponse(detail, status_code=status_code)
+        async def reject(status_code: int, error_key: str) -> None:
+            language = normalize_language(
+                request.cookies.get(LANGUAGE_COOKIE_NAME),
+                fallback=_preferred_language(request),
+            )
+            error = localized_error(error_key, language)
+            response = PlainTextResponse(
+                f"{error.code}: {error.message}",
+                status_code=status_code,
+            )
             await response(scope, receive, secure_send)
 
         if _parse_local_authority(request.headers.get("host", "")) is None:
-            await reject(400, "Invalid Host header")
+            await reject(400, "request.invalid")
             return
 
         if request.method not in UNSAFE_METHODS:
@@ -246,18 +402,18 @@ class _LocalRequestGuard:
         for header in ("origin", "referer"):
             value = request.headers.get(header)
             if value is not None and not _allowed_form_source(value, request_origin):
-                await reject(403, "Cross-origin form submission rejected")
+                await reject(403, "security.cross_origin")
                 return
 
         csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME, "")
         if not csrf_cookie or not secrets.compare_digest(csrf_cookie, self.csrf_token):
-            await reject(403, "Invalid or missing form security cookie")
+            await reject(403, "security.csrf")
             return
 
         try:
             declared_length = _content_length(scope)
         except ValueError:
-            await reject(400, "Invalid Content-Length header")
+            await reject(400, "request.invalid")
             return
 
         body_limit = _request_body_limit(request.url.path, self.max_file_bytes)
@@ -267,10 +423,10 @@ class _LocalRequestGuard:
             and content_type == "multipart/form-data"
             and declared_length is None
         ):
-            await reject(411, "Multipart uploads require a Content-Length header")
+            await reject(411, "request.invalid")
             return
         if declared_length is not None and declared_length > body_limit:
-            await reject(413, "Request body exceeds the configured upload limit")
+            await reject(413, "upload.too_large")
             return
 
         limited_receive = _LimitedReceive(receive, body_limit)
@@ -282,7 +438,7 @@ class _LocalRequestGuard:
         if limited_receive.exceeded:
             if response_started:
                 raise RuntimeError("Request body limit was exceeded after the response started")
-            await reject(413, "Request body exceeds the configured upload limit")
+            await reject(413, "upload.too_large")
 
 
 async def _store_upload(upload: UploadFile, target: Path, maximum: int) -> None:
@@ -291,15 +447,21 @@ async def _store_upload(upload: UploadFile, target: Path, maximum: int) -> None:
         while chunk := await upload.read(1024 * 1024):
             size += len(chunk)
             if size > maximum:
-                raise HTTPException(
-                    status_code=413, detail="Workbook exceeds the configured upload limit"
+                raise _http_error(
+                    413,
+                    "Workbook exceeds the configured upload limit",
+                    "upload.too_large",
                 )
             handle.write(chunk)
     if size == 0:
-        raise HTTPException(status_code=400, detail="Uploaded workbook is empty")
+        raise _http_error(400, "Uploaded workbook is empty", "upload.empty")
 
 
-def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
+def create_app(
+    *,
+    max_file_bytes: int = 100 * 1024 * 1024,
+    language: Language | str | None = None,
+) -> FastAPI:
     """Create the local UI. Callers must still bind Uvicorn to 127.0.0.1."""
 
     sessions: dict[str, WebSession] = {}
@@ -321,40 +483,90 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
     )
     environment = _environment()
     app.state.csrf_token = secrets.token_urlsafe(32)
+    app.state.default_language = language
     app.add_middleware(
         _LocalRequestGuard,
         max_file_bytes=max_file_bytes,
         csrf_token=app.state.csrf_token,
     )
 
-    def error_page(message: str, status_code: int) -> HTMLResponse:
-        html = environment.from_string(ERROR_TEMPLATE).render(message=message)
-        return HTMLResponse(html, status_code=status_code)
+    def error_page(
+        request: Request,
+        exc: Exception,
+        status_code: int,
+        *,
+        diagnostic_id: str | None = None,
+    ) -> HTMLResponse:
+        language = _request_language(request)
+        diagnostic_id = diagnostic_id or new_diagnostic_id()
+        error: UserFacingError = localize_exception(
+            exc,
+            language,
+            operation=_request_operation(request),
+            diagnostic_id=diagnostic_id,
+        )
+        log_level = logging.ERROR if status_code >= 500 else logging.WARNING
+        LOGGER.log(
+            log_level,
+            "Local UI request failed [diagnostic_id=%s error_code=%s error_key=%s exception_type=%s]",
+            diagnostic_id,
+            error.code,
+            error.key,
+            type(exc).__name__,
+        )
+        html = _render_page(
+            environment,
+            "error.html",
+            language,
+            page_title=error.title,
+            language_action="/",
+            view="error",
+            error=error,
+        )
+        return _language_response(html, language, status_code=status_code)
 
     @app.exception_handler(WorkbookLensError)
-    async def workbook_error(_request: Request, exc: WorkbookLensError) -> HTMLResponse:
-        return error_page(str(exc), 400)
+    async def workbook_error(request: Request, exc: WorkbookLensError) -> HTMLResponse:
+        return error_page(request, exc, 400)
 
     @app.exception_handler(HTTPException)
-    async def http_error(_request: Request, exc: HTTPException) -> HTMLResponse:
-        return error_page(str(exc.detail), exc.status_code)
+    async def http_error(request: Request, exc: HTTPException) -> HTMLResponse:
+        return error_page(request, exc, exc.status_code)
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, exc: Exception) -> HTMLResponse:
+        diagnostic_id = new_diagnostic_id()
+        return error_page(
+            request,
+            exc,
+            500,
+            diagnostic_id=diagnostic_id,
+        )
 
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/", response_class=HTMLResponse)
-    async def index() -> HTMLResponse:
+    async def index(request: Request, lang: str | None = None) -> HTMLResponse:
+        language = _request_language(request, lang)
+        translator = partial(translate, language=language)
         converter_names = [
             provider.label for provider in conversion.available_conversion_providers()
         ]
-        response = HTMLResponse(
-            environment.from_string(INDEX_TEMPLATE).render(
-                max_mb=max_file_bytes // 1024**2,
-                csrf_token=app.state.csrf_token,
-                converter_names=converter_names,
-            )
+        html = _render_page(
+            environment,
+            "index.html",
+            language,
+            page_title=translator("web.home_title"),
+            language_action="/",
+            view="home",
+            max_mb=max_file_bytes // 1024**2,
+            csrf_token=app.state.csrf_token,
+            converter_names=converter_names,
+            provider_separator=translator("web.provider_separator"),
         )
+        response = _language_response(html, language)
         response.set_cookie(
             CSRF_COOKIE_NAME,
             app.state.csrf_token,
@@ -369,11 +581,17 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
         request: Request,
         legacy_workbook: UploadFile,
         csrf_token: str = Form(default=""),
+        language: str = Form(default=""),
     ) -> FileResponse:
         _validate_post_request(request, csrf_token)
+        selected_language = _request_language(request, language)
         filename = Path(legacy_workbook.filename or "workbook.xls").name
         if Path(filename).suffix.lower() != ".xls":
-            raise HTTPException(status_code=400, detail="Upload must be a binary .xls workbook")
+            raise _http_error(
+                400,
+                "Upload must be a binary .xls workbook",
+                "conversion.invalid_input",
+            )
         conversion_id = secrets.token_urlsafe(18)
         conversion_root = request.app.state.root / f"convert-{conversion_id}"
         conversion_root.mkdir(parents=True)
@@ -387,32 +605,57 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
                 output,
                 max_output_bytes=max_file_bytes,
             )
-        except BaseException:
+        except BaseException as exc:
             shutil.rmtree(conversion_root, ignore_errors=True)
+            if isinstance(exc, HTTPException):
+                raise
+            if isinstance(exc, WorkbookLensError):
+                exc.error_key = _conversion_error_key(exc)
+            elif isinstance(exc, Exception):
+                raise WorkbookLensError(
+                    error_key=_conversion_error_key(exc),
+                ) from exc
             raise
         download_name = f"{Path(filename).stem or 'workbook'}.xlsx"
-        return FileResponse(
+        response = FileResponse(
             result.output,
             media_type=conversion.XLSX_MEDIA_TYPE,
             filename=download_name,
             headers={"X-WorkbookLens-Converter": result.provider.label},
             background=BackgroundTask(shutil.rmtree, conversion_root, ignore_errors=True),
         )
+        response.set_cookie(
+            LANGUAGE_COOKIE_NAME,
+            selected_language,
+            max_age=LANGUAGE_COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+        return response
 
-    @app.post("/scan", response_class=HTMLResponse)
+    @app.post("/scan")
     async def scan_upload(
         request: Request,
         workbook: UploadFile,
         csrf_token: str = Form(default=""),
-    ) -> str:
+        language: str = Form(default=""),
+    ) -> RedirectResponse:
         _validate_post_request(request, csrf_token)
+        selected_language = _request_language(request, language)
         filename = Path(workbook.filename or "workbook.xlsx").name
         suffix = Path(filename).suffix.lower()
         if suffix not in {".xlsx", ".xlsm"}:
-            raise HTTPException(status_code=400, detail="Upload must be .xlsx or .xlsm")
+            raise _http_error(
+                400,
+                "Upload must be .xlsx or .xlsm",
+                "upload.invalid_type",
+            )
         if len(sessions) >= 20:
-            raise HTTPException(
-                status_code=429, detail="Session limit reached; restart the local server"
+            raise _http_error(
+                429,
+                "Session limit reached; restart the local server",
+                "session.limit",
             )
         session_id = secrets.token_urlsafe(18)
         session_root = request.app.state.root / session_id
@@ -422,7 +665,6 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
             await _store_upload(workbook, source, max_file_bytes)
             limits = PackageLimits(max_file_bytes=max_file_bytes)
             scan = await run_in_threadpool(scan_workbook, source, limits=limits)
-            report_paths = await run_in_threadpool(write_scan_report, scan, session_root / "report")
             plan = build_patch_plan(scan)
             plan_path = session_root / "repair-plan.json"
             write_patch_plan(plan_path, plan)
@@ -433,46 +675,106 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
             session_id=session_id,
             filename=filename,
             source=source,
-            report=report_paths["html"],
             plan_path=plan_path,
             plan=plan,
+            scan=scan,
             findings=scan.findings,
+            language=selected_language,
+            reports={},
+            diff_reports={},
         )
-        reviewable_patches = (
-            []
-            if suffix == ".xlsm"
-            else [
-                patch
-                for patch in plan.patches
-                if patch.safe_only_eligible or patch.risk == PatchRisk.LAYOUT_REVIEW
-            ]
+        response = RedirectResponse(
+            f"/sessions/{session_id}",
+            status_code=303,
         )
-        return environment.from_string(RESULT_TEMPLATE).render(
-            session_id=session_id,
-            filename=filename,
-            findings=scan.findings,
-            patches=reviewable_patches,
-            csrf_token=app.state.csrf_token,
-            has_layout_review=any(
-                patch.risk == PatchRisk.LAYOUT_REVIEW for patch in reviewable_patches
-            ),
-        )
+        _set_language_cookie(response, selected_language)
+        return response
 
     def session_or_404(session_id: str) -> WebSession:
         session = sessions.get(session_id)
         if session is None:
-            raise HTTPException(status_code=404, detail="Local session not found or expired")
+            raise _http_error(
+                404,
+                "Local session not found or expired",
+                "session.not_found",
+            )
         return session
 
-    @app.get("/sessions/{session_id}/report")
-    async def report(session_id: str) -> FileResponse:
+    def reviewable_patches(session: WebSession) -> list[Any]:
+        if session.source.suffix.lower() == ".xlsm":
+            return []
+        return [
+            patch
+            for patch in session.plan.patches
+            if patch.safe_only_eligible or patch.risk == PatchRisk.LAYOUT_REVIEW
+        ]
+
+    @app.get("/sessions/{session_id}", response_class=HTMLResponse)
+    async def results(
+        session_id: str,
+        request: Request,
+        lang: str | None = None,
+    ) -> HTMLResponse:
         session = session_or_404(session_id)
-        return FileResponse(
-            session.report,
+        language = _request_language(request, lang, fallback=session.language)
+        session.language = language
+        findings = [localize_finding(finding, language) for finding in session.findings]
+        patches = [localize_patch(patch, language) for patch in reviewable_patches(session)]
+        severity_counts = {"info": 0, "warning": 0, "error": 0, "critical": 0}
+        for finding in findings:
+            severity_counts[finding.severity.value] += 1
+        translator = partial(translate, language=language)
+        html = _render_page(
+            environment,
+            "results.html",
+            language,
+            page_title=translator("web.results_page_title"),
+            language_action=f"/sessions/{session_id}",
+            view="results",
+            session_id=session_id,
+            filename=session.filename,
+            findings=findings,
+            patches=patches,
+            severity_counts=severity_counts,
+            csrf_token=app.state.csrf_token,
+            has_layout_review=any(patch.risk == PatchRisk.LAYOUT_REVIEW for patch in patches),
+        )
+        return _language_response(html, language)
+
+    @app.get("/sessions/{session_id}/report")
+    async def report(
+        session_id: str,
+        request: Request,
+        lang: str | None = None,
+    ) -> FileResponse:
+        session = session_or_404(session_id)
+        language = _request_language(request, lang, fallback=session.language)
+        session.language = language
+        report_path = session.reports.get(language)
+        if report_path is None:
+            report_paths = await run_in_threadpool(
+                write_scan_report,
+                session.scan,
+                session.source.parent / f"report-{language}",
+                language=language,
+            )
+            report_path = report_paths["html"]
+            session.reports[language] = report_path
+        response = FileResponse(
+            report_path,
             media_type="text/html",
             filename="workbooklens-report.html",
             content_disposition_type="inline",
         )
+        response.set_cookie(
+            LANGUAGE_COOKIE_NAME,
+            language,
+            max_age=LANGUAGE_COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+        return response
 
     @app.get("/sessions/{session_id}/plan")
     async def plan(session_id: str) -> FileResponse:
@@ -481,18 +783,24 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
             session.plan_path, media_type="application/json", filename="repair-plan.json"
         )
 
-    @app.post("/sessions/{session_id}/apply", response_class=HTMLResponse)
+    @app.post("/sessions/{session_id}/apply")
     async def apply_selected(
         session_id: str,
         request: Request,
         csrf_token: str = Form(default=""),
+        language: str = Form(default=""),
         patch_id: list[str] = Form(default=[]),
         accept_layout_risk: bool = Form(default=False),
-    ) -> str:
+    ) -> RedirectResponse:
         _validate_post_request(request, csrf_token)
         session = session_or_404(session_id)
+        selected_language = _request_language(request, language, fallback=session.language)
         if not patch_id:
-            raise HTTPException(status_code=400, detail="Select at least one reviewed patch")
+            raise _http_error(
+                400,
+                "Select at least one reviewed patch",
+                "repair.selection_required",
+            )
         fixed = session.source.parent / "fixed.xlsx"
         fixed.unlink(missing_ok=True)
         result = await run_in_threadpool(
@@ -505,22 +813,57 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
         )
         apply_report = session.source.parent / "apply-report.json"
         write_json(apply_report, result.model_dump(mode="json"))
-        diff = session.source.parent / "diff.html"
         semantic_diff = await run_in_threadpool(compare_workbooks, session.source, fixed)
-        await run_in_threadpool(write_diff_report, semantic_diff, diff)
         session.fixed = fixed
-        session.diff = diff
+        session.result = result
+        session.semantic_diff = semantic_diff
+        session.diff_reports = {}
         session.apply_report = apply_report
-        return environment.from_string(APPLIED_TEMPLATE).render(
-            session_id=session_id,
-            result=result,
+        session.language = selected_language
+        response = RedirectResponse(
+            f"/sessions/{session_id}/completed",
+            status_code=303,
         )
+        _set_language_cookie(response, selected_language)
+        return response
+
+    @app.get("/sessions/{session_id}/completed", response_class=HTMLResponse)
+    async def completed(
+        session_id: str,
+        request: Request,
+        lang: str | None = None,
+    ) -> HTMLResponse:
+        session = session_or_404(session_id)
+        if session.result is None:
+            raise _http_error(
+                404,
+                "No fixed workbook has been created",
+                "download.not_ready",
+            )
+        language = _request_language(request, lang, fallback=session.language)
+        session.language = language
+        translator = partial(translate, language=language)
+        html = _render_page(
+            environment,
+            "applied.html",
+            language,
+            page_title=translator("web.applied_title"),
+            language_action=f"/sessions/{session_id}/completed",
+            view="completed",
+            session_id=session_id,
+            result=session.result,
+        )
+        return _language_response(html, language)
 
     @app.get("/sessions/{session_id}/fixed")
     async def fixed(session_id: str) -> FileResponse:
         session = session_or_404(session_id)
         if session.fixed is None:
-            raise HTTPException(status_code=404, detail="No fixed workbook has been created")
+            raise _http_error(
+                404,
+                "No fixed workbook has been created",
+                "download.not_ready",
+            )
         filename = f"{Path(session.filename).stem}.fixed.xlsx"
         return FileResponse(
             session.fixed,
@@ -529,22 +872,59 @@ def create_app(*, max_file_bytes: int = 100 * 1024 * 1024) -> FastAPI:
         )
 
     @app.get("/sessions/{session_id}/diff")
-    async def diff(session_id: str) -> FileResponse:
+    async def diff(
+        session_id: str,
+        request: Request,
+        lang: str | None = None,
+    ) -> FileResponse:
         session = session_or_404(session_id)
-        if session.diff is None:
-            raise HTTPException(status_code=404, detail="No semantic diff has been created")
-        return FileResponse(
-            session.diff,
+        if session.semantic_diff is None:
+            raise _http_error(
+                404,
+                "No semantic diff has been created",
+                "download.not_ready",
+            )
+        language = _request_language(request, lang, fallback=session.language)
+        session.language = language
+        diff_reports = session.diff_reports
+        if diff_reports is None:
+            diff_reports = {}
+            session.diff_reports = diff_reports
+        diff_path = diff_reports.get(language)
+        if diff_path is None:
+            diff_path = session.source.parent / f"diff-{language}.html"
+            await run_in_threadpool(
+                write_diff_report,
+                session.semantic_diff,
+                diff_path,
+                language=language,
+            )
+            diff_reports[language] = diff_path
+        response = FileResponse(
+            diff_path,
             media_type="text/html",
             filename="workbooklens-diff.html",
             content_disposition_type="inline",
         )
+        response.set_cookie(
+            LANGUAGE_COOKIE_NAME,
+            language,
+            max_age=LANGUAGE_COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+        return response
 
     @app.get("/sessions/{session_id}/apply-report")
     async def apply_report(session_id: str) -> FileResponse:
         session = session_or_404(session_id)
         if session.apply_report is None:
-            raise HTTPException(status_code=404, detail="No apply report has been created")
+            raise _http_error(
+                404,
+                "No apply report has been created",
+                "download.not_ready",
+            )
         return FileResponse(
             session.apply_report,
             media_type="application/json",

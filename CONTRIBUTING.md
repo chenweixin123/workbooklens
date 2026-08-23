@@ -48,7 +48,7 @@ uv run python -m pytest -q
 uv run workbooklens demo --out .artifacts/demo
 uv build --out-dir dist
 uvx --from twine twine check --strict dist/*
-python scripts/check_release_artifacts.py dist --version 2.2.1
+python scripts/check_release_artifacts.py dist --version 2.3.0
 ~~~
 
 On 64-bit Windows, reproduce and exercise the portable artifact from the built wheel with:
@@ -61,17 +61,17 @@ uv export --locked --python 3.12 --no-dev --group portable --no-emit-project --n
 $wheel = @(Get-ChildItem -LiteralPath .artifacts/portable-python-dist -Filter '*.whl')
 if ($wheel.Count -ne 1) { throw "Expected exactly one wheel, found $($wheel.Count)." }
 $python = (Resolve-Path .venv/Scripts/python.exe).Path
-& $python scripts/build_portable_windows.py --wheel $wheel[0].FullName --python $python --expected-version 2.2.1 --constraints .artifacts/portable-constraints.txt --output-dir .artifacts/portable-dist
+& $python scripts/build_portable_windows.py --wheel $wheel[0].FullName --python $python --expected-version 2.3.0 --constraints .artifacts/portable-constraints.txt --output-dir .artifacts/portable-dist
 $archive = @(Get-ChildItem -LiteralPath .artifacts/portable-dist -Filter '*.zip')
 if ($archive.Count -ne 1) { throw "Expected exactly one ZIP, found $($archive.Count)." }
-& $python scripts/check_portable_artifact.py $archive[0].FullName --expected-version 2.2.1
-& $python scripts/smoke_portable.py $archive[0].FullName --expected-version 2.2.1
+& $python scripts/check_portable_artifact.py $archive[0].FullName --expected-version 2.3.0
+& $python scripts/smoke_portable.py $archive[0].FullName --expected-version 2.3.0
 $iscc = (Resolve-Path "$env:LOCALAPPDATA/Programs/Inno Setup 6/ISCC.exe").Path
-& $python scripts/build_installer_windows.py --portable-zip $archive[0].FullName --expected-version 2.2.1 --iscc $iscc --output-dir .artifacts/installer-dist
+& $python scripts/build_installer_windows.py --portable-zip $archive[0].FullName --expected-version 2.3.0 --iscc $iscc --output-dir .artifacts/installer-dist
 $installer = @(Get-ChildItem -LiteralPath .artifacts/installer-dist -Filter '*.exe')
 if ($installer.Count -ne 1) { throw "Expected exactly one installer, found $($installer.Count)." }
-& $python scripts/check_installer_artifact.py $installer[0].FullName --expected-version 2.2.1
-& $python scripts/smoke_installer_windows.py $installer[0].FullName --portable-zip $archive[0].FullName --expected-version 2.2.1
+& $python scripts/check_installer_artifact.py $installer[0].FullName --expected-version 2.3.0
+& $python scripts/smoke_installer_windows.py $installer[0].FullName --portable-zip $archive[0].FullName --expected-version 2.3.0
 ~~~
 
 The installer smoke test is intentionally destructive only to its own temporary installation. It

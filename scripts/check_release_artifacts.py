@@ -482,6 +482,11 @@ def _check_sdist(path: Path, version: str) -> None:
         "packaging/windows/Start-WorkbookLens.cmd",
         "packaging/windows/WorkbookLens.iss",
         "packaging/windows/WorkbookLens.spec",
+        "packaging/windows/assets/LICENSE-LUCIDE.txt",
+        "packaging/windows/assets/WorkbookLens.ico",
+        "packaging/windows/assets/WorkbookLens.png",
+        "packaging/windows/assets/WorkbookLens.svg",
+        "packaging/windows/desktop_entry.py",
         "packaging/windows/entry.py",
         "pyproject.toml",
         "scripts/action_scan.py",
@@ -495,6 +500,7 @@ def _check_sdist(path: Path, version: str) -> None:
         "src/workbooklens/__init__.py",
         "src/workbooklens/console.py",
         "src/workbooklens/conversion.py",
+        "src/workbooklens/desktop.py",
         "src/workbooklens/web/launcher.py",
     }
     names = {member.as_posix() for member in relative}
@@ -522,6 +528,7 @@ def _check_wheel(path: Path, version: str) -> None:
             "workbooklens/__init__.py",
             "workbooklens/console.py",
             "workbooklens/conversion.py",
+            "workbooklens/desktop.py",
             "workbooklens/diff/templates/diff.html.j2",
             "workbooklens/reports/templates/scan.html.j2",
             "workbooklens/web/launcher.py",

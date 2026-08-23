@@ -40,7 +40,7 @@ _PROCESS_DRAIN_TIMEOUT_SECONDS = 5
 _MAX_EXCEL_IDENTITY_BYTES = 4096
 _EXCEL_STARTUP_TIMEOUT_SECONDS = 30.0
 _EXCEL_STARTUP_POLL_SECONDS = 0.05
-_EXCEL_CANDIDATE_DISCOVERY_SECONDS = 1.0
+_EXCEL_GRACEFUL_EXIT_TIMEOUT_SECONDS = 15
 _EXCEL_PROCESS_QUERY_TIMEOUT_SECONDS = 5
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _PROCESS_TERMINATE = 0x0001
@@ -184,15 +184,23 @@ try {
     $ownedExcelProcessInfo = Get-Process -Id ([int]$excelPid) -ErrorAction Stop
     try {
         $startTimeUtc = $ownedExcelProcessInfo.StartTime.ToUniversalTime()
-        $normalizedExecutablePath = [IO.Path]::GetFullPath(
-            [string]$ownedExcelProcessInfo.Path
-        ).ToLowerInvariant()
-        if (
-            [string]::IsNullOrWhiteSpace($normalizedExecutablePath) -or
-            [IO.Path]::GetFileName($normalizedExecutablePath).ToUpperInvariant() -ne
-                'EXCEL.EXE'
-        ) {
-            throw 'WorkbookLens could not bind the Microsoft Excel executable path safely.'
+        $normalizedExecutablePath = $null
+        try {
+            $candidateExecutablePath = [string]$ownedExcelProcessInfo.Path
+            if (-not [string]::IsNullOrWhiteSpace($candidateExecutablePath)) {
+                $candidateExecutablePath = [IO.Path]::GetFullPath(
+                    $candidateExecutablePath
+                ).ToLowerInvariant()
+                if (
+                    [IO.Path]::GetFileName($candidateExecutablePath).ToUpperInvariant() -eq
+                        'EXCEL.EXE'
+                ) {
+                    $normalizedExecutablePath = $candidateExecutablePath
+                }
+            }
+        } catch {
+            # Some Office or endpoint-security configurations deny Process.Path.
+            # Python verifies the executable through the held Windows process handle.
         }
         $identityJson = ConvertTo-Json -InputObject ([ordered]@{
             process_id = [int]$excelPid
@@ -337,7 +345,7 @@ class _ExcelProcessIdentity:
     creation_utc: str
     creation_filetime: int
     session_id: int
-    normalized_executable_path: str
+    normalized_executable_path: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,7 +370,14 @@ class _OwnedExcelProcess:
 
 
 class _ProviderFailure(Exception):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_key: str = "conversion.all_providers_failed",
+    ) -> None:
+        super().__init__(message)
+        self.error_key = error_key
 
 
 class _ExcelStartupTimeout(Exception):
@@ -445,8 +460,19 @@ def _process_detail(completed: subprocess.CompletedProcess[str]) -> str:
         part.strip() for part in (completed.stderr, completed.stdout) if part.strip()
     )
     if not output:
-        return f"process exited with code {completed.returncode}"
-    return " ".join(output.split())[-600:]
+        return f"local converter exited with code {completed.returncode}"
+    compact = " ".join(output.replace("_x000D_", " ").split())
+    known_messages = (
+        "WorkbookLens did not provide conversion paths.",
+        "WorkbookLens could not identify the Microsoft Excel process safely.",
+        "Microsoft Excel reused an existing user process; conversion was refused.",
+        "WorkbookLens did not confirm ownership of the Microsoft Excel process.",
+        "Workbook has too many formatted non-empty cells to convert safely.",
+    )
+    for message in known_messages:
+        if message.casefold() in compact.casefold():
+            return message
+    return f"local converter exited with code {completed.returncode}"
 
 
 def _load_number_format_records(path: Path) -> tuple[_NumberFormatRecord, ...]:
@@ -803,17 +829,18 @@ def _load_excel_process_identity(path: Path) -> _ExcelProcessIdentity | None:
         or not isinstance(creation_utc, str)
         or not isinstance(raw_filetime, str)
         or re.fullmatch(r"[1-9][0-9]{0,18}", raw_filetime) is None
-        or not isinstance(raw_path, str)
+        or (raw_path is not None and not isinstance(raw_path, str))
     ):
         return None
     creation_filetime = int(raw_filetime)
     expected_creation_utc = _filetime_to_creation_utc(creation_filetime)
-    normalized_path = _normalize_windows_executable_path(raw_path)
+    normalized_path = (
+        _normalize_windows_executable_path(raw_path) if isinstance(raw_path, str) else None
+    )
     if (
         expected_creation_utc is None
         or creation_utc != expected_creation_utc
-        or normalized_path is None
-        or raw_path != normalized_path
+        or (raw_path is not None and (normalized_path is None or raw_path != normalized_path))
     ):
         return None
     return _ExcelProcessIdentity(
@@ -981,12 +1008,22 @@ def _open_verified_excel_process(
     except _ProviderFailure:
         _close_windows_process_handle(handle)
         raise
-    if actual != expected:
+    identity_changed = (
+        actual.process_id != expected.process_id
+        or actual.creation_utc != expected.creation_utc
+        or actual.creation_filetime != expected.creation_filetime
+        or actual.session_id != expected.session_id
+        or (
+            expected.normalized_executable_path is not None
+            and actual.normalized_executable_path != expected.normalized_executable_path
+        )
+    )
+    if identity_changed:
         _close_windows_process_handle(handle)
         raise _ProviderFailure(
             "Excel process identity changed; refusing to authorize or terminate that PID"
         )
-    return _OwnedExcelProcess(expected, handle)
+    return _OwnedExcelProcess(actual, handle)
 
 
 def _wait_windows_process_handle(handle: int, timeout_milliseconds: int) -> int:
@@ -1000,6 +1037,19 @@ def _wait_windows_process_handle(handle: int, timeout_milliseconds: int) -> int:
             max(0, timeout_milliseconds),
         )
     )
+
+
+def _wait_for_excel_process_exit(process: _OwnedExcelProcess, timeout_seconds: int) -> bool:
+    wait_result = _wait_windows_process_handle(process.handle, max(0, timeout_seconds) * 1000)
+    if wait_result == _WAIT_OBJECT_0:
+        return True
+    if wait_result == _WAIT_TIMEOUT:
+        return False
+    if wait_result == _WAIT_FAILED:
+        raise _ProviderFailure(
+            f"could not inspect the Excel process handle (Windows error {_windows_last_error()})"
+        )
+    raise _ProviderFailure("Windows returned an unexpected Excel handle wait result")
 
 
 def _terminate_excel_process(process: _OwnedExcelProcess) -> None:
@@ -1028,7 +1078,10 @@ def _terminate_excel_process(process: _OwnedExcelProcess) -> None:
         _PROCESS_DRAIN_TIMEOUT_SECONDS * 1000,
     )
     if wait_result == _WAIT_TIMEOUT:
-        raise _ProviderFailure("the owned Excel process did not terminate in time")
+        raise _ProviderFailure(
+            "the owned Excel process did not terminate in time",
+            error_key="conversion.timeout",
+        )
     if wait_result != _WAIT_OBJECT_0:
         raise _ProviderFailure(
             f"could not wait for the owned Excel process (Windows error {_windows_last_error()})"
@@ -1151,6 +1204,9 @@ def _query_excel_processes(runner: Path) -> _ExcelProcessSnapshot | None:
         expected_creation_utc = (
             _filetime_to_creation_utc(creation_filetime) if creation_filetime is not None else None
         )
+        path_is_valid = executable_path_value is None or (
+            normalized_path is not None and executable_path_value == normalized_path
+        )
         if (
             isinstance(session_id_value, int)
             and not isinstance(session_id_value, bool)
@@ -1158,8 +1214,7 @@ def _query_excel_processes(runner: Path) -> _ExcelProcessSnapshot | None:
             and isinstance(creation_utc_value, str)
             and creation_utc_value == expected_creation_utc
             and creation_filetime is not None
-            and normalized_path is not None
-            and executable_path_value == normalized_path
+            and path_is_valid
         ):
             identity = _ExcelProcessIdentity(
                 process_id=process_id,
@@ -1206,59 +1261,6 @@ def _snapshot_excel_process_ids(runner: Path) -> frozenset[int] | None:
     if snapshot is None:
         return None
     return frozenset(process.process_id for process in snapshot.processes)
-
-
-def _has_windows_command_argument(command_line: str, argument: str) -> bool:
-    return (
-        re.search(
-            rf"(?<!\S){re.escape(argument)}(?!\S)",
-            command_line,
-            flags=re.IGNORECASE,
-        )
-        is not None
-    )
-
-
-def _find_unique_new_excel_automation_process(
-    runner: Path,
-    baseline_process_ids: frozenset[int] | None,
-    launched_at: datetime,
-) -> _ExcelProcessIdentity | None:
-    if baseline_process_ids is None:
-        return None
-    observed_candidates: set[_ExcelProcessIdentity] = set()
-    deadline = time.monotonic() + _EXCEL_CANDIDATE_DISCOVERY_SECONDS
-    while True:
-        snapshot = _query_excel_processes(runner)
-        if snapshot is None:
-            return None
-        for process in snapshot.processes:
-            if process.process_id in baseline_process_ids:
-                continue
-            if (
-                process.identity is None
-                or process.creation_time is None
-                or process.command_line is None
-                or process.main_window_handle is None
-            ):
-                return None
-            if (
-                process.identity.session_id == snapshot.caller_session_id
-                and process.creation_time >= launched_at
-                and process.main_window_handle == 0
-                and _has_windows_command_argument(process.command_line, "/automation")
-                and _has_windows_command_argument(process.command_line, "-Embedding")
-            ):
-                observed_candidates.add(process.identity)
-        if len(observed_candidates) > 1:
-            return None
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(_EXCEL_STARTUP_POLL_SECONDS, remaining))
-    if len(observed_candidates) != 1:
-        return None
-    return next(iter(observed_candidates))
 
 
 def _wait_for_owned_excel_process_identity(
@@ -1336,7 +1338,8 @@ def _run_excel(
             encoded_script,
         ]
         baseline_process_ids = _snapshot_excel_process_ids(provider.runner)
-        launched_at = datetime.now(UTC)
+        if baseline_process_ids is None:
+            raise _ProviderFailure("could not establish a safe Microsoft Excel process baseline")
         try:
             process = subprocess.Popen(  # noqa: S603
                 command,
@@ -1361,36 +1364,23 @@ def _run_excel(
             late_identity = _load_excel_process_identity(excel_identity)
             try:
                 if late_identity is not None:
-                    if (
-                        baseline_process_ids is None
-                        or late_identity.process_id not in baseline_process_ids
-                    ):
+                    if late_identity.process_id not in baseline_process_ids:
                         _terminate_excel_identity_if_present(late_identity)
                 elif os.path.lexists(excel_identity):
                     raise _ProviderFailure(
                         "Excel returned an invalid late process-identity handshake"
                     )
-                else:
-                    candidate = _find_unique_new_excel_automation_process(
-                        provider.runner,
-                        baseline_process_ids,
-                        launched_at,
-                    )
-                    if candidate is not None:
-                        _terminate_excel_identity_if_present(candidate)
             except _ProviderFailure as safety_error:
                 raise safety_error from exc
             raise _ProviderFailure(
                 f"Excel startup handshake timed out after "
-                f"{int(_EXCEL_STARTUP_TIMEOUT_SECONDS)} seconds"
+                f"{int(_EXCEL_STARTUP_TIMEOUT_SECONDS)} seconds",
+                error_key="conversion.timeout",
             ) from exc
         except _ProviderFailure:
             _terminate_process_tree(process)
             raise
-        if (
-            baseline_process_ids is not None
-            and expected_identity.process_id in baseline_process_ids
-        ):
+        if expected_identity.process_id in baseline_process_ids:
             _terminate_process_tree(process)
             raise _ProviderFailure(
                 "Microsoft Excel reused an existing user process; conversion was refused"
@@ -1422,7 +1412,10 @@ def _run_excel(
                     _terminate_excel_process(owned_excel)
                 finally:
                     _terminate_process_tree(process)
-                raise _ProviderFailure(f"timed out after {timeout_seconds} seconds") from exc
+                raise _ProviderFailure(
+                    f"timed out after {timeout_seconds} seconds",
+                    error_key="conversion.timeout",
+                ) from exc
             except OSError as exc:
                 try:
                     _terminate_excel_process(owned_excel)
@@ -1438,7 +1431,11 @@ def _run_excel(
             if completed.returncode != 0:
                 _terminate_excel_process(owned_excel)
                 raise _ProviderFailure(_process_detail(completed))
-            _terminate_excel_process(owned_excel)
+            if not _wait_for_excel_process_exit(
+                owned_excel,
+                _EXCEL_GRACEFUL_EXIT_TIMEOUT_SECONDS,
+            ):
+                _terminate_excel_process(owned_excel)
             records = _load_number_format_records(format_map)
             if not staged_output.is_file():
                 raise _ProviderFailure("Excel did not create the expected .xlsx file")
@@ -1504,7 +1501,10 @@ def _run_libreoffice(
             stdout, stderr = process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired as exc:
             _terminate_process_tree(process)
-            raise _ProviderFailure(f"timed out after {timeout_seconds} seconds") from exc
+            raise _ProviderFailure(
+                f"timed out after {timeout_seconds} seconds",
+                error_key="conversion.timeout",
+            ) from exc
         return_code = process.returncode if process.returncode is not None else -1
         completed = subprocess.CompletedProcess(command, return_code, stdout, stderr)
         generated = output_dir / converted.name
@@ -1539,20 +1539,38 @@ def _run_provider(
 def _validate_source(source: Path) -> Path:
     resolved = source.expanduser().resolve()
     if source.is_symlink() or not resolved.is_file():
-        raise UsageError(f"Legacy workbook does not exist or is not a regular file: {source}")
+        raise UsageError(
+            f"Legacy workbook does not exist or is not a regular file: {source}",
+            error_key="conversion.invalid_input",
+        )
     if resolved.suffix.lower() != ".xls":
-        raise UsageError("Legacy conversion accepts only .xls input files")
+        raise UsageError(
+            "Legacy conversion accepts only .xls input files",
+            error_key="conversion.invalid_input",
+        )
     with resolved.open("rb") as handle:
         signature = handle.read(len(_OLE_COMPOUND_FILE_SIGNATURE))
     if signature != _OLE_COMPOUND_FILE_SIGNATURE:
-        raise UsageError("Upload is not a recognized binary Excel .xls workbook")
+        raise UsageError(
+            "Upload is not a recognized binary Excel .xls workbook",
+            error_key="conversion.invalid_input",
+        )
     return resolved
 
 
 def _validate_output(output: Path, maximum: int) -> None:
-    inspection = inspect_package(output, PackageLimits(max_file_bytes=maximum))
+    try:
+        inspection = inspect_package(output, PackageLimits(max_file_bytes=maximum))
+    except (WorkbookLensError, OSError) as exc:
+        raise UsageError(
+            "The local converter did not produce a verified macro-free .xlsx workbook",
+            error_key="conversion.output_invalid",
+        ) from exc
     if not inspection.repairable:
-        raise UsageError("The local converter did not produce a verified macro-free .xlsx workbook")
+        raise UsageError(
+            "The local converter did not produce a verified macro-free .xlsx workbook",
+            error_key="conversion.output_invalid",
+        )
 
 
 def convert_xls_to_xlsx(
@@ -1585,10 +1603,12 @@ def convert_xls_to_xlsx(
     if not providers:
         raise UsageError(
             "No local .xls converter is available. Install Microsoft Excel or LibreOffice, "
-            "then restart WorkbookLens. No workbook was uploaded to a cloud service."
+            "then restart WorkbookLens. No workbook was uploaded to a cloud service.",
+            error_key="conversion.unavailable",
         )
 
     failures: list[str] = []
+    failure_keys: list[str] = []
     with tempfile.TemporaryDirectory(
         prefix=".workbooklens-convert-",
         dir=resolved_output.parent,
@@ -1608,6 +1628,12 @@ def convert_xls_to_xlsx(
             except (_ProviderFailure, WorkbookLensError, OSError) as exc:
                 staged_output.unlink(missing_ok=True)
                 failures.append(f"{provider.label}: {exc}")
+                failure_key = getattr(exc, "error_key", None)
+                failure_keys.append(
+                    failure_key
+                    if isinstance(failure_key, str)
+                    else "conversion.all_providers_failed"
+                )
                 continue
             try:
                 os.link(staged_output, resolved_output)
@@ -1624,7 +1650,16 @@ def convert_xls_to_xlsx(
             return ConversionResult(resolved_output, provider)
 
     detail = "; ".join(failures)
-    raise UsageError(f"Every available local converter failed. {detail}")
+    uniform_key = failure_keys[0] if failure_keys and len(set(failure_keys)) == 1 else None
+    error_key = (
+        uniform_key
+        if uniform_key in {"conversion.timeout", "conversion.output_invalid"}
+        else "conversion.all_providers_failed"
+    )
+    raise UsageError(
+        f"Every available local converter failed. {detail}",
+        error_key=error_key,
+    )
 
 
 __all__ = [

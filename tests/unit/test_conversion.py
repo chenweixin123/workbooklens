@@ -5,7 +5,7 @@ import hashlib
 import json
 import subprocess
 import zipfile
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -30,12 +30,16 @@ def _excel_identity(
     *,
     creation_filetime: int = 134000000000000000,
     session_id: int = 7,
-    executable_path: str = (r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"),
+    executable_path: str | None = (r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE"),
 ) -> conversion._ExcelProcessIdentity:
     creation_utc = conversion._filetime_to_creation_utc(creation_filetime)
-    normalized_path = conversion._normalize_windows_executable_path(executable_path)
+    normalized_path = (
+        conversion._normalize_windows_executable_path(executable_path)
+        if executable_path is not None
+        else None
+    )
     assert creation_utc is not None
-    assert normalized_path is not None
+    assert executable_path is None or normalized_path is not None
     return conversion._ExcelProcessIdentity(
         process_id=process_id,
         creation_utc=creation_utc,
@@ -134,8 +138,10 @@ def test_conversion_rejects_disguised_non_xls(tmp_path: Path) -> None:
     source = tmp_path / "fake.xls"
     source.write_bytes(b"not an OLE compound file")
 
-    with pytest.raises(UsageError, match="not a recognized binary Excel"):
+    with pytest.raises(UsageError, match="not a recognized binary Excel") as captured:
         conversion.convert_xls_to_xlsx(source, tmp_path / "fake.xlsx")
+
+    assert captured.value.error_key == "conversion.invalid_input"
 
 
 def test_conversion_explains_when_no_local_provider(
@@ -145,8 +151,10 @@ def test_conversion_explains_when_no_local_provider(
     source = _legacy_workbook(tmp_path / "legacy.xls")
     monkeypatch.setattr(conversion, "available_conversion_providers", lambda: ())
 
-    with pytest.raises(UsageError, match="Microsoft Excel or LibreOffice"):
+    with pytest.raises(UsageError, match="Microsoft Excel or LibreOffice") as captured:
         conversion.convert_xls_to_xlsx(source, tmp_path / "converted.xlsx")
+
+    assert captured.value.error_key == "conversion.unavailable"
 
 
 def test_conversion_falls_back_and_validates_output(
@@ -264,10 +272,49 @@ def test_conversion_removes_invalid_provider_output(
         lambda _provider, _source, target, _timeout: target.write_bytes(b"invalid"),
     )
 
-    with pytest.raises(UsageError, match="Every available local converter failed"):
+    with pytest.raises(
+        UsageError,
+        match="Every available local converter failed",
+    ) as captured:
         conversion.convert_xls_to_xlsx(source, output)
 
+    assert captured.value.error_key == "conversion.output_invalid"
     assert not output.exists()
+
+
+def test_mixed_provider_failures_are_not_misreported_as_a_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _legacy_workbook(tmp_path / "legacy.xls")
+    output = tmp_path / "converted.xlsx"
+    excel = ConversionProvider("excel", "Microsoft Excel", Path("powershell.exe"))
+    libreoffice = ConversionProvider("libreoffice", "LibreOffice", Path("soffice.exe"))
+    monkeypatch.setattr(
+        conversion,
+        "available_conversion_providers",
+        lambda: (excel, libreoffice),
+    )
+
+    def fail(
+        provider: ConversionProvider,
+        _source: Path,
+        _target: Path,
+        _timeout_seconds: int,
+    ) -> tuple[conversion._NumberFormatRecord, ...]:
+        if provider.kind == "excel":
+            raise conversion._ProviderFailure(
+                "timed out",
+                error_key="conversion.timeout",
+            )
+        raise OSError("ordinary provider failure")
+
+    monkeypatch.setattr(conversion, "_run_provider", fail)
+
+    with pytest.raises(UsageError) as captured:
+        conversion.convert_xls_to_xlsx(source, output)
+
+    assert captured.value.error_key == "conversion.all_providers_failed"
 
 
 def test_excel_runner_uses_encoded_script_and_environment_paths(
@@ -280,6 +327,7 @@ def test_excel_runner_uses_encoded_script_and_environment_paths(
     observed: dict[str, object] = {}
     identity = _excel_identity()
     terminated: list[int] = []
+    waited: list[tuple[int, int]] = []
     closed: list[int] = []
 
     class FakeProcess:
@@ -326,6 +374,13 @@ def test_excel_runner_uses_encoded_script_and_environment_paths(
         conversion,
         "_terminate_excel_process",
         lambda process: terminated.append(process.identity.process_id),
+    )
+    monkeypatch.setattr(
+        conversion,
+        "_wait_for_excel_process_exit",
+        lambda process, timeout_seconds: (
+            waited.append((process.identity.process_id, timeout_seconds)) or True
+        ),
     )
     monkeypatch.setattr(
         conversion,
@@ -391,7 +446,14 @@ def test_excel_runner_uses_encoded_script_and_environment_paths(
     assert "[IO.File]::Delete($excelIdentityTempPath)" in conversion._EXCEL_CONVERSION_SCRIPT
     assert "creation_filetime" in conversion._EXCEL_CONVERSION_SCRIPT
     assert "normalized_executable_path" in conversion._EXCEL_CONVERSION_SCRIPT
-    assert terminated == [4242]
+    assert "$candidateExecutablePath = [string]$ownedExcelProcessInfo.Path" in (
+        conversion._EXCEL_CONVERSION_SCRIPT
+    )
+    assert "Python verifies the executable through the held Windows process handle" in (
+        conversion._EXCEL_CONVERSION_SCRIPT
+    )
+    assert waited == [(4242, conversion._EXCEL_GRACEFUL_EXIT_TIMEOUT_SECONDS)]
+    assert terminated == []
     assert closed == [88]
     assert "$calculationWorkbook = $null\n    $workbook =" in conversion._EXCEL_CONVERSION_SCRIPT
     assert "if ($null -ne $calculationWorkbook)" in conversion._EXCEL_CONVERSION_SCRIPT
@@ -415,6 +477,75 @@ def test_excel_runner_never_overwrites_a_preexisting_output(
         conversion._run_excel(provider, source, output, 10)
 
     assert output.read_bytes() == b"user-owned"
+
+
+def test_excel_refuses_to_start_without_a_reliable_process_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _legacy_workbook(tmp_path / "legacy.xls")
+    output = tmp_path / "converted.xlsx"
+    provider = ConversionProvider("excel", "Microsoft Excel", Path("powershell.exe"))
+    monkeypatch.setattr(conversion, "_snapshot_excel_process_ids", lambda _runner: None)
+    monkeypatch.setattr(
+        conversion.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "PowerShell must not start without a reliable Excel process baseline"
+        ),
+    )
+
+    with pytest.raises(conversion._ProviderFailure, match="safe Microsoft Excel process baseline"):
+        conversion._run_excel(provider, source, output, 10)
+
+    assert not output.exists()
+
+
+def test_excel_process_snapshot_accepts_a_missing_executable_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _excel_identity(executable_path=None)
+    payload = {
+        "caller_session_id": identity.session_id,
+        "processes": [
+            {
+                "process_id": identity.process_id,
+                "session_id": identity.session_id,
+                "creation_utc": identity.creation_utc,
+                "creation_filetime": str(identity.creation_filetime),
+                "normalized_executable_path": None,
+                "command_line": None,
+                "main_window_handle": 0,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        conversion.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["powershell.exe"],
+            0,
+            json.dumps(payload),
+            "",
+        ),
+    )
+
+    snapshot = conversion._query_excel_processes(Path("powershell.exe"))
+
+    assert snapshot is not None
+    assert snapshot.caller_session_id == identity.session_id
+    assert snapshot.processes == (
+        conversion._ExcelProcessRecord(
+            process_id=identity.process_id,
+            identity=identity,
+            creation_time=datetime.fromisoformat(identity.creation_utc.replace("Z", "+00:00")),
+            command_line=None,
+            main_window_handle=0,
+        ),
+    )
+    assert conversion._snapshot_excel_process_ids(Path("powershell.exe")) == frozenset(
+        {identity.process_id}
+    )
 
 
 def test_excel_operation_timeout_kills_owned_excel_then_wrapper(
@@ -619,7 +750,7 @@ def test_excel_sidecar_cannot_authorize_a_preexisting_user_pid(
     assert killed == [9001]
 
 
-def test_excel_startup_timeout_kills_wrapper_then_unique_candidate(
+def test_excel_startup_timeout_kills_only_wrapper_without_verified_sidecar(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -628,9 +759,6 @@ def test_excel_startup_timeout_kills_wrapper_then_unique_candidate(
     provider = ConversionProvider("excel", "Microsoft Excel", Path("C:/Windows/powershell.exe"))
     taskkill = Path("C:/Windows/System32/taskkill.exe")
     killed: list[int] = []
-    terminated: list[int] = []
-    closed: list[int] = []
-    candidate_identity = _excel_identity()
 
     def fake_subprocess_run(
         command: list[str], **_kwargs: object
@@ -663,16 +791,6 @@ def test_excel_startup_timeout_kills_wrapper_then_unique_candidate(
     ) -> conversion._ExcelProcessIdentity:
         raise conversion._ExcelStartupTimeout
 
-    def unique_candidate(
-        runner: Path,
-        baseline_process_ids: frozenset[int] | None,
-        launched_at: datetime,
-    ) -> conversion._ExcelProcessIdentity:
-        assert runner == provider.runner
-        assert baseline_process_ids == frozenset({111})
-        assert launched_at.tzinfo is UTC
-        return candidate_identity
-
     monkeypatch.setattr(conversion.sys, "platform", "win32")
     monkeypatch.setattr(conversion, "_windows_taskkill_executable", lambda: taskkill)
     monkeypatch.setattr(conversion, "_snapshot_excel_process_ids", lambda _runner: frozenset({111}))
@@ -681,105 +799,67 @@ def test_excel_startup_timeout_kills_wrapper_then_unique_candidate(
         "_wait_for_owned_excel_process_identity",
         fail_startup,
     )
-    monkeypatch.setattr(conversion, "_find_unique_new_excel_automation_process", unique_candidate)
     monkeypatch.setattr(
         conversion,
         "_open_verified_excel_process",
-        lambda expected, *, missing_is_clean: (
-            conversion._OwnedExcelProcess(expected, 88)
-            if missing_is_clean
-            else pytest.fail("startup fallback must open in missing-is-clean mode")
+        lambda *_args, **_kwargs: pytest.fail(
+            "an Excel process without a verified sidecar must never be opened or terminated"
         ),
-    )
-    monkeypatch.setattr(
-        conversion,
-        "_terminate_excel_process",
-        lambda process: terminated.append(process.identity.process_id),
-    )
-    monkeypatch.setattr(
-        conversion,
-        "_close_excel_process",
-        lambda process: closed.append(process.handle) if process is not None else None,
     )
     monkeypatch.setattr(conversion.subprocess, "run", fake_subprocess_run)
     monkeypatch.setattr(conversion.subprocess, "Popen", FakeProcess)
 
-    with pytest.raises(conversion._ProviderFailure, match="startup handshake timed out"):
+    with pytest.raises(
+        conversion._ProviderFailure,
+        match="startup handshake timed out",
+    ) as captured:
         conversion._run_excel(provider, source, output, 1)
 
-    assert terminated == [4242]
+    assert captured.value.error_key == "conversion.timeout"
     assert killed == [9001]
+
+
+def test_missing_powershell_process_path_is_verified_through_held_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _excel_identity(executable_path=None)
+    actual = _excel_identity()
+    sidecar = tmp_path / "excel-process.json"
+    _write_excel_identity(sidecar, expected)
+    closed: list[int] = []
+
+    assert conversion._load_excel_process_identity(sidecar) == expected
+    monkeypatch.setattr(
+        conversion,
+        "_open_windows_process_handle",
+        lambda process_id: 88 if process_id == expected.process_id else None,
+    )
+    monkeypatch.setattr(
+        conversion,
+        "_read_windows_process_handle_identity",
+        lambda handle, process_id: actual,
+    )
+    monkeypatch.setattr(conversion, "_close_windows_process_handle", closed.append)
+
+    process = conversion._open_verified_excel_process(expected, missing_is_clean=False)
+
+    assert process == conversion._OwnedExcelProcess(actual, 88)
+    conversion._close_excel_process(process)
     assert closed == [88]
 
 
-def test_excel_candidate_discovery_is_strict_and_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = Path("C:/Windows/powershell.exe")
-    launched_at = datetime(2025, 1, 1, tzinfo=UTC)
-    strict_identity = _excel_identity()
-    strict_creation_time = datetime.fromisoformat(
-        strict_identity.creation_utc.replace("Z", "+00:00")
+def test_powershell_clixml_is_not_exposed_as_provider_detail() -> None:
+    raw = (
+        '#< CLIXML <S S="Error">C:\\Users\\person\\private.xls_x000D_ at ConvertWorkbook.ps1:42</S>'
     )
-    strict = conversion._ExcelProcessRecord(
-        process_id=4242,
-        identity=strict_identity,
-        creation_time=strict_creation_time,
-        command_line=(
-            r'"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE" '
-            r"/automation -Embedding"
-        ),
-        main_window_handle=0,
-    )
-    second_identity = _excel_identity(process_id=4343, creation_filetime=134000000000000010)
-    second = conversion._ExcelProcessRecord(
-        process_id=4343,
-        identity=second_identity,
-        creation_time=datetime.fromisoformat(second_identity.creation_utc.replace("Z", "+00:00")),
-        command_line=(
-            r'"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE" '
-            r"/automation -Embedding"
-        ),
-        main_window_handle=0,
-    )
-    missing_information = conversion._ExcelProcessRecord(
-        process_id=4444,
-        identity=None,
-        creation_time=launched_at,
-        command_line=None,
-        main_window_handle=0,
-    )
-    monkeypatch.setattr(conversion, "_EXCEL_CANDIDATE_DISCOVERY_SECONDS", 0.0)
+    completed = subprocess.CompletedProcess(["powershell"], 1, "", raw)
 
-    def set_snapshot(*processes: conversion._ExcelProcessRecord) -> None:
-        snapshot = conversion._ExcelProcessSnapshot(7, processes)
-        monkeypatch.setattr(conversion, "_query_excel_processes", lambda _runner: snapshot)
+    detail = conversion._process_detail(completed)
 
-    set_snapshot(strict)
-    assert (
-        conversion._find_unique_new_excel_automation_process(runner, frozenset(), launched_at)
-        == strict_identity
-    )
-    set_snapshot(strict, second)
-    assert (
-        conversion._find_unique_new_excel_automation_process(runner, frozenset(), launched_at)
-        is None
-    )
-    set_snapshot(missing_information)
-    assert (
-        conversion._find_unique_new_excel_automation_process(runner, frozenset(), launched_at)
-        is None
-    )
-    set_snapshot(strict)
-    assert (
-        conversion._find_unique_new_excel_automation_process(runner, frozenset({4242}), launched_at)
-        is None
-    )
-    set_snapshot()
-    assert (
-        conversion._find_unique_new_excel_automation_process(runner, frozenset(), launched_at)
-        is None
-    )
+    assert detail == "local converter exited with code 1"
+    assert "CLIXML" not in detail
+    assert "private.xls" not in detail
 
 
 @pytest.mark.parametrize("changed_field", ["creation", "path", "session"])

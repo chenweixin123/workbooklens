@@ -49,6 +49,7 @@ MinVersion=10.0
 Uninstallable=yes
 UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\{#AppExeName}
+SetupIconFile=assets\WorkbookLens.ico
 VersionInfoCompany={#AppPublisher}
 VersionInfoDescription={#AppName} local spreadsheet auditor installer
 VersionInfoProductName={#AppName}
@@ -78,18 +79,19 @@ Type: files; Name: "{app}\README-PORTABLE.txt"; Check: ShouldCleanPreviousPayloa
 Type: files; Name: "{app}\Start-WorkbookLens.cmd"; Check: ShouldCleanPreviousPayload
 Type: files; Name: "{app}\THIRD-PARTY-NOTICES.txt"; Check: ShouldCleanPreviousPayload
 Type: files; Name: "{app}\WorkbookLens.exe"; Check: ShouldCleanPreviousPayload
+Type: files; Name: "{app}\WorkbookLensCLI.exe"; Check: ShouldCleanPreviousPayload
 Type: files; Name: "{app}\workbooklens.example.yml"; Check: ShouldCleanPreviousPayload
 
 [UninstallDelete]
 Type: files; Name: "{app}\.workbooklens-install-owner"
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "serve --open-browser --fallback-port"; WorkingDir: "{app}"; Comment: "Open the local WorkbookLens interface"; AppUserModelID: "WorkbookLens.Local"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Parameters: "serve --open-browser --fallback-port"; WorkingDir: "{app}"; Comment: "Open the local WorkbookLens interface"; AppUserModelID: "WorkbookLens.Local"; Tasks: desktopicon
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Comment: "Open WorkbookLens"; AppUserModelID: "WorkbookLens.Local"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Comment: "Open WorkbookLens"; AppUserModelID: "WorkbookLens.Local"; Tasks: desktopicon
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"; WorkingDir: "{app}"
 
 [Run]
-Filename: "{app}\{#AppExeName}"; Parameters: "serve --open-browser --fallback-port"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
 const

@@ -1,18 +1,30 @@
 from __future__ import annotations
 
+import errno
 import io
+import shutil
 from pathlib import Path
 
+import pytest
 from scripts.smoke_portable import (
+    PortableSmokeError,
     _build_multipart_upload,
     _extract_csrf_token,
+    _is_retryable_temporary_delete_error,
     _log_command,
+    _remove_temporary_tree,
     configure_utf8_stdio,
     contains_text_ignoring_line_wraps,
     parse_windows_listener_endpoints,
     parse_windows_listeners,
     sanitized_windows_environment,
 )
+
+
+def _windows_delete_error(winerror: int) -> OSError:
+    error = OSError(f"Windows delete error {winerror}")
+    error.winerror = winerror  # type: ignore[attr-defined]
+    return error
 
 
 def test_configures_legacy_stdio_for_non_ascii_command_logs() -> None:
@@ -22,7 +34,7 @@ def test_configures_legacy_stdio_for_non_ascii_command_logs() -> None:
     stderr = io.TextIOWrapper(stderr_buffer, encoding="cp1252", errors="strict")
     try:
         configure_utf8_stdio(stdout=stdout, stderr=stderr)
-        _log_command([r"C:\workbooklens-测试\WorkbookLens.exe", "--version"], stream=stdout)
+        _log_command([r"C:\workbooklens-测试\WorkbookLensCLI.exe", "--version"], stream=stdout)
         stdout.flush()
 
         assert stdout.encoding == "utf-8"
@@ -37,14 +49,135 @@ def test_command_log_escapes_non_ascii_for_unconfigured_cp1252_stream() -> None:
     buffer = io.BytesIO()
     stream = io.TextIOWrapper(buffer, encoding="cp1252", errors="strict")
     try:
-        _log_command([r"C:\workbooklens-测试\WorkbookLens.exe", "--version"], stream=stream)
+        _log_command([r"C:\workbooklens-测试\WorkbookLensCLI.exe", "--version"], stream=stream)
         stream.flush()
 
         output = buffer.getvalue().decode("cp1252")
         assert "\\u6d4b\\u8bd5" in output
-        assert "WorkbookLens.exe --version" in output
+        assert "WorkbookLensCLI.exe --version" in output
     finally:
         stream.detach()
+
+
+@pytest.mark.parametrize("winerror", [5, 32, 33, 145])
+def test_classifies_retryable_windows_delete_errors(winerror: int) -> None:
+    assert _is_retryable_temporary_delete_error(_windows_delete_error(winerror))
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EBUSY, errno.ENOTEMPTY])
+def test_classifies_retryable_delete_errnos(error_number: int) -> None:
+    assert _is_retryable_temporary_delete_error(OSError(error_number, "locked"))
+
+
+def test_rejects_nonretryable_windows_delete_error() -> None:
+    assert not _is_retryable_temporary_delete_error(_windows_delete_error(87))
+
+
+def test_temporary_tree_cleanup_retries_windows_file_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "locked.log").write_text("pending close", encoding="utf-8")
+    original_rmtree = shutil.rmtree
+    attempts = 0
+
+    def flaky_rmtree(path: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise _windows_delete_error(32)
+        original_rmtree(path)
+
+    monkeypatch.setattr("scripts.smoke_portable.shutil.rmtree", flaky_rmtree)
+
+    _remove_temporary_tree(workspace, timeout=1.0, retry_delay=0.0)
+
+    assert attempts == 2
+    assert not workspace.exists()
+
+
+def test_temporary_tree_cleanup_still_fails_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    moments = iter([0.0, 0.0, 15.0])
+    attempts = 0
+
+    def locked_rmtree(_path: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise _windows_delete_error(32)
+
+    monkeypatch.setattr("scripts.smoke_portable.shutil.rmtree", locked_rmtree)
+    monkeypatch.setattr("scripts.smoke_portable.time.monotonic", lambda: next(moments))
+    monkeypatch.setattr("scripts.smoke_portable.time.sleep", lambda _delay: None)
+
+    with pytest.raises(PortableSmokeError, match="could not be removed within 15s"):
+        _remove_temporary_tree(workspace, timeout=15.0, retry_delay=0.25)
+
+    assert attempts == 2
+
+
+def test_temporary_tree_cleanup_propagates_unrelated_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    error = _windows_delete_error(87)
+    attempts = 0
+
+    def failing_rmtree(_path: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise error
+
+    monkeypatch.setattr("scripts.smoke_portable.shutil.rmtree", failing_rmtree)
+
+    with pytest.raises(OSError) as raised:
+        _remove_temporary_tree(workspace, timeout=15.0, retry_delay=0.0)
+
+    assert raised.value is error
+    assert attempts == 1
+
+
+def test_temporary_tree_cleanup_accepts_already_removed_path(tmp_path: Path) -> None:
+    _remove_temporary_tree(tmp_path / "missing", timeout=0.0, retry_delay=0.0)
+
+
+def test_temporary_tree_cleanup_retries_missing_child_while_root_remains(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    original_rmtree = shutil.rmtree
+    attempts = 0
+
+    def transient_missing_child(path: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise FileNotFoundError(
+                errno.ENOENT,
+                "child disappeared during cleanup",
+                str(path / "vanished.tmp"),
+            )
+        original_rmtree(path)
+
+    monkeypatch.setattr(
+        "scripts.smoke_portable.shutil.rmtree",
+        transient_missing_child,
+    )
+
+    _remove_temporary_tree(workspace, timeout=1.0, retry_delay=0.0)
+
+    assert attempts == 2
+    assert not workspace.exists()
 
 
 def test_sanitized_environment_removes_python_paths() -> None:
@@ -71,10 +204,10 @@ def test_sanitized_environment_removes_python_paths() -> None:
 
 
 def test_matches_non_ascii_path_across_rich_line_wraps() -> None:
-    expected = "C:\\Temp\\\u4e2d\u6587 \u7a7a\u683c\\\u8def\u5f84 \u6df7\u5408\\demo"
+    path = "C:\\Temp\\\u4e2d\u6587 \u7a7a\u683c\\\u8def\u5f84 \u6df7\u5408\\demo"
+    expected = f"Demo complete {path}"
     output = (
-        "Demo complete in C:\\Temp\\\u4e2d\u6587 \r\n"
-        "\u7a7a\u683c\\\u8def\u5f84 \u6df7\u5408\\demo\r\n"
+        "Demo complete C:\\Temp\\\u4e2d\u6587 \r\n\u7a7a\u683c\\\u8def\u5f84 \u6df7\u5408\\demo\r\n"
     )
 
     assert contains_text_ignoring_line_wraps(output, expected)
