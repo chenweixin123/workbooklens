@@ -14,7 +14,7 @@ from scripts.build_portable_windows import (
 )
 
 
-def _wheel(path: Path, *, name: str = "WorkbookLens", version: str = "2.2.1") -> Path:
+def _wheel(path: Path, *, name: str = "WorkbookLens", version: str = "2.3.0") -> Path:
     metadata = f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n\n"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(f"workbooklens-{version}.dist-info/METADATA", metadata.encode())
@@ -25,7 +25,7 @@ def test_reads_workbooklens_wheel_metadata(tmp_path: Path) -> None:
     metadata = read_wheel_metadata(_wheel(tmp_path / "workbooklens.whl"))
 
     assert metadata.name == "WorkbookLens"
-    assert metadata.version == "2.2.1"
+    assert metadata.version == "2.3.0"
 
 
 def test_rejects_unrelated_wheel(tmp_path: Path) -> None:
@@ -36,10 +36,18 @@ def test_rejects_unrelated_wheel(tmp_path: Path) -> None:
 
 
 def test_renders_windows_version_resource() -> None:
-    rendered = render_version_info("2.2.1")
+    rendered = render_version_info("2.3.0")
+    cli_rendered = render_version_info(
+        "2.3.0",
+        original_filename="WorkbookLensCLI.exe",
+        description="WorkbookLens command-line interface",
+    )
 
-    assert "filevers=(2, 2, 1, 0)" in rendered
-    assert "StringStruct('ProductVersion', '2.2.1')" in rendered
+    assert "filevers=(2, 3, 0, 0)" in rendered
+    assert "StringStruct('ProductVersion', '2.3.0')" in rendered
+    assert "StringStruct('OriginalFilename', 'WorkbookLens.exe')" in rendered
+    assert "StringStruct('OriginalFilename', 'WorkbookLensCLI.exe')" in cli_rendered
+    assert "WorkbookLens command-line interface" in cli_rendered
 
 
 def test_collects_dist_info_license_files(tmp_path: Path) -> None:
@@ -101,7 +109,7 @@ def test_rejects_missing_declared_license_file(tmp_path: Path) -> None:
 
 
 def test_deterministic_zip_is_reproducible(tmp_path: Path) -> None:
-    source = tmp_path / "WorkbookLens-2.2.1-windows-x64"
+    source = tmp_path / "WorkbookLens-2.3.0-windows-x64"
     source.mkdir()
     (source / "b.txt").write_text("b", encoding="utf-8")
     (source / "a.txt").write_text("a", encoding="utf-8")
@@ -123,6 +131,8 @@ def test_sanitized_python_environment_removes_interpreter_injection() -> None:
         "CONDA_PREFIX": r"C:\Miniconda",
         "__PYVENV_LAUNCHER__": r"C:\shim.exe",
         "PIP_INDEX_URL": "https://example.invalid/simple",
+        "PYTHONUTF8": "0",
+        "PYTHONIOENCODING": "cp1252",
     }
 
     result = sanitized_python_environment(source)
@@ -130,6 +140,8 @@ def test_sanitized_python_environment_removes_interpreter_injection() -> None:
     assert result["PATH"] == source["PATH"]
     assert result["PIP_INDEX_URL"] == source["PIP_INDEX_URL"]
     assert result["PYTHONNOUSERSITE"] == "1"
+    assert result["PYTHONUTF8"] == "1"
+    assert result["PYTHONIOENCODING"] == "utf-8"
     assert (
         not {
             "PYTHONPATH",
@@ -142,14 +154,14 @@ def test_sanitized_python_environment_removes_interpreter_injection() -> None:
     )
 
 
-def test_windows_launcher_uses_a_dedicated_console() -> None:
+def test_windows_launcher_opens_the_native_app_without_server_arguments() -> None:
     launcher = (
         Path(__file__).parents[1] / "packaging" / "windows" / "Start-WorkbookLens.cmd"
     ).read_text(encoding="utf-8")
 
-    assert 'start "WorkbookLens" /D "%~dp0" "%~dp0WorkbookLens.exe"' in launcher
-    assert "Press Ctrl+C there to stop WorkbookLens." in launcher
-    assert "Terminate batch job" not in launcher
+    assert 'start "" /D "%~dp0" "%~dp0WorkbookLens.exe"' in launcher
+    assert "serve --open-browser" not in launcher
+    assert "Press Ctrl+C" not in launcher
 
 
 def test_windows_frozen_runtime_enables_utf8_before_startup() -> None:
@@ -159,3 +171,11 @@ def test_windows_frozen_runtime_enables_utf8_before_startup() -> None:
 
     assert '("X utf8", None, "OPTION")' in spec
     assert '"winreg"' in spec
+    assert 'name="WorkbookLensCLI"' in spec
+    assert 'desktop_hiddenimports = sorted({*hiddenimports, "webview"})' in spec
+    assert "/runtimes/win-x86/" not in spec
+    assert "/runtimes/win-arm64/" not in spec
+    assert "webbrowserinterop.x86.dll" in spec
+    assert "/clr_loader/ffi/dlls/x86/" in spec
+    assert 'name="WorkbookLens"' in spec
+    assert "console=False" in spec

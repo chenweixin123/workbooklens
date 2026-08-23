@@ -4,6 +4,7 @@ import asyncio
 import re
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import Response
@@ -14,8 +15,15 @@ import workbooklens.conversion as conversion
 from workbooklens import __version__
 from workbooklens.conversion import ConversionProvider, ConversionResult
 from workbooklens.demo.workflow import generate_demo_workbook
+from workbooklens.exceptions import UsageError
+from workbooklens.i18n import require_translation
 from workbooklens.web import create_app
-from workbooklens.web.app import CSRF_COOKIE_NAME, MAX_MULTIPART_OVERHEAD_BYTES
+from workbooklens.web.app import (
+    CSRF_COOKIE_NAME,
+    LANGUAGE_COOKIE_NAME,
+    MAX_MULTIPART_OVERHEAD_BYTES,
+)
+from workbooklens.web.templates import TEMPLATES
 
 OLE_SIGNATURE = bytes.fromhex("D0CF11E0A1B11AE1")
 
@@ -28,8 +36,12 @@ def _csrf_token(html: str) -> str:
     return token
 
 
-def _client(app: FastAPI) -> TestClient:
-    return TestClient(app, base_url="http://127.0.0.1")
+def _client(app: FastAPI, *, raise_server_exceptions: bool = True) -> TestClient:
+    return TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        raise_server_exceptions=raise_server_exceptions,
+    )
 
 
 def _run_asgi_post(
@@ -114,7 +126,7 @@ def test_local_web_scan_apply_and_download_workflow(tmp_path: Path) -> None:
         assert client.get("/openapi.json").json()["info"]["version"] == __version__
         home = client.get("/")
         assert home.status_code == 200
-        assert "removed on normal server shutdown" in home.text
+        assert "removed during normal shutdown" in home.text
         token = _csrf_token(home.text)
         assert client.cookies.get(CSRF_COOKIE_NAME) == token
         set_cookie = home.headers["set-cookie"].lower()
@@ -152,7 +164,7 @@ def test_local_web_scan_apply_and_download_workflow(tmp_path: Path) -> None:
             data={"csrf_token": result_token, "patch_id": patch_ids},
         )
         assert applied.status_code == 200, applied.text
-        assert "Validated copy created" in applied.text
+        assert "Repairs completed" in applied.text
         fixed = client.get(f"/sessions/{session_id}/fixed")
         assert fixed.status_code == 200
         assert fixed.content.startswith(b"PK")
@@ -160,6 +172,115 @@ def test_local_web_scan_apply_and_download_workflow(tmp_path: Path) -> None:
         assert diff.status_code == 200
         assert diff.headers["content-disposition"].startswith("inline")
         assert client.get(f"/sessions/{session_id}/apply-report").status_code == 200
+
+
+def test_web_language_choice_persists_and_can_be_changed() -> None:
+    app = create_app()
+    with _client(app) as client:
+        chinese = client.get("/?lang=zh-CN")
+        assert chinese.status_code == 200
+        assert '<html lang="zh-CN">' in chinese.text
+        assert "检查并修复 Excel 工作簿" in chinese.text
+        assert "本地扫描" in chinese.text
+        assert "选择文件" in chinese.text
+        assert "未选择文件" in chinese.text
+        assert "No file selected" not in chinese.text
+        assert "Scan locally" not in chinese.text
+        assert client.cookies.get(LANGUAGE_COOKIE_NAME) == "zh-CN"
+        language_cookie = next(
+            value
+            for value in chinese.headers.get_list("set-cookie")
+            if value.startswith(f"{LANGUAGE_COOKIE_NAME}=")
+        ).lower()
+        assert "max-age=31536000" in language_cookie
+        assert "httponly" in language_cookie
+        assert "samesite=lax" in language_cookie
+
+        persisted = client.get("/")
+        assert '<html lang="zh-CN">' in persisted.text
+        assert "选择工作簿" in persisted.text
+
+        english = client.get("/?lang=en")
+        assert '<html lang="en">' in english.text
+        assert "Inspect and repair an Excel workbook" in english.text
+        assert "Choose file" in english.text
+        assert "No file selected" in english.text
+        assert "未选择文件" not in english.text
+        assert "检查并修复 Excel 工作簿" not in english.text
+        assert client.cookies.get(LANGUAGE_COOKIE_NAME) == "en"
+
+
+def test_web_file_pickers_use_localized_text_instead_of_native_browser_labels() -> None:
+    app = create_app()
+    with _client(app) as client:
+        response = client.get("/?lang=en")
+
+    assert response.text.count('class="file-picker-control"') == 2
+    assert len(re.findall(r'<input[^>]+type="file"', response.text)) == 2
+    assert "file-selector-button" not in response.text
+    assert "bindFileSelection('workbook'" in response.text
+    assert "bindFileSelection('legacy-workbook'" in response.text
+    assert "status.textContent = input.files" in response.text
+
+
+def test_web_uses_configured_or_browser_language_on_first_open() -> None:
+    configured = create_app(language="zh-CN")
+    with _client(configured) as client:
+        response = client.get("/", headers={"accept-language": "en-US,en;q=0.9"})
+    assert '<html lang="zh-CN">' in response.text
+    assert "选择工作簿" in response.text
+
+    browser_selected = create_app()
+    with _client(browser_selected) as client:
+        response = client.get("/", headers={"accept-language": "zh-CN,zh;q=0.9,en;q=0.8"})
+    assert '<html lang="zh-CN">' in response.text
+    assert "选择工作簿" in response.text
+
+
+def test_web_template_catalog_is_complete() -> None:
+    keys = {
+        match for template in TEMPLATES.values() for match in re.findall(r"web\.[a-z_]+", template)
+    }
+    assert keys
+    for key in keys:
+        assert require_translation(key, "en") != key
+        assert require_translation(key, "zh-CN") != key
+
+
+def test_web_results_can_switch_language_without_resubmitting_upload(tmp_path: Path) -> None:
+    workbook = tmp_path / "demo.xlsx"
+    generate_demo_workbook(workbook)
+    app = create_app(max_file_bytes=5 * 1024 * 1024)
+    with _client(app) as client:
+        home = client.get("/?lang=en")
+        with workbook.open("rb") as handle:
+            result = client.post(
+                "/scan",
+                data={"csrf_token": _csrf_token(home.text), "language": "en"},
+                files={
+                    "workbook": (
+                        "demo.xlsx",
+                        handle,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                },
+            )
+        assert result.status_code == 200
+        session_match = re.search(r"/sessions/([^/]+)/apply", result.text)
+        assert session_match
+        session_id = session_match.group(1)
+        assert "Inspection results" in result.text
+
+        chinese = client.get(f"/sessions/{session_id}?lang=zh-CN")
+        assert chinese.status_code == 200
+        assert '<html lang="zh-CN">' in chinese.text
+        assert "检查结果" in chinese.text
+        assert "检查建议修复" in chinese.text
+        assert "Inspection results" not in chinese.text
+
+        persisted = client.get(f"/sessions/{session_id}")
+        assert '<html lang="zh-CN">' in persisted.text
+        assert "发现的问题" in persisted.text
 
 
 def test_web_converts_legacy_xls_with_an_installed_local_provider(
@@ -186,11 +307,8 @@ def test_web_converts_legacy_xls_with_an_installed_local_provider(
         home = client.get("/")
         token = _csrf_token(home.text)
         assert "Available locally: Microsoft Excel" in home.text
-        assert (
-            "Normal .xlsx/.xlsm scanning and .xlsx copy repair do not calculate formulas"
-            in home.text
-        )
-        assert "Trusted files only:" in home.text
+        assert "Scanning and repair do not execute formulas" in home.text
+        assert "Trusted files only" in home.text
         assert "may recalculate formulas or process workbook-defined behavior" in home.text
         response = client.post(
             "/convert",
@@ -221,6 +339,51 @@ def test_web_disables_conversion_button_without_a_local_provider(monkeypatch) ->
 
     assert "Converter unavailable" in home.text
     assert "Install Microsoft Excel or LibreOffice" in home.text
+
+
+@pytest.mark.parametrize(
+    ("provider_message", "error_code"),
+    [
+        ("Upload is not a recognized binary Excel .xls workbook", "WL-CNV-001"),
+        ("No local .xls converter is available", "WL-CNV-002"),
+        ("Every available local converter failed. provider detail", "WL-CNV-003"),
+        ("The local converter did not produce a verified macro-free .xlsx workbook", "WL-CNV-004"),
+        ("Every available local converter failed. timed out after 180 seconds", "WL-CNV-005"),
+    ],
+)
+def test_web_conversion_errors_are_stable_localized_and_sanitized(
+    monkeypatch,
+    provider_message: str,
+    error_code: str,
+) -> None:
+    provider = ConversionProvider("excel", "Microsoft Excel", Path("powershell.exe"))
+    monkeypatch.setattr(conversion, "available_conversion_providers", lambda: (provider,))
+
+    def failed_conversion(*_args, **_kwargs):
+        raise UsageError(provider_message)
+
+    monkeypatch.setattr(conversion, "convert_xls_to_xlsx", failed_conversion)
+    app = create_app(max_file_bytes=1024)
+    with _client(app) as client:
+        home = client.get("/?lang=zh-CN")
+        response = client.post(
+            "/convert",
+            data={"csrf_token": _csrf_token(home.text), "language": "zh-CN"},
+            files={
+                "legacy_workbook": (
+                    "legacy.xls",
+                    OLE_SIGNATURE + b"local test",
+                    "application/vnd.ms-excel",
+                )
+            },
+        )
+
+    assert response.status_code == 400
+    assert '<html lang="zh-CN">' in response.text
+    assert error_code in response.text
+    assert "诊断编号" in response.text
+    assert provider_message not in response.text
+    assert "CLIXML" not in response.text
 
 
 def test_web_rejects_wrong_or_oversized_legacy_upload(monkeypatch) -> None:
@@ -281,7 +444,7 @@ def test_xlsm_web_scan_does_not_offer_repairs(tmp_path: Path) -> None:
         )
     assert response.status_code == 200
     assert 'name="patch_id"' not in response.text
-    assert "No safe deterministic patches are available" in response.text
+    assert "No reviewable repairs were proposed" in response.text
 
 
 def test_web_accepts_unicode_filename_with_loopback_alias_and_null_origin(tmp_path: Path) -> None:
@@ -320,8 +483,47 @@ def test_web_errors_are_recoverable_html_pages() -> None:
         )
     assert response.status_code == 400
     assert response.headers["content-type"].startswith("text/html")
-    assert "could not continue" in response.text
-    assert "source workbook was not modified" in response.text
+    assert "Unsupported file type" in response.text
+    assert "source workbook was not modified" in response.text.lower()
+    assert "Diagnostic ID" in response.text
+    assert "Upload must be .xlsx or .xlsm" not in response.text
+
+
+def test_web_error_page_never_exposes_raw_provider_output(monkeypatch, caplog) -> None:
+    raw_provider_output = (
+        '#< CLIXML <S S="Error">C:\\Users\\person\\private.xls at ConvertWorkbook.ps1:42</S>'
+    )
+
+    def failed_scan(*_args, **_kwargs):
+        raise RuntimeError(raw_provider_output)
+
+    monkeypatch.setattr("workbooklens.web.app.scan_workbook", failed_scan)
+    app = create_app(max_file_bytes=1024)
+    with _client(app, raise_server_exceptions=False) as client:
+        home = client.get("/?lang=en")
+        response = client.post(
+            "/scan",
+            data={"csrf_token": _csrf_token(home.text), "language": "en"},
+            files={
+                "workbook": (
+                    "private.xlsx",
+                    b"not parsed by the injected failure",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+
+    assert response.status_code == 500
+    assert "Diagnostic ID" in response.text
+    assert "WL-" in response.text
+    assert "CLIXML" not in response.text
+    assert "ConvertWorkbook.ps1" not in response.text
+    assert "C:\\Users\\person" not in response.text
+    assert "RuntimeError" not in response.text
+    assert "diagnostic_id=WL-" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert "CLIXML" not in caplog.text
+    assert "C:\\Users\\person" not in caplog.text
 
 
 def test_web_accepts_only_exact_loopback_host_headers() -> None:
@@ -341,7 +543,7 @@ def test_web_accepts_only_exact_loopback_host_headers() -> None:
         ):
             response = client.get("/health", headers={"host": host})
             assert response.status_code == 400
-            assert response.text == "Invalid Host header"
+            assert response.text.startswith("WL-REQ-001: ")
             _assert_security_headers(response)
 
 
@@ -357,8 +559,25 @@ def test_web_rejects_external_and_loopback_lookalike_origins() -> None:
                 files={"workbook": ("book.xlsx", b"not parsed", "application/octet-stream")},
             )
             assert response.status_code == 403
-            assert response.text == "Cross-origin form submission rejected"
+            assert response.text.startswith("WL-SEC-001: ")
             _assert_security_headers(response)
+
+
+def test_early_request_guard_uses_the_selected_language() -> None:
+    app = create_app()
+    with _client(app) as client:
+        home = client.get("/?lang=zh-CN")
+        response = client.post(
+            "/scan",
+            data={"csrf_token": _csrf_token(home.text), "language": "zh-CN"},
+            headers={"origin": "https://example.com"},
+            files={"workbook": ("book.xlsx", b"not parsed", "application/octet-stream")},
+        )
+
+    assert response.status_code == 403
+    assert response.text.startswith("WL-SEC-001: ")
+    assert "此表单来自不受信任的来源" in response.text
+    assert "untrusted origin" not in response.text
 
 
 def test_web_rejects_missing_invalid_and_cross_origin_csrf() -> None:
@@ -389,7 +608,8 @@ def test_web_rejects_missing_invalid_and_cross_origin_csrf() -> None:
             files={"workbook": ("notes.txt", b"hello", "text/plain")},
         )
         assert same_origin.status_code == 400
-        assert "Upload must be .xlsx or .xlsm" in same_origin.text
+        assert "Upload must be .xlsx or .xlsm" not in same_origin.text
+        assert "Diagnostic ID" in same_origin.text
 
         client.cookies.clear()
         client.cookies.set(CSRF_COOKIE_NAME, "wrong-cookie")

@@ -11,7 +11,7 @@ from scripts.check_installer_artifact import (
     inspect_installer,
 )
 
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 
 
 def _fake_installer(*, machine: int = 0x14C) -> bytes:

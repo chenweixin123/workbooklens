@@ -12,6 +12,16 @@ from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
 from openpyxl.utils.exceptions import CellCoordinatesException
 
 from workbooklens import __version__
+from workbooklens.i18n import (
+    Language,
+    localize_finding,
+    localize_scan_result,
+    normalize_language,
+    patch_kind_label,
+    risk_label,
+    severity_label,
+    translate,
+)
 from workbooklens.models import Finding, Severity
 from workbooklens.policy import FindingPolicyResult, apply_finding_policy, source_scope_for_path
 from workbooklens.scanner import ScanResult
@@ -119,6 +129,7 @@ def write_scan_report(
     output_directory: Path,
     *,
     policy: FindingPolicyResult | None = None,
+    language: Language | str | None = None,
 ) -> dict[str, Path]:
     """Write HTML, findings JSON, snapshot JSON, and SARIF into one directory."""
 
@@ -155,21 +166,47 @@ def write_scan_report(
     write_json(snapshot_path, scan.snapshot.model_dump(mode="json"))
     write_json(sarif_path, build_sarif(active_scan, source_uri=logical_source))
 
+    display_language = normalize_language(language)
+    display_scan = localize_scan_result(scan, display_language)
+    display_findings_by_id = {finding.id: finding for finding in display_scan.findings}
+    display_active_findings = [
+        display_findings_by_id.get(finding.id) or localize_finding(finding, display_language)
+        for finding in active_policy.active_findings
+    ]
+    display_baseline_findings = [
+        display_findings_by_id.get(finding.id) or localize_finding(finding, display_language)
+        for finding in active_policy.baseline_findings
+    ]
+    display_suppressed_findings = [
+        replace(
+            item,
+            finding=(
+                display_findings_by_id.get(item.finding.id)
+                or localize_finding(item.finding, display_language)
+            ),
+        )
+        for item in active_policy.suppressed_findings
+    ]
     severity_counts = Counter(finding.severity.value for finding in active_policy.active_findings)
     rule_counts = Counter(finding.rule_id for finding in active_policy.active_findings)
-    patch_map = {patch.id: patch for patch in scan.patches}
+    patch_map = {patch.id: patch for patch in display_scan.patches}
     environment = Environment(
         loader=PackageLoader("workbooklens.reports", "templates"),
         autoescape=select_autoescape(("html", "xml")),
     )
     template = environment.get_template("scan.html.j2")
     html = template.render(
+        language=display_language,
+        t=lambda key, **params: translate(key, display_language, **params),
+        severity_label=lambda severity: severity_label(severity, display_language),
+        risk_label=lambda risk: risk_label(risk, display_language),
+        patch_kind_label=lambda kind: patch_kind_label(kind, display_language),
         source=logical_source,
         source_sha256=scan.snapshot.source_sha256,
         weighted_finding_score=_weighted_finding_score(active_policy.active_findings),
-        findings=active_policy.active_findings,
-        suppressed_findings=active_policy.suppressed_findings,
-        baseline_findings=active_policy.baseline_findings if active_policy.new_only else (),
+        findings=display_active_findings,
+        suppressed_findings=display_suppressed_findings,
+        baseline_findings=display_baseline_findings if active_policy.new_only else (),
         policy_summary=active_policy.summary,
         baseline_path=active_policy.baseline_path,
         new_only=active_policy.new_only,

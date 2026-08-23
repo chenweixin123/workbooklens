@@ -11,29 +11,27 @@ Requirements
 - 64-bit Windows 10 or Windows 11.
 - No separate Python installation is required.
 
-Start the local web interface
+Start the desktop application
 -----------------------------
 
 1. Extract the complete ZIP archive. Do not run files from inside the ZIP.
-2. Double-click Start-WorkbookLens.cmd.
-3. A dedicated WorkbookLens console window opens. Your default browser opens
-   after the local service is ready. If it does not,
-   open the local URL printed in the console window.
-4. Keep the WorkbookLens console window open while using WorkbookLens.
-5. Press Ctrl+C in that window to stop the local server.
+2. Double-click WorkbookLens.exe.
+3. WorkbookLens opens in its own desktop window. No console or external browser
+   is required. Closing the window stops its private local service.
 
-The launcher first tries port 8765. If that port is already in use, WorkbookLens
-automatically selects a free local port and opens that exact address. It binds
-only to 127.0.0.1 and will not open or trust an unrelated service on port 8765.
+Start-WorkbookLens.cmd remains as a compatibility shortcut and opens the same
+desktop application. The application first tries port 8765. If that port is
+already in use, it automatically selects a free local port. It binds only to
+127.0.0.1 and displays that local service inside the native application window.
 
 Command-line use
 ----------------
 
 Open Command Prompt in this directory and run:
 
-  WorkbookLens.exe --help
-  WorkbookLens.exe --version
-  WorkbookLens.exe demo --out demo-output
+  WorkbookLensCLI.exe --help
+  WorkbookLensCLI.exe --version
+  WorkbookLensCLI.exe demo --out demo-output
 
 Configuration
 -------------

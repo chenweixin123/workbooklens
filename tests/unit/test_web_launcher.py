@@ -75,6 +75,10 @@ def test_run_local_ui_passes_prebound_socket_to_uvicorn(
     app = object()
     captured: dict[str, Any] = {}
 
+    def fake_app(**kwargs: Any) -> object:
+        captured["app_kwargs"] = kwargs
+        return app
+
     def fake_config(received_app: object, **kwargs: Any) -> object:
         captured["app"] = received_app
         captured["config"] = kwargs
@@ -88,15 +92,16 @@ def test_run_local_ui_passes_prebound_socket_to_uvicorn(
             captured["sockets"] = sockets
             captured["bound"] = sockets[0].getsockname()
 
-    monkeypatch.setattr(launcher, "create_app", lambda **_kwargs: app)
+    monkeypatch.setattr(launcher, "create_app", fake_app)
     monkeypatch.setattr(launcher.uvicorn, "Config", fake_config)
     monkeypatch.setattr(launcher.uvicorn, "Server", FakeServer)
 
     messages: list[str] = []
-    launcher.run_local_ui(port=0, status=messages.append)
+    launcher.run_local_ui(port=0, language="zh-CN", status=messages.append)
 
     config = captured["config"]
     assert captured["app"] is app
+    assert captured["app_kwargs"]["language"] == "zh-CN"
     assert config["host"] == launcher.LOOPBACK_HOST
     assert config["port"] == captured["bound"][1]
     assert config["loop"] == "asyncio"
@@ -104,12 +109,59 @@ def test_run_local_ui_passes_prebound_socket_to_uvicorn(
     assert config["ws"] == "none"
     assert config["lifespan"] == "on"
     assert config["proxy_headers"] is False
+    assert config["access_log"] is True
     assert len(captured["sockets"]) == 1
     assert captured["sockets"][0].fileno() == -1
     assert messages == [
         f"WorkbookLens local UI: http://127.0.0.1:{config['port']}",
         "Press Ctrl+C in this window to stop WorkbookLens.",
     ]
+
+
+def test_background_server_is_quiet_and_stops_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = object()
+    captured: dict[str, Any] = {}
+    started = launcher.threading.Event()
+
+    def fake_config(received_app: object, **kwargs: Any) -> object:
+        captured["app"] = received_app
+        captured["config"] = kwargs
+        return object()
+
+    class FakeServer:
+        should_exit = False
+        force_exit = False
+
+        def __init__(self, config: object) -> None:
+            captured["server_config"] = config
+
+        def run(self, *, sockets: list[socket.socket]) -> None:
+            captured["sockets"] = sockets
+            started.set()
+            while not self.should_exit:
+                launcher.time.sleep(0.001)
+
+    monkeypatch.setattr(launcher, "create_app", lambda **_kwargs: app)
+    monkeypatch.setattr(launcher.uvicorn, "Config", fake_config)
+    monkeypatch.setattr(launcher.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(launcher, "_wait_until_ready", lambda *_args, **_kwargs: True)
+
+    messages: list[str] = []
+    running = launcher.start_local_ui_server(port=0, status=messages.append)
+    assert started.wait(1)
+    config = captured["config"]
+    assert config["host"] == launcher.LOOPBACK_HOST
+    assert config["access_log"] is False
+    assert config["log_config"] is None
+    assert config["log_level"] == "warning"
+    assert messages == [f"WorkbookLens local UI: {running.url}"]
+
+    running.stop(timeout=1)
+    assert not running.thread.is_alive()
+    assert running.binding.socket.fileno() == -1
+    running.stop(timeout=1)
 
 
 def test_run_local_ui_closes_socket_when_app_creation_fails(
@@ -225,6 +277,7 @@ def test_serve_cli_defaults_and_boolean_flags(monkeypatch: pytest.MonkeyPatch) -
     assert enabled_result.exit_code == 0, enabled_result.stdout
     assert calls[0]["open_browser"] is False
     assert calls[0]["fallback_port"] is False
+    assert calls[0]["language"] == cli._current_language
     assert calls[1]["open_browser"] is True
     assert calls[1]["fallback_port"] is True
 
@@ -234,4 +287,4 @@ def test_serve_cli_reports_occupied_port_as_exit_two() -> None:
     for port in _occupied_loopback_port():
         result = runner.invoke(cli.app, ["serve", "--port", str(port)])
     assert result.exit_code == 2
-    assert f"Local port {port} is already in use" in result.stdout
+    assert "WL-REQ-001" in result.stdout

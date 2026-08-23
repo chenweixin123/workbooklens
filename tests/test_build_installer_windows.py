@@ -12,8 +12,8 @@ from scripts.build_installer_windows import (
 
 
 def test_numeric_installer_version() -> None:
-    assert numeric_installer_version("2.2.1") == "2.2.1.0"
-    assert numeric_installer_version("2.2.1rc1") == "2.2.1.0"
+    assert numeric_installer_version("2.3.0") == "2.3.0.0"
+    assert numeric_installer_version("2.3.0rc1") == "2.3.0.0"
 
 
 @pytest.mark.parametrize("version", ("dev", "1.2.70000"))
@@ -44,7 +44,9 @@ def test_inno_definition_creates_named_shortcuts_and_uninstaller() -> None:
     assert "Tasks: desktopicon" in definition
     assert 'Name: "{group}\\Uninstall {#AppName}"' in definition
     assert 'Filename: "{uninstallexe}"' in definition
-    assert 'Parameters: "serve --open-browser --fallback-port"' in definition
+    assert 'Parameters: "serve --open-browser --fallback-port"' not in definition
+    assert r"SetupIconFile=assets\WorkbookLens.ico" in definition
+    assert r'Name: "{app}\WorkbookLensCLI.exe"' in definition
     assert "UninstallDisplayName={#AppName}" in definition
     assert "AppId={{7B7534E0-8485-4F4F-8DE7-561869FF7C0C}" in definition
     assert 'Type: filesandordirs; Name: "{app}\\_internal"' in definition
@@ -57,7 +59,7 @@ def test_publishes_validated_installer_pair(tmp_path: Path) -> None:
     output = tmp_path / "output"
     staging.mkdir()
     output.mkdir()
-    staged_installer = staging / "WorkbookLens-2.2.1-windows-x64-setup.exe"
+    staged_installer = staging / "WorkbookLens-2.3.0-windows-x64-setup.exe"
     staged_sidecar = staging / f"{staged_installer.name}.sha256"
     installer = output / staged_installer.name
     sidecar = output / staged_sidecar.name
@@ -82,7 +84,7 @@ def test_publish_failure_removes_new_outputs_and_preserves_error(tmp_path: Path)
     output = tmp_path / "output"
     staging.mkdir()
     output.mkdir()
-    staged_installer = staging / "WorkbookLens-2.2.1-windows-x64-setup.exe"
+    staged_installer = staging / "WorkbookLens-2.3.0-windows-x64-setup.exe"
     staged_sidecar = staging / f"{staged_installer.name}.sha256"
     installer = output / staged_installer.name
     sidecar = output / staged_sidecar.name
@@ -111,7 +113,7 @@ def test_overwrite_failure_restores_previous_pair(tmp_path: Path) -> None:
     output = tmp_path / "output"
     staging.mkdir()
     output.mkdir()
-    staged_installer = staging / "WorkbookLens-2.2.1-windows-x64-setup.exe"
+    staged_installer = staging / "WorkbookLens-2.3.0-windows-x64-setup.exe"
     staged_sidecar = staging / f"{staged_installer.name}.sha256"
     installer = output / staged_installer.name
     sidecar = output / staged_sidecar.name

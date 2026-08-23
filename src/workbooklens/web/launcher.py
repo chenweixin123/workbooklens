@@ -10,7 +10,8 @@ import urllib.error
 import urllib.request
 import webbrowser
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import uvicorn
 
@@ -21,6 +22,7 @@ LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 HEALTH_TIMEOUT_SECONDS = 10.0
 HEALTH_POLL_SECONDS = 0.1
+SERVER_STOP_TIMEOUT_SECONDS = 10.0
 
 StatusCallback = Callable[[str], None]
 
@@ -33,6 +35,33 @@ class LocalBinding:
     port: int
     requested_port: int
     fell_back: bool
+
+
+@dataclass(slots=True)
+class RunningLocalUI:
+    """A background loopback server owned by a native desktop window."""
+
+    binding: LocalBinding
+    server: uvicorn.Server
+    thread: threading.Thread
+    url: str
+    errors: list[BaseException] = field(default_factory=list)
+    _stopped: bool = False
+
+    def stop(self, *, timeout: float = SERVER_STOP_TIMEOUT_SECONDS) -> None:
+        """Stop Uvicorn, wait for its thread, and release the reserved socket."""
+
+        if self._stopped:
+            return
+        self.server.should_exit = True
+        self.thread.join(timeout=max(0.0, timeout))
+        if self.thread.is_alive():
+            self.server.force_exit = True
+            self.thread.join(timeout=min(2.0, max(0.0, timeout)))
+        if self.thread.is_alive():
+            raise RuntimeError("WorkbookLens local server did not stop in time")
+        self.binding.socket.close()
+        self._stopped = True
 
 
 def _new_loopback_socket(port: int) -> socket.socket:
@@ -97,6 +126,31 @@ def _health_ready(opener: urllib.request.OpenerDirector, url: str, timeout: floa
         return False
 
 
+def _wait_until_ready(
+    url: str,
+    *,
+    timeout: float,
+    poll_interval: float,
+    thread: threading.Thread | None = None,
+    errors: list[BaseException] | None = None,
+) -> bool:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    deadline = time.monotonic() + timeout
+    while True:
+        if thread is not None and not thread.is_alive():
+            if errors:
+                raise RuntimeError("WorkbookLens local server stopped during startup") from errors[
+                    0
+                ]
+            raise RuntimeError("WorkbookLens local server stopped during startup")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if _health_ready(opener, url, min(remaining, 0.5)):
+            return True
+        time.sleep(min(poll_interval, remaining))
+
+
 def _open_browser_when_ready(
     url: str,
     *,
@@ -104,16 +158,9 @@ def _open_browser_when_ready(
     timeout: float = HEALTH_TIMEOUT_SECONDS,
     poll_interval: float = HEALTH_POLL_SECONDS,
 ) -> None:
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            status(f"The local UI did not become ready in time. Open it manually: {url}")
-            return
-        if _health_ready(opener, url, min(remaining, 0.5)):
-            break
-        time.sleep(min(poll_interval, remaining))
+    if not _wait_until_ready(url, timeout=timeout, poll_interval=poll_interval):
+        status(f"The local UI did not become ready in time. Open it manually: {url}")
+        return
 
     try:
         opened = webbrowser.open(url, new=2, autoraise=True)
@@ -124,10 +171,78 @@ def _open_browser_when_ready(
         status(f"The browser could not be opened automatically. Open this URL: {url}")
 
 
+def _uvicorn_server(
+    local_app: Any,
+    binding: LocalBinding,
+    *,
+    quiet: bool,
+) -> uvicorn.Server:
+    options: dict[str, Any] = {
+        "host": LOOPBACK_HOST,
+        "port": binding.port,
+        "log_level": "warning" if quiet else "info",
+        "loop": "asyncio",
+        "http": "h11",
+        "ws": "none",
+        "lifespan": "on",
+        "proxy_headers": False,
+        "access_log": not quiet,
+    }
+    if quiet:
+        options["log_config"] = None
+    return uvicorn.Server(uvicorn.Config(local_app, **options))
+
+
+def start_local_ui_server(
+    *,
+    port: int = DEFAULT_PORT,
+    max_file_bytes: int = 100 * 1024 * 1024,
+    language: str | None = None,
+    fallback_port: bool = False,
+    status: StatusCallback = print,
+    ready_timeout: float = HEALTH_TIMEOUT_SECONDS,
+) -> RunningLocalUI:
+    """Start a quiet background server for the native desktop shell."""
+
+    binding = bind_loopback_socket(port, fallback_port=fallback_port)
+    try:
+        local_app = create_app(max_file_bytes=max_file_bytes, language=language)
+        url = f"http://{LOOPBACK_HOST}:{binding.port}"
+        if binding.fell_back:
+            status(f"Local port {binding.requested_port} is in use; using {binding.port} instead.")
+        server = _uvicorn_server(local_app, binding, quiet=True)
+        errors: list[BaseException] = []
+
+        def serve() -> None:
+            try:
+                server.run(sockets=[binding.socket])
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=serve, name="workbooklens-server", daemon=True)
+        running = RunningLocalUI(binding, server, thread, url, errors)
+        thread.start()
+        if not _wait_until_ready(
+            url,
+            timeout=ready_timeout,
+            poll_interval=HEALTH_POLL_SECONDS,
+            thread=thread,
+            errors=errors,
+        ):
+            running.stop()
+            raise UsageError("The WorkbookLens local interface did not become ready in time")
+        status(f"WorkbookLens local UI: {url}")
+        return running
+    except BaseException:
+        binding.socket.close()
+        raise
+
+
 def run_local_ui(
     *,
     port: int = DEFAULT_PORT,
     max_file_bytes: int = 100 * 1024 * 1024,
+    language: str | None = None,
     open_browser: bool = False,
     fallback_port: bool = False,
     status: StatusCallback = print,
@@ -136,25 +251,14 @@ def run_local_ui(
 
     binding = bind_loopback_socket(port, fallback_port=fallback_port)
     try:
-        local_app = create_app(max_file_bytes=max_file_bytes)
+        local_app = create_app(max_file_bytes=max_file_bytes, language=language)
         url = f"http://{LOOPBACK_HOST}:{binding.port}"
         if binding.fell_back:
             status(f"Local port {binding.requested_port} is in use; using {binding.port} instead.")
         status(f"WorkbookLens local UI: {url}")
         status("Press Ctrl+C in this window to stop WorkbookLens.")
 
-        config = uvicorn.Config(
-            local_app,
-            host=LOOPBACK_HOST,
-            port=binding.port,
-            log_level="info",
-            loop="asyncio",
-            http="h11",
-            ws="none",
-            lifespan="on",
-            proxy_headers=False,
-        )
-        server = uvicorn.Server(config)
+        server = _uvicorn_server(local_app, binding, quiet=False)
         if open_browser:
             threading.Thread(
                 target=_open_browser_when_ready,

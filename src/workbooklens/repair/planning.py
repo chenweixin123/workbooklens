@@ -93,7 +93,10 @@ def resolve_patch_selection(
                 resolved.update(member_ids)
     else:
         if not requested:
-            raise UsageError("Select at least one --patch-id or pass --safe-only")
+            raise UsageError(
+                "Select at least one --patch-id or pass --safe-only",
+                error_key="repair.selection_required",
+            )
         unknown = requested - by_id.keys()
         if unknown:
             raise UsageError("Unknown patch IDs: " + ", ".join(sorted(unknown)))

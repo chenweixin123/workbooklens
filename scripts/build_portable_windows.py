@@ -26,6 +26,7 @@ else:
 
 
 PYINSTALLER_VERSION: Final = "6.22.2"
+PYWEBVIEW_VERSION: Final = "6.2.1"
 REQUIRED_PYTHON: Final = (3, 12)
 VERSION_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 PROJECT_CANONICAL_NAME: Final = "workbooklens"
@@ -118,6 +119,8 @@ def sanitized_python_environment(
         if key.casefold() in PYTHON_INJECTION_VARIABLES:
             environment.pop(key, None)
     environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONUTF8"] = "1"
+    environment["PYTHONIOENCODING"] = "utf-8"
     return environment
 
 
@@ -217,7 +220,12 @@ def _numeric_file_version(version: str) -> tuple[int, int, int, int]:
     return (parts[0], parts[1], parts[2], 0)
 
 
-def render_version_info(version: str) -> str:
+def render_version_info(
+    version: str,
+    *,
+    original_filename: str = "WorkbookLens.exe",
+    description: str = "WorkbookLens local spreadsheet auditor",
+) -> str:
     numeric = _numeric_file_version(version)
     return f"""# UTF-8
 VSVersionInfo(
@@ -236,11 +244,11 @@ VSVersionInfo(
       StringTable(
         '040904B0',
         [StringStruct('CompanyName', 'WorkbookLens'),
-         StringStruct('FileDescription', 'WorkbookLens local spreadsheet auditor'),
+         StringStruct('FileDescription', '{description}'),
          StringStruct('FileVersion', '{version}'),
          StringStruct('InternalName', 'WorkbookLens'),
          StringStruct('LegalCopyright', 'WorkbookLens contributors'),
-         StringStruct('OriginalFilename', 'WorkbookLens.exe'),
+         StringStruct('OriginalFilename', '{original_filename}'),
          StringStruct('ProductName', 'WorkbookLens'),
          StringStruct('ProductVersion', '{version}')])
     ]),
@@ -585,15 +593,22 @@ def build_portable(args: argparse.Namespace) -> tuple[Path, Path]:
         ]
         if constraints is not None:
             install_command.extend(["--constraint", constraints])
-        install_command.extend([f"pyinstaller=={PYINSTALLER_VERSION}", wheel])
+        install_command.extend(
+            [
+                f"pyinstaller=={PYINSTALLER_VERSION}",
+                f"pywebview=={PYWEBVIEW_VERSION}",
+                wheel,
+            ]
+        )
         _run(install_command, env=isolated_env)
         verification = _run(
             [
                 venv_python,
                 "-c",
                 (
-                    "import json, PyInstaller, workbooklens; "
+                    "import importlib.metadata, json, PyInstaller, workbooklens; "
                     "print(json.dumps({'pyinstaller': PyInstaller.__version__, "
+                    "'pywebview': importlib.metadata.version('pywebview'), "
                     "'workbooklens': workbooklens.__version__}))"
                 ),
             ],
@@ -602,16 +617,30 @@ def build_portable(args: argparse.Namespace) -> tuple[Path, Path]:
         installed = json.loads(verification.stdout)
         if installed != {
             "pyinstaller": PYINSTALLER_VERSION,
+            "pywebview": PYWEBVIEW_VERSION,
             "workbooklens": metadata.version,
         }:
             raise PortableBuildError(f"isolated environment version mismatch: {installed!r}")
 
-        version_file = scratch / "version_info.txt"
-        version_file.write_text(
-            render_version_info(metadata.version), encoding="utf-8", newline="\n"
+        gui_version_file = scratch / "gui-version-info.txt"
+        gui_version_file.write_text(
+            render_version_info(metadata.version),
+            encoding="utf-8",
+            newline="\n",
+        )
+        cli_version_file = scratch / "cli-version-info.txt"
+        cli_version_file.write_text(
+            render_version_info(
+                metadata.version,
+                original_filename="WorkbookLensCLI.exe",
+                description="WorkbookLens command-line interface",
+            ),
+            encoding="utf-8",
+            newline="\n",
         )
         pyinstaller_env = isolated_env.copy()
-        pyinstaller_env["WORKBOOKLENS_VERSION_FILE"] = str(version_file)
+        pyinstaller_env["WORKBOOKLENS_GUI_VERSION_FILE"] = str(gui_version_file)
+        pyinstaller_env["WORKBOOKLENS_CLI_VERSION_FILE"] = str(cli_version_file)
         pyinstaller_env["PYINSTALLER_CONFIG_DIR"] = str(scratch / "pyinstaller-config")
         raw_dist = scratch / "pyinstaller-dist"
         _run(
@@ -634,6 +663,8 @@ def build_portable(args: argparse.Namespace) -> tuple[Path, Path]:
         pyinstaller_output = raw_dist / "WorkbookLens"
         if not (pyinstaller_output / "WorkbookLens.exe").is_file():
             raise PortableBuildError("PyInstaller did not produce WorkbookLens.exe")
+        if not (pyinstaller_output / "WorkbookLensCLI.exe").is_file():
+            raise PortableBuildError("PyInstaller did not produce WorkbookLensCLI.exe")
         if not (pyinstaller_output / "_internal").is_dir():
             raise PortableBuildError("PyInstaller did not produce an _internal directory")
 
@@ -651,6 +682,22 @@ def build_portable(args: argparse.Namespace) -> tuple[Path, Path]:
         distributions = collect_distribution_licenses(
             _query_site_packages(venv_python, env=isolated_env),
             licenses_dir,
+        )
+        lucide_directory = licenses_dir / "Lucide-1.8.0"
+        lucide_directory.mkdir()
+        lucide_license = lucide_directory / "LICENSE.txt"
+        shutil.copyfile(
+            repository_root / "packaging" / "windows" / "assets" / "LICENSE-LUCIDE.txt",
+            lucide_license,
+        )
+        distributions.append(
+            DistributionNotice(
+                name="Lucide Icons",
+                version="1.8.0",
+                license_expression="ISC AND MIT",
+                license_text="Lucide ISC; Feather-derived Search icon MIT",
+                copied_files=(lucide_license.relative_to(licenses_dir).as_posix(),),
+            )
         )
         (staging_root / "THIRD-PARTY-NOTICES.txt").write_text(
             render_third_party_notices(runtime, distributions),

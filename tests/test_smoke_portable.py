@@ -22,7 +22,7 @@ def test_configures_legacy_stdio_for_non_ascii_command_logs() -> None:
     stderr = io.TextIOWrapper(stderr_buffer, encoding="cp1252", errors="strict")
     try:
         configure_utf8_stdio(stdout=stdout, stderr=stderr)
-        _log_command([r"C:\workbooklens-测试\WorkbookLens.exe", "--version"], stream=stdout)
+        _log_command([r"C:\workbooklens-测试\WorkbookLensCLI.exe", "--version"], stream=stdout)
         stdout.flush()
 
         assert stdout.encoding == "utf-8"
@@ -37,12 +37,12 @@ def test_command_log_escapes_non_ascii_for_unconfigured_cp1252_stream() -> None:
     buffer = io.BytesIO()
     stream = io.TextIOWrapper(buffer, encoding="cp1252", errors="strict")
     try:
-        _log_command([r"C:\workbooklens-测试\WorkbookLens.exe", "--version"], stream=stream)
+        _log_command([r"C:\workbooklens-测试\WorkbookLensCLI.exe", "--version"], stream=stream)
         stream.flush()
 
         output = buffer.getvalue().decode("cp1252")
         assert "\\u6d4b\\u8bd5" in output
-        assert "WorkbookLens.exe --version" in output
+        assert "WorkbookLensCLI.exe --version" in output
     finally:
         stream.detach()
 
@@ -71,10 +71,10 @@ def test_sanitized_environment_removes_python_paths() -> None:
 
 
 def test_matches_non_ascii_path_across_rich_line_wraps() -> None:
-    expected = "C:\\Temp\\\u4e2d\u6587 \u7a7a\u683c\\\u8def\u5f84 \u6df7\u5408\\demo"
+    path = "C:\\Temp\\\u4e2d\u6587 \u7a7a\u683c\\\u8def\u5f84 \u6df7\u5408\\demo"
+    expected = f"Demo complete {path}"
     output = (
-        "Demo complete in C:\\Temp\\\u4e2d\u6587 \r\n"
-        "\u7a7a\u683c\\\u8def\u5f84 \u6df7\u5408\\demo\r\n"
+        "Demo complete C:\\Temp\\\u4e2d\u6587 \r\n\u7a7a\u683c\\\u8def\u5f84 \u6df7\u5408\\demo\r\n"
     )
 
     assert contains_text_ignoring_line_wraps(output, expected)

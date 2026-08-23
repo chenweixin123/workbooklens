@@ -18,6 +18,8 @@ from typing import Any, Final
 if __package__:
     from .check_installer_artifact import InstallerArtifactError, inspect_installer
     from .check_portable_artifact import (
+        LEGACY_V2_2_1_PROFILE,
+        LEGACY_V2_2_1_VERSION,
         PortableArtifactError,
         extract_checked_artifact,
         inspect_artifact,
@@ -25,6 +27,8 @@ if __package__:
 else:
     from check_installer_artifact import InstallerArtifactError, inspect_installer
     from check_portable_artifact import (
+        LEGACY_V2_2_1_PROFILE,
+        LEGACY_V2_2_1_VERSION,
         PortableArtifactError,
         extract_checked_artifact,
         inspect_artifact,
@@ -73,6 +77,47 @@ def _run(
         ) from exc
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallerSmokeError(f"cannot complete command {rendered}: {exc}") from exc
+
+
+def _run_desktop_smoke(
+    executable: Path,
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float = 30.0,
+) -> None:
+    command = [str(executable), "--workbooklens-smoke-test"]
+    rendered = subprocess.list2cmdline(command)
+    print(f"+ {rendered}", flush=True)
+    process = subprocess.Popen(  # noqa: S603 - exact installed release executable.
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        system_root = env.get("SystemRoot") or env.get("WINDIR")
+        if system_root:
+            taskkill = Path(system_root) / "System32" / "taskkill.exe"
+            if taskkill.is_file():
+                subprocess.run(  # noqa: S603 - taskkill is resolved below SystemRoot.
+                    [str(taskkill), "/PID", str(process.pid), "/T", "/F"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+        with suppress(OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.communicate(timeout=5)
+        raise InstallerSmokeError("installed native desktop smoke timed out") from exc
+    if process.returncode != 0:
+        raise InstallerSmokeError(
+            f"installed native desktop smoke failed with exit code {process.returncode}"
+        )
 
 
 def _shell_folder(name: str) -> Path:
@@ -483,11 +528,15 @@ def smoke_installer(
     baseline_portable = portable_zip
     baseline_version = installer_report.version
     if previous_installer is not None and previous_portable_zip is not None:
-        previous_report = inspect_installer(previous_installer)
+        previous_report = inspect_installer(
+            previous_installer,
+            expected_version=LEGACY_V2_2_1_VERSION,
+        )
         inspect_artifact(
             previous_portable_zip,
-            expected_version=previous_report.version,
+            expected_version=LEGACY_V2_2_1_VERSION,
             repository_root=None,
+            profile=LEGACY_V2_2_1_PROFILE,
         )
         baseline_installer = previous_installer
         baseline_portable = previous_portable_zip
@@ -527,6 +576,7 @@ def smoke_installer(
                 scratch / "portable-previous",
                 expected_version=baseline_version,
                 repository_root=None,
+                profile=LEGACY_V2_2_1_PROFILE,
             )
         baseline_hashes = _file_hashes(baseline_root)
         primary_error: BaseException | None = None
@@ -785,10 +835,15 @@ def smoke_installer(
                 install_dir=install_dir,
             )
             executable = install_dir / "WorkbookLens.exe"
+            cli_executable = install_dir / "WorkbookLensCLI.exe"
             uninstaller = install_dir / "unins000.exe"
-            if not executable.is_file() or not uninstaller.is_file():
+            if (
+                not executable.is_file()
+                or not cli_executable.is_file()
+                or not uninstaller.is_file()
+            ):
                 raise InstallerSmokeError(
-                    "installer did not create the application and uninstaller"
+                    "installer did not create the desktop app, CLI, and uninstaller"
                 )
             _assert_payload_matches(
                 install_dir,
@@ -807,7 +862,7 @@ def smoke_installer(
                 details = _shortcut_details(link)
                 if Path(details.get("TargetPath", "")).resolve() != executable.resolve():
                     raise InstallerSmokeError(f"shortcut target is incorrect: {link}")
-                if details.get("Arguments") != "serve --open-browser --fallback-port":
+                if details.get("Arguments"):
                     raise InstallerSmokeError(f"shortcut launch arguments are incorrect: {link}")
 
             entries = _uninstall_entries()
@@ -824,7 +879,7 @@ def smoke_installer(
                 if key.casefold() in {"pythonhome", "pythonpath", "virtual_env"}:
                     environment.pop(key, None)
             completed = subprocess.run(  # noqa: S603 - exact installed release executable.
-                [str(executable), "--version"],
+                [str(cli_executable), "--version"],
                 check=True,
                 timeout=30,
                 text=True,
@@ -835,7 +890,16 @@ def smoke_installer(
                 env=environment,
             )
             if installer_report.version not in completed.stdout:
-                raise InstallerSmokeError("installed executable reports the wrong version")
+                raise InstallerSmokeError("installed CLI reports the wrong version")
+            desktop_environment = environment.copy()
+            desktop_data = scratch / "desktop-local-app-data"
+            desktop_data.mkdir(exist_ok=True)
+            desktop_environment["LOCALAPPDATA"] = str(desktop_data)
+            _run_desktop_smoke(
+                executable,
+                cwd=install_dir,
+                env=desktop_environment,
+            )
             _assert_payload_matches(
                 install_dir,
                 expected_hashes,

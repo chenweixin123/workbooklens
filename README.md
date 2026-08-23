@@ -3,7 +3,7 @@
 **Deterministic linting, regression testing, semantic diffing, and conservative repair for
 Excel workbooks.**
 
-WorkbookLens 2.2 core scan, test, diff, and repair workflows work locally without Microsoft Excel,
+WorkbookLens 2.3 core scan, test, diff, and repair workflows work locally without Microsoft Excel,
 LibreOffice, an AI key, or a cloud service. Those normal OOXML workflows do not calculate formulas,
 execute VBA, open embedded objects, or fetch external links. .xlsx files support scan, test, diff,
 and safe-copy repair; .xlsm files remain read-only. The optional local `.xls` conversion button is a
@@ -13,9 +13,26 @@ behavior supported by that application. Conversion never uses a cloud service an
 that every legacy workbook feature can be preserved.
 
 > **Release status:** GitHub Releases are authoritative for source archives and attached artifacts.
-> Version 2.2.1 may not be published to [PyPI](https://pypi.org/project/workbooklens/); use the
+> Version 2.3.0 may not be published to [PyPI](https://pypi.org/project/workbooklens/); use the
 > downloaded wheel or source checkout instructions below unless PyPI explicitly lists that version.
 > Do not assume pipx or uvx can install a GitHub-only release by package name.
+
+## What is new in 2.3
+
+- The Windows installer and portable package now launch `WorkbookLens.exe` as a native, branded
+  desktop window. The local FastAPI service remains bound to `127.0.0.1`, but no console or external
+  browser is shown; closing the window stops the background service and releases its port.
+- A persistent language selector supports Chinese and English. Built-in pages, findings, repair
+  suggestions, scan reports, semantic-diff reports, and safe error messages follow the selected
+  language while canonical rule IDs, patch IDs, fingerprints, formulas, and JSON/SARIF data remain
+  unchanged. Third-party plugin text is retained when no trusted translation is available.
+- Local `.xls` conversion tolerates Windows or Office configurations that deny access to
+  `Process.Path`. WorkbookLens verifies the Excel process with stronger held-handle identity checks
+  and reports stable `WL-CNV-001` through `WL-CNV-005` codes plus a diagnostic ID instead of exposing
+  PowerShell CLIXML, private paths, or tracebacks in the interface.
+- Windows artifacts contain a windowed `WorkbookLens.exe`, a separate console
+  `WorkbookLensCLI.exe`, and the WorkbookLens application icon. The CLI and Python package workflows
+  remain available for automation and third-party plugins.
 
 ## What is new in 2.2
 
@@ -81,20 +98,21 @@ that every legacy workbook feature can be preserved.
 ## Windows installer (recommended)
 
 For the normal Windows experience, download
-`WorkbookLens-2.2.1-windows-x64-setup.exe` and `SHA256SUMS` from the official
-[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.2.1). Verify the
+`WorkbookLens-2.3.0-windows-x64-setup.exe` and `SHA256SUMS` from the official
+[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.3.0). Verify the
 published checksum before running the installer:
 
 ~~~powershell
-(Get-FileHash .\WorkbookLens-2.2.1-windows-x64-setup.exe -Algorithm SHA256).Hash
+(Get-FileHash .\WorkbookLens-2.3.0-windows-x64-setup.exe -Algorithm SHA256).Hash
 ~~~
 
 The installer uses the current Windows account and does not require administrator access. Its
 wizard provides the normal **Install** button, adds **WorkbookLens** to the Start menu, offers a
 desktop shortcut by default, and registers a standard entry in Windows **Installed apps**. Open the
-Start-menu or desktop shortcut to launch the local interface directly; the WorkbookLens console
-starts the loopback service and the default browser opens after it is ready. Keep that console open
-while using WorkbookLens, and press `Ctrl+C` there to stop it cleanly.
+Start-menu or desktop shortcut to launch the local `WorkbookLens` window directly. The application
+uses pywebview with the Microsoft Edge WebView2 Runtime to render its loopback-only interface; it
+does not show a console or open an external browser. Closing the desktop window stops its background
+server cleanly. The language selector offers Chinese and English and remembers the choice locally.
 
 Uninstall from Windows **Settings > Apps > Installed apps**, or choose
 **Uninstall WorkbookLens** in the WorkbookLens Start-menu folder. The installer and application are
@@ -105,28 +123,29 @@ interface as the portable build.
 
 ## Windows portable ZIP
 
-The official `WorkbookLens-2.2.1-windows-x64-portable.zip` is the no-install Windows option.
+The official `WorkbookLens-2.3.0-windows-x64-portable.zip` is the no-install Windows option.
 It bundles a 64-bit CPython 3.12 runtime, so users do not need to install Python, `uv`, Microsoft
 Excel, LibreOffice, an AI key, or a cloud client. It is a portable folder rather than an installer:
 it does not request administrator access, modify the registry, create file associations, or add an
 automatic updater.
 
 Download the ZIP and `SHA256SUMS` from the official
-[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.2.1), compare the
+[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.3.0), compare the
 published SHA-256 value, and extract the complete folder. In PowerShell:
 
 ~~~powershell
-(Get-FileHash .\WorkbookLens-2.2.1-windows-x64-portable.zip -Algorithm SHA256).Hash
-Expand-Archive .\WorkbookLens-2.2.1-windows-x64-portable.zip -DestinationPath .\WorkbookLens
-Set-Location .\WorkbookLens\WorkbookLens-2.2.1-windows-x64
+(Get-FileHash .\WorkbookLens-2.3.0-windows-x64-portable.zip -Algorithm SHA256).Hash
+Expand-Archive .\WorkbookLens-2.3.0-windows-x64-portable.zip -DestinationPath .\WorkbookLens
+Set-Location .\WorkbookLens\WorkbookLens-2.3.0-windows-x64
 .\Start-WorkbookLens.cmd
 ~~~
 
-The launcher opens a dedicated WorkbookLens console, starts only on `127.0.0.1`, waits for the
-health check, and opens the default browser. It prefers port 8765 and selects an available local
-port if that port is already in use. Press `Ctrl+C` in the WorkbookLens console to stop the server
-cleanly. Workbook files and generated reports stay on the computer; the portable runtime does not
-upload them.
+The launcher starts the no-console `WorkbookLens.exe` desktop application. Its background service
+listens only on `127.0.0.1`, prefers port 8765, and selects an available local port if that port is
+already in use. The interface opens inside the WorkbookLens window through Edge WebView2 rather than
+an external browser, and closing the window stops the service cleanly. Workbook files, generated
+reports, language settings, and diagnostic logs stay on the computer; the portable runtime does not
+upload them. `WorkbookLensCLI.exe` remains available in the same folder for command-line workflows.
 
 The local home page also offers **Convert to .xlsx** for legacy binary `.xls` workbooks. Conversion
 is enabled only when WorkbookLens detects Microsoft Excel or LibreOffice on that computer. Excel is
@@ -148,17 +167,17 @@ upload service. Workbook processing stays on the user's computer. Installing the
 the configured Python package index once to obtain dependencies; scanning, planning, repair, diff,
 and the loopback web UI do not upload workbooks.
 
-Download `workbooklens-2.2.1-py3-none-any.whl`, `workbooklens-2.2.1.tar.gz`, and
+Download `workbooklens-2.3.0-py3-none-any.whl`, `workbooklens-2.3.0.tar.gz`, and
 `SHA256SUMS` from the official
-[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.2.1), verify the
+[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.3.0), verify the
 checksum, and install it with Python 3.11+ and `uv`.
 
 ### PowerShell
 
 ~~~powershell
 Get-Content .\SHA256SUMS
-(Get-FileHash .\workbooklens-2.2.1-py3-none-any.whl -Algorithm SHA256).Hash
-uv tool install .\workbooklens-2.2.1-py3-none-any.whl
+(Get-FileHash .\workbooklens-2.3.0-py3-none-any.whl -Algorithm SHA256).Hash
+uv tool install .\workbooklens-2.3.0-py3-none-any.whl
 workbooklens --version
 workbooklens serve --port 8765
 ~~~
@@ -166,9 +185,9 @@ workbooklens serve --port 8765
 ### Bash
 
 ~~~bash
-grep -E '  workbooklens-2\.2\.1-py3-none-any\.whl$' SHA256SUMS | sha256sum -c -
-grep -E '  workbooklens-2\.2\.1\.tar\.gz$' SHA256SUMS | sha256sum -c -
-uv tool install ./workbooklens-2.2.1-py3-none-any.whl
+grep -E '  workbooklens-2\.3\.0-py3-none-any\.whl$' SHA256SUMS | sha256sum -c -
+grep -E '  workbooklens-2\.3\.0\.tar\.gz$' SHA256SUMS | sha256sum -c -
+uv tool install ./workbooklens-2.3.0-py3-none-any.whl
 workbooklens --version
 workbooklens serve --port 8765
 ~~~
@@ -205,11 +224,11 @@ uv run workbooklens --version
 uv run workbooklens demo --out .artifacts/demo
 ~~~
 
-If PyPI lists version 2.2.1, isolated installation is:
+If PyPI lists version 2.3.0, isolated installation is:
 
 ~~~bash
-uvx --from workbooklens==2.2.1 workbooklens --help
-pipx install workbooklens==2.2.1
+uvx --from workbooklens==2.3.0 workbooklens --help
+pipx install workbooklens==2.3.0
 ~~~
 
 ## Core workflows
@@ -287,7 +306,7 @@ confidentiality as the input workbook.
 
 ## GitHub Action
 
-After the v2.2.1 tag exists:
+After the v2.3.0 tag exists:
 
 ~~~yaml
 permissions:
@@ -299,7 +318,7 @@ steps:
     with:
       fetch-depth: 0
 
-  - uses: chenweixin123/workbooklens@v2.2.1
+  - uses: chenweixin123/workbooklens@v2.3.0
     with:
       mode: scan
       path: workbooks
@@ -313,7 +332,7 @@ steps:
 Assertion mode requires config and deliberately rejects baseline/new-only:
 
 ~~~yaml
-- uses: chenweixin123/workbooklens@v2.2.1
+- uses: chenweixin123/workbooklens@v2.3.0
   with:
     mode: test
     path: workbooks
@@ -412,12 +431,13 @@ uv run mypy src
 uv run python -m pytest -q
 uv build --out-dir dist
 uvx --from twine twine check --strict dist/*
-python scripts/check_release_artifacts.py dist --version 2.2.1
+python scripts/check_release_artifacts.py dist --version 2.3.0
 ~~~
 
 To reproduce the Windows x64 portable release candidate from the built wheel, run the following in
-PowerShell on 64-bit Windows. The final smoke test executes the frozen program, including the CLI,
-loopback web UI, occupied-port fallback, clean shutdown, and installation-directory hash check.
+PowerShell on 64-bit Windows. The final smoke test exercises the console CLI and native desktop
+window, including the loopback-only service, occupied-port fallback, clean shutdown, dual-executable
+subsystems, and installation-directory hash check.
 
 ~~~powershell
 uv sync --locked --python 3.12
@@ -427,17 +447,17 @@ uv export --locked --python 3.12 --no-dev --group portable --no-emit-project --n
 $wheel = @(Get-ChildItem -LiteralPath .artifacts/portable-python-dist -Filter '*.whl')
 if ($wheel.Count -ne 1) { throw "Expected exactly one wheel, found $($wheel.Count)." }
 $python = (Resolve-Path .venv/Scripts/python.exe).Path
-& $python scripts/build_portable_windows.py --wheel $wheel[0].FullName --python $python --expected-version 2.2.1 --constraints .artifacts/portable-constraints.txt --output-dir .artifacts/portable-dist
+& $python scripts/build_portable_windows.py --wheel $wheel[0].FullName --python $python --expected-version 2.3.0 --constraints .artifacts/portable-constraints.txt --output-dir .artifacts/portable-dist
 $archive = @(Get-ChildItem -LiteralPath .artifacts/portable-dist -Filter '*.zip')
 if ($archive.Count -ne 1) { throw "Expected exactly one ZIP, found $($archive.Count)." }
-& $python scripts/check_portable_artifact.py $archive[0].FullName --expected-version 2.2.1
-& $python scripts/smoke_portable.py $archive[0].FullName --expected-version 2.2.1
+& $python scripts/check_portable_artifact.py $archive[0].FullName --expected-version 2.3.0
+& $python scripts/smoke_portable.py $archive[0].FullName --expected-version 2.3.0
 $iscc = (Resolve-Path "$env:LOCALAPPDATA/Programs/Inno Setup 6/ISCC.exe").Path
-& $python scripts/build_installer_windows.py --portable-zip $archive[0].FullName --expected-version 2.2.1 --iscc $iscc --output-dir .artifacts/installer-dist
+& $python scripts/build_installer_windows.py --portable-zip $archive[0].FullName --expected-version 2.3.0 --iscc $iscc --output-dir .artifacts/installer-dist
 $installer = @(Get-ChildItem -LiteralPath .artifacts/installer-dist -Filter '*.exe')
 if ($installer.Count -ne 1) { throw "Expected exactly one installer, found $($installer.Count)." }
-& $python scripts/check_installer_artifact.py $installer[0].FullName --expected-version 2.2.1
-& $python scripts/smoke_installer_windows.py $installer[0].FullName --portable-zip $archive[0].FullName --expected-version 2.2.1
+& $python scripts/check_installer_artifact.py $installer[0].FullName --expected-version 2.3.0
+& $python scripts/smoke_installer_windows.py $installer[0].FullName --portable-zip $archive[0].FullName --expected-version 2.3.0
 ~~~
 
 The installer smoke test requires a user account without an existing WorkbookLens installation. It

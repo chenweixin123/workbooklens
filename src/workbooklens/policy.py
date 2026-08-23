@@ -160,7 +160,10 @@ def _validate_report_scope(raw: dict[str, Any], expected_source_scope: str | Non
         if not isinstance(report_scope, str):
             raise UsageError("Baseline 'source_scope' must be a string")
         if normalize_source_scope(report_scope) != expected:
-            raise UsageError(f"Baseline source scope {report_scope!r} does not match {expected!r}")
+            raise UsageError(
+                f"Baseline source scope {report_scope!r} does not match {expected!r}",
+                error_key="request.baseline_scope_mismatch",
+            )
         return
     legacy_source = raw.get("source")
     if not isinstance(legacy_source, str) or not legacy_source.strip():
@@ -170,7 +173,10 @@ def _validate_report_scope(raw: dict[str, Any], expected_source_scope: str | Non
         )
     legacy_name = PurePosixPath(legacy_source.replace("\\", "/")).name
     if legacy_name != PurePosixPath(expected).name:
-        raise UsageError(f"Baseline source {legacy_source!r} does not match {expected!r}")
+        raise UsageError(
+            f"Baseline source {legacy_source!r} does not match {expected!r}",
+            error_key="request.baseline_scope_mismatch",
+        )
 
 
 def load_baseline(

@@ -14,12 +14,16 @@ import zlib
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Final, NoReturn
+from typing import Final, Literal, NoReturn
 
 ARCHIVE_RE: Final = re.compile(
     r"^WorkbookLens-(?P<version>[A-Za-z0-9][A-Za-z0-9._+-]*)-"
     r"windows-x64-portable\.zip$"
 )
+ArtifactProfile = Literal["current", "legacy-v2.2.1"]
+CURRENT_PROFILE: Final[ArtifactProfile] = "current"
+LEGACY_V2_2_1_PROFILE: Final[ArtifactProfile] = "legacy-v2.2.1"
+LEGACY_V2_2_1_VERSION: Final = "2.2.1"
 WINDOWS_DRIVE_RE: Final = re.compile(r"^[A-Za-z]:")
 WINDOWS_DEVICES: Final = {
     "AUX",
@@ -45,8 +49,10 @@ ALLOWED_ROOT_FILES: Final = {
     "Start-WorkbookLens.cmd",
     "THIRD-PARTY-NOTICES.txt",
     "WorkbookLens.exe",
+    "WorkbookLensCLI.exe",
     "workbooklens.example.yml",
 }
+LEGACY_V2_2_1_ALLOWED_ROOT_FILES: Final = ALLOWED_ROOT_FILES - {"WorkbookLensCLI.exe"}
 ALLOWED_ROOT_DIRECTORIES: Final = {"LICENSES", "_internal"}
 SENSITIVE_DIRECTORY_NAMES: Final = {
     ".aws",
@@ -132,8 +138,23 @@ INTERNAL_SENSITIVE_TOKENS: Final = {
 }
 INTERNAL_ALLOWED_SENSITIVE_FILES: Final = {
     "api-ms-win-core-debug-l1-1-0.dll",
+    "system.diagnostics.debug.dll",
+}
+PYWEBVIEW_LOADER_ARCHITECTURES: Final = {
+    "webview/lib/runtimes/win-arm64/native/webview2loader.dll": (0xAA64, 0x20B),
+    "webview/lib/runtimes/win-x64/native/webview2loader.dll": (0x8664, 0x20B),
+    "webview/lib/runtimes/win-x86/native/webview2loader.dll": (0x14C, 0x10B),
 }
 REQUIRED_INTERNAL_FILES: Final = {
+    "base_library.zip",
+    "python312.dll",
+    "webview/js/api.js",
+    "webview/lib/microsoft.web.webview2.core.dll",
+    *PYWEBVIEW_LOADER_ARCHITECTURES,
+    "workbooklens/diff/templates/diff.html.j2",
+    "workbooklens/reports/templates/scan.html.j2",
+}
+LEGACY_V2_2_1_REQUIRED_INTERNAL_FILES: Final = {
     "base_library.zip",
     "python312.dll",
     "workbooklens/diff/templates/diff.html.j2",
@@ -168,6 +189,18 @@ class ArtifactReport:
     sha256: str
 
 
+@dataclass(frozen=True)
+class _ArtifactContract:
+    allowed_root_files: frozenset[str]
+    required_internal_files: frozenset[str]
+    workbooklens_subsystem: int
+    cli_subsystem: int | None
+    required_notice_tokens: tuple[str, ...]
+    forbidden_notice_tokens: tuple[str, ...] = ()
+    forbidden_internal_prefixes: tuple[str, ...] = ()
+    forbidden_license_prefixes: tuple[str, ...] = ()
+
+
 def _fail(message: str) -> NoReturn:
     raise PortableArtifactError(message)
 
@@ -178,6 +211,44 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _artifact_contract(
+    profile: ArtifactProfile,
+    *,
+    version: str,
+    expected_version: str | None,
+) -> _ArtifactContract:
+    if profile == CURRENT_PROFILE:
+        return _ArtifactContract(
+            allowed_root_files=frozenset(ALLOWED_ROOT_FILES),
+            required_internal_files=frozenset(REQUIRED_INTERNAL_FILES),
+            workbooklens_subsystem=2,
+            cli_subsystem=3,
+            required_notice_tokens=("CPython", "PyInstaller", "pywebview", "Lucide"),
+        )
+    if profile == LEGACY_V2_2_1_PROFILE:
+        if expected_version != LEGACY_V2_2_1_VERSION:
+            _fail(
+                f"portable profile {profile!r} requires explicit expected_version "
+                f"{LEGACY_V2_2_1_VERSION!r}, got {expected_version!r}"
+            )
+        if version != LEGACY_V2_2_1_VERSION:
+            _fail(
+                f"portable profile {profile!r} requires archive version "
+                f"{LEGACY_V2_2_1_VERSION!r}, got {version!r}"
+            )
+        return _ArtifactContract(
+            allowed_root_files=frozenset(LEGACY_V2_2_1_ALLOWED_ROOT_FILES),
+            required_internal_files=frozenset(LEGACY_V2_2_1_REQUIRED_INTERNAL_FILES),
+            workbooklens_subsystem=3,
+            cli_subsystem=None,
+            required_notice_tokens=("CPython", "PyInstaller"),
+            forbidden_notice_tokens=("pywebview", "Lucide"),
+            forbidden_internal_prefixes=("webview",),
+            forbidden_license_prefixes=("pywebview-", "lucide-"),
+        )
+    _fail(f"unsupported portable artifact profile: {profile!r}")
 
 
 def _validate_checksum(archive: Path, expected_digest: str) -> None:
@@ -555,6 +626,9 @@ def _validate_pe_x64(
     *,
     member_name: str,
     version: str | None = None,
+    allow_managed_anycpu: bool = False,
+    expected_subsystem: int | None = None,
+    expected_architecture: tuple[int, int] | None = None,
 ) -> None:
     if len(data) < 0x40 or data[:2] != b"MZ":
         _fail(f"{member_name} is not a PE executable")
@@ -563,12 +637,67 @@ def _validate_pe_x64(
         _fail(f"{member_name} has an invalid PE header")
     machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
     optional_magic = struct.unpack_from("<H", data, pe_offset + 24)[0]
-    if machine != 0x8664 or optional_magic != 0x20B:
+    is_x64 = machine == 0x8664 and optional_magic == 0x20B
+    if expected_architecture is not None and (machine, optional_magic) != expected_architecture:
+        _fail(f"{member_name} does not match its required PE architecture")
+    if (
+        expected_architecture is None
+        and not is_x64
+        and not (
+            allow_managed_anycpu and _is_managed_anycpu_pe(data, pe_offset, machine, optional_magic)
+        )
+    ):
         _fail(f"{member_name} is not a Windows x64 PE32+ executable")
+    if expected_subsystem is not None:
+        optional_offset = pe_offset + 24
+        subsystem_offset = optional_offset + 68
+        if subsystem_offset + 2 > len(data):
+            _fail(f"{member_name} has a truncated PE optional header")
+        subsystem = struct.unpack_from("<H", data, subsystem_offset)[0]
+        if subsystem != expected_subsystem:
+            _fail(f"{member_name} has Windows subsystem {subsystem}, expected {expected_subsystem}")
     if version is not None and (
         version.encode("ascii") not in data and version.encode("utf-16le") not in data
     ):
         _fail(f"{member_name} does not contain the expected product version")
+
+
+def _is_managed_anycpu_pe(
+    data: bytes,
+    pe_offset: int,
+    machine: int,
+    optional_magic: int,
+) -> bool:
+    if machine != 0x14C or optional_magic != 0x10B:
+        return False
+    number_of_sections = struct.unpack_from("<H", data, pe_offset + 6)[0]
+    optional_size = struct.unpack_from("<H", data, pe_offset + 20)[0]
+    optional_offset = pe_offset + 24
+    directory_offset = optional_offset + 96 + (14 * 8)
+    optional_end = optional_offset + optional_size
+    if directory_offset + 8 > min(optional_end, len(data)):
+        return False
+    cli_rva, cli_size = struct.unpack_from("<II", data, directory_offset)
+    if cli_rva == 0 or cli_size < 20:
+        return False
+    section_offset = optional_end
+    for index in range(number_of_sections):
+        header = section_offset + (index * 40)
+        if header + 40 > len(data):
+            return False
+        virtual_size, virtual_address, raw_size, raw_offset = struct.unpack_from(
+            "<IIII",
+            data,
+            header + 8,
+        )
+        mapped_size = max(virtual_size, raw_size)
+        if virtual_address <= cli_rva < virtual_address + mapped_size:
+            cli_offset = raw_offset + (cli_rva - virtual_address)
+            if cli_offset + 20 > len(data):
+                return False
+            flags = struct.unpack_from("<I", data, cli_offset + 16)[0]
+            return bool(flags & 0x1) and not bool(flags & 0x2)
+    return False
 
 
 def _read_member(zf: zipfile.ZipFile, name: str) -> bytes:
@@ -619,6 +748,7 @@ def inspect_artifact(
     repository_root: Path | None = None,
     limits: ArtifactLimits = DEFAULT_ARTIFACT_LIMITS,
     require_checksum: bool = True,
+    profile: ArtifactProfile = CURRENT_PROFILE,
 ) -> ArtifactReport:
     archive = archive.resolve()
     if not archive.is_file():
@@ -630,6 +760,11 @@ def inspect_artifact(
     version = match.group("version")
     if expected_version is not None and version != expected_version:
         _fail(f"archive version {version!r} does not match {expected_version!r}")
+    contract = _artifact_contract(
+        profile,
+        version=version,
+        expected_version=expected_version,
+    )
     root = f"WorkbookLens-{version}-windows-x64"
     digest = _sha256(archive)
     if require_checksum:
@@ -683,7 +818,7 @@ def inspect_artifact(
                 if not info.is_dir():
                     _fail("archive root entry must be a directory")
             elif len(relative) == 1 and not info.is_dir():
-                if relative[0] not in ALLOWED_ROOT_FILES:
+                if relative[0] not in contract.allowed_root_files:
                     _fail(f"unexpected file at archive root: {relative[0]!r}")
                 files.add(relative[0])
             else:
@@ -691,11 +826,19 @@ def inspect_artifact(
                 if top not in ALLOWED_ROOT_DIRECTORIES:
                     _fail(f"unexpected directory at archive root: {top!r}")
                 root_directories.add(top)
-                if top == "_internal" and not info.is_dir():
+                if top == "_internal":
                     internal_name = "/".join(relative[1:]).casefold()
-                    internal_files.add(internal_name)
-                    if Path(relative[-1]).suffix.casefold() in {".dll", ".pyd"}:
-                        pe_members.append(info.filename)
+                    if any(
+                        internal_name == prefix or internal_name.startswith(f"{prefix}/")
+                        for prefix in contract.forbidden_internal_prefixes
+                    ):
+                        _fail(
+                            f"portable profile {profile!r} forbids runtime path {info.filename!r}"
+                        )
+                    if not info.is_dir():
+                        internal_files.add(internal_name)
+                        if Path(relative[-1]).suffix.casefold() in {".dll", ".pyd"}:
+                            pe_members.append(info.filename)
                 elif top == "LICENSES" and (
                     len(relative) >= 3 or (len(relative) == 2 and info.is_dir())
                 ):
@@ -707,7 +850,7 @@ def inspect_artifact(
             if total_uncompressed > limits.max_total_uncompressed:
                 _fail("portable archive exceeds the total uncompressed-size limit")
 
-        missing_files = ALLOWED_ROOT_FILES - files
+        missing_files = contract.allowed_root_files - files
         if missing_files:
             _fail(f"portable archive is missing root files: {sorted(missing_files)!r}")
         missing_directories = ALLOWED_ROOT_DIRECTORIES - root_directories
@@ -716,11 +859,18 @@ def inspect_artifact(
                 "portable archive is missing populated directories: "
                 f"{sorted(missing_directories)!r}"
             )
-        missing_internal = REQUIRED_INTERNAL_FILES - internal_files
+        missing_internal = contract.required_internal_files - internal_files
         if missing_internal:
             _fail(
                 f"portable archive is missing required runtime files: {sorted(missing_internal)!r}"
             )
+        for directory in sorted(license_distribution_dirs):
+            folded_directory = directory.casefold()
+            if any(
+                folded_directory.startswith(prefix)
+                for prefix in contract.forbidden_license_prefixes
+            ):
+                _fail(f"portable profile {profile!r} forbids license directory {directory!r}")
 
         try:
             corrupt_member = zf.testzip()
@@ -734,11 +884,23 @@ def inspect_artifact(
             _read_member(zf, exe_name),
             member_name=exe_name,
             version=version,
+            expected_subsystem=contract.workbooklens_subsystem,
         )
+        if contract.cli_subsystem is not None:
+            cli_exe_name = f"{root}/WorkbookLensCLI.exe"
+            _validate_pe_x64(
+                _read_member(zf, cli_exe_name),
+                member_name=cli_exe_name,
+                version=version,
+                expected_subsystem=contract.cli_subsystem,
+            )
         for member_name in pe_members:
+            internal_name = member_name.removeprefix(f"{root}/_internal/").casefold()
             _validate_pe_x64(
                 _read_member(zf, member_name),
                 member_name=member_name,
+                allow_managed_anycpu=True,
+                expected_architecture=PYWEBVIEW_LOADER_ARCHITECTURES.get(internal_name),
             )
 
         readme = _read_member(zf, f"{root}/README-PORTABLE.txt")
@@ -754,9 +916,16 @@ def inspect_artifact(
             notices_text = notices.decode("utf-8")
         except UnicodeDecodeError as exc:
             _fail(f"THIRD-PARTY-NOTICES.txt is not UTF-8: {exc}")
-        for required_notice in ("CPython", "PyInstaller"):
+        for required_notice in contract.required_notice_tokens:
             if required_notice not in notices_text:
                 _fail(f"THIRD-PARTY-NOTICES.txt does not mention {required_notice}")
+        folded_notices = notices_text.casefold()
+        for forbidden_notice in contract.forbidden_notice_tokens:
+            if forbidden_notice.casefold() in folded_notices:
+                _fail(
+                    "THIRD-PARTY-NOTICES.txt unexpectedly mentions "
+                    f"{forbidden_notice} for profile {profile!r}"
+                )
         for directory in sorted(license_distribution_dirs):
             if directory not in notices_text:
                 _fail(f"THIRD-PARTY-NOTICES.txt does not reference license directory {directory!r}")
@@ -838,11 +1007,13 @@ def extract_checked_artifact(
     *,
     expected_version: str,
     repository_root: Path | None = None,
+    profile: ArtifactProfile = CURRENT_PROFILE,
 ) -> Path:
     report = inspect_artifact(
         archive,
         expected_version=expected_version,
         repository_root=repository_root,
+        profile=profile,
     )
     destination = _prepare_extraction_destination(destination)
     destination_resolved = destination.resolve()

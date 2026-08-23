@@ -16,9 +16,13 @@ class ExitCode:
 
 
 class WorkbookLensError(Exception):
-    """Base class for expected failures safe to show to an end user."""
+    """Base expected failure; presentation layers must localize and sanitize it."""
 
     exit_code = ExitCode.INTERNAL_ERROR
+
+    def __init__(self, message: str = "", *, error_key: str | None = None) -> None:
+        super().__init__(message)
+        self.error_key = error_key
 
 
 class UsageError(WorkbookLensError):

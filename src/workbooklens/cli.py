@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 import typer
 from rich.console import Console
@@ -13,6 +13,14 @@ from workbooklens import __version__
 from workbooklens.demo import run_demo
 from workbooklens.diff import compare_workbooks, write_diff_report
 from workbooklens.exceptions import ExitCode, UsageError, WorkbookLensError
+from workbooklens.i18n import (
+    DEFAULT_LANGUAGE,
+    Language,
+    localize_assertion_message,
+    localize_exception,
+    normalize_language,
+    translate,
+)
 from workbooklens.models import SEVERITY_RANK, PatchRisk, Severity
 from workbooklens.ooxml.safety import PackageLimits
 from workbooklens.policy import apply_finding_policy, load_baseline, source_scope_for_path
@@ -31,6 +39,7 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 console = Console()
+_current_language: Language = DEFAULT_LANGUAGE
 
 
 def _version(value: bool) -> None:
@@ -48,18 +57,38 @@ def main(
         is_eager=True,
         help="Show the installed version and exit.",
     ),
+    language: str = typer.Option(
+        DEFAULT_LANGUAGE,
+        "--language",
+        "-l",
+        help="Output language: en or zh-CN.",
+    ),
 ) -> None:
     """Deterministic workbook quality tooling with no cloud or Excel dependency."""
 
+    global _current_language
+    _current_language = normalize_language(language)
 
-def _fail(exc: WorkbookLensError) -> NoReturn:
-    console.print(f"[bold red]Error:[/bold red] {exc}", style="red")
+
+def _fail(
+    exc: WorkbookLensError,
+    *,
+    operation: Literal["conversion", "scan", "repair", "download", "request"] = "request",
+) -> NoReturn:
+    public = localize_exception(exc, _current_language, operation=operation)
+    console.print(
+        f"[bold red]{translate('cli.error', _current_language)} {public.code}:[/bold red] "
+        f"{public.message} {public.suggestion}",
+        style="red",
+    )
     raise typer.Exit(exc.exit_code)
 
 
 def _internal_fail(exc: Exception) -> NoReturn:
+    public = localize_exception(exc, _current_language)
     console.print(
-        f"[bold red]Internal error:[/bold red] {type(exc).__name__}: {exc}",
+        f"[bold red]{translate('cli.internal_error', _current_language)} {public.code}:[/bold red] "
+        f"{public.message} {public.suggestion}",
         style="red",
     )
     raise typer.Exit(ExitCode.INTERNAL_ERROR)
@@ -115,7 +144,10 @@ def scan(
 
     try:
         if new_only and baseline is None:
-            raise UsageError("--new-only requires --baseline")
+            raise UsageError(
+                "--new-only requires --baseline",
+                error_key="request.baseline_required",
+            )
         configuration = _optional_test_config(config)
         result = scan_workbook(
             input_workbook,
@@ -136,15 +168,21 @@ def scan(
             source_scope=logical_source,
             new_only=new_only,
         )
-        paths = write_scan_report(result, out, policy=policy)
+        paths = write_scan_report(result, out, policy=policy, language=_current_language)
         console.print(
-            f"[green]Scanned[/green] {input_workbook}: {len(policy.active_findings)} active, "
-            f"{len(policy.suppressed_findings)} suppressed, {len(policy.new_findings)} new; "
-            f"report [link=file://{paths['html'].resolve()}]{paths['html']}[/link]"
+            f"[green]{translate('cli.scanned', _current_language)}[/green] {input_workbook}: "
+            + translate(
+                "cli.scan_summary",
+                _current_language,
+                active=len(policy.active_findings),
+                suppressed=len(policy.suppressed_findings),
+                new=len(policy.new_findings),
+                report=f"[link=file://{paths['html'].resolve()}]{paths['html']}[/link]",
+            )
         )
         if policy.expired_suppression_ids:
             console.print(
-                "[yellow]Expired suppressions ignored:[/yellow] "
+                f"[yellow]{translate('cli.expired_suppressions', _current_language)}[/yellow] "
                 + ", ".join(policy.expired_suppression_ids)
             )
         if fail_on is not None and any(
@@ -155,7 +193,7 @@ def scan(
     except typer.Exit:
         raise
     except WorkbookLensError as exc:
-        _fail(exc)
+        _fail(exc, operation="scan")
     except Exception as exc:
         _internal_fail(exc)
 
@@ -186,13 +224,20 @@ def plan(
             patch.risk == PatchRisk.LAYOUT_REVIEW for patch in patch_plan.patches
         )
         console.print(
-            f"[green]Planned[/green] {len(patch_plan.patches)} patches "
-            f"({safe_count} safe, {layout_review_count} layout review) → {out}"
+            f"[green]{translate('cli.planned', _current_language)}[/green] "
+            + translate(
+                "cli.plan_summary",
+                _current_language,
+                patches=len(patch_plan.patches),
+                safe=safe_count,
+                layout=layout_review_count,
+                output=out,
+            )
         )
     except typer.Exit:
         raise
     except WorkbookLensError as exc:
-        _fail(exc)
+        _fail(exc, operation="scan")
     except Exception as exc:
         _internal_fail(exc)
 
@@ -239,13 +284,19 @@ def apply(
         report_path = out.with_suffix(out.suffix + ".apply.json")
         write_json(report_path, result.model_dump(mode="json"))
         console.print(
-            f"[green]Applied and validated[/green] {len(result.applied_patch_ids)} patches → {out}"
+            f"[green]{translate('cli.applied', _current_language)}[/green] "
+            + translate(
+                "cli.apply_summary",
+                _current_language,
+                patches=len(result.applied_patch_ids),
+                output=out,
+            )
         )
-        console.print(f"Apply report: {report_path}")
+        console.print(f"{translate('cli.apply_report', _current_language)}: {report_path}")
     except typer.Exit:
         raise
     except WorkbookLensError as exc:
-        _fail(exc)
+        _fail(exc, operation="repair")
     except Exception as exc:
         _internal_fail(exc)
 
@@ -262,15 +313,21 @@ def diff(
         if out.suffix.lower() != ".html":
             raise UsageError("--out for diff must end in .html")
         result = compare_workbooks(before, after)
-        paths = write_diff_report(result, out)
+        paths = write_diff_report(result, out, language=_current_language)
         console.print(
-            f"[green]Compared[/green] workbooks: {len(result.cell_changes)} cell and "
-            f"{len(result.structural_changes)} structural changes → {paths['html']}"
+            f"[green]{translate('cli.compared', _current_language)}[/green] "
+            + translate(
+                "cli.diff_summary",
+                _current_language,
+                cells=len(result.cell_changes),
+                structures=len(result.structural_changes),
+                output=paths["html"],
+            )
         )
     except typer.Exit:
         raise
     except WorkbookLensError as exc:
-        _fail(exc)
+        _fail(exc, operation="scan")
     except Exception as exc:
         _internal_fail(exc)
 
@@ -287,25 +344,34 @@ def test_workbook(
     try:
         configuration = load_test_config(config)
         run = evaluate_workbook_tests(input_workbook, configuration, _limits(max_file_mb))
-        table = Table(title="Workbook assertions")
-        table.add_column("Result")
-        table.add_column("Assertion")
-        table.add_column("Message")
+        table = Table(title=translate("cli.assertions_title", _current_language))
+        table.add_column(translate("cli.result", _current_language))
+        table.add_column(translate("cli.assertion", _current_language))
+        table.add_column(translate("cli.message", _current_language))
         for result in run.results:
             table.add_row(
-                "[green]PASS[/green]" if result.passed else "[red]FAIL[/red]",
+                (
+                    f"[green]{translate('cli.pass', _current_language)}[/green]"
+                    if result.passed
+                    else f"[red]{translate('cli.fail', _current_language)}[/red]"
+                ),
                 result.assertion_id,
-                result.message,
+                localize_assertion_message(result.message, _current_language),
             )
         console.print(table)
         if run.policy.suppressed_findings:
             console.print(
-                f"[yellow]{len(run.policy.suppressed_findings)} findings suppressed by "
-                "documented waivers.[/yellow]"
+                "[yellow]"
+                + translate(
+                    "cli.suppressed_summary",
+                    _current_language,
+                    count=len(run.policy.suppressed_findings),
+                )
+                + "[/yellow]"
             )
         if run.policy.expired_suppression_ids:
             console.print(
-                "[yellow]Expired suppressions ignored:[/yellow] "
+                f"[yellow]{translate('cli.expired_suppressions', _current_language)}[/yellow] "
                 + ", ".join(run.policy.expired_suppression_ids)
             )
         if out is not None:
@@ -328,7 +394,7 @@ def test_workbook(
     except typer.Exit:
         raise
     except WorkbookLensError as exc:
-        _fail(exc)
+        _fail(exc, operation="scan")
     except Exception as exc:
         _internal_fail(exc)
 
@@ -360,6 +426,7 @@ def serve(
         run_local_ui(
             port=port,
             max_file_bytes=max_file_mb * 1024 * 1024,
+            language=_current_language,
             open_browser=open_browser,
             fallback_port=fallback_port,
             status=console.print,
@@ -367,7 +434,7 @@ def serve(
     except typer.Exit:
         raise
     except WorkbookLensError as exc:
-        _fail(exc)
+        _fail(exc, operation="request")
     except Exception as exc:
         _internal_fail(exc)
 
@@ -380,15 +447,17 @@ def demo(
 
     try:
         result = run_demo(out)
-        console.print(f"[green]Demo complete[/green] in {result.directory}")
-        console.print(f"Before: {result.before_workbook}")
-        console.print(f"After:  {result.after_workbook}")
-        console.print(f"Plan:   {result.repair_plan}")
-        console.print(f"Diff:   {result.diff_html}")
+        console.print(
+            f"[green]{translate('cli.demo_complete', _current_language)}[/green] {result.directory}"
+        )
+        console.print(f"{translate('cli.before', _current_language)}: {result.before_workbook}")
+        console.print(f"{translate('cli.after', _current_language)}:  {result.after_workbook}")
+        console.print(f"{translate('cli.plan', _current_language)}:   {result.repair_plan}")
+        console.print(f"{translate('cli.diff', _current_language)}:   {result.diff_html}")
     except typer.Exit:
         raise
     except WorkbookLensError as exc:
-        _fail(exc)
+        _fail(exc, operation="request")
     except Exception as exc:
         _internal_fail(exc)
 

@@ -135,6 +135,35 @@ def _run_cli(
     return completed.stdout
 
 
+def _run_desktop_smoke(
+    executable: Path,
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float,
+) -> None:
+    command = [str(executable), "--workbooklens-smoke-test"]
+    _log_command(command)
+    try:
+        completed = subprocess.run(  # noqa: S603 - executable is the validated artifact.
+            command,
+            cwd=cwd,
+            env=env,
+            check=False,
+            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PortableSmokeError("native desktop smoke timed out") from exc
+    except OSError as exc:
+        raise PortableSmokeError(f"cannot run native desktop smoke: {exc}") from exc
+    if completed.returncode != 0:
+        raise PortableSmokeError(
+            f"native desktop smoke failed with exit code {completed.returncode}"
+        )
+
+
 def contains_text_ignoring_line_wraps(output: str, expected: str) -> bool:
     """Match text that Rich may wrap across redirected-output lines."""
 
@@ -652,8 +681,12 @@ def smoke_portable(
             expected_version=expected_version,
             repository_root=repository_root,
         )
-        executable = root / "WorkbookLens.exe"
+        desktop_executable = root / "WorkbookLens.exe"
+        executable = root / "WorkbookLensCLI.exe"
         env = sanitized_windows_environment()
+        local_app_data = temporary / "local app data"
+        local_app_data.mkdir()
+        env["LOCALAPPDATA"] = str(local_app_data)
         _assert_no_python_on_path(env, root)
         installation_snapshot = _directory_snapshot(root)
 
@@ -674,7 +707,7 @@ def smoke_portable(
             env=env,
             timeout=timeout,
         )
-        expected_demo_message = f"Demo complete in {demo}"
+        expected_demo_message = f"Demo complete {demo}"
         if not contains_text_ignoring_line_wraps(demo_output, expected_demo_message):
             raise PortableSmokeError(
                 f"demo output did not preserve its non-ASCII path: {demo_output!r}"
@@ -754,6 +787,12 @@ def smoke_portable(
             cwd=root,
             env=env,
             timeout=timeout,
+        )
+        _run_desktop_smoke(
+            desktop_executable,
+            cwd=root,
+            env=env,
+            timeout=max(timeout, 30.0),
         )
         if _directory_snapshot(root) != installation_snapshot:
             raise PortableSmokeError(

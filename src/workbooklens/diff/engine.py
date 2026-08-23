@@ -8,6 +8,13 @@ from typing import Any
 from jinja2 import Environment, PackageLoader, select_autoescape
 
 from workbooklens.formulas import UnsupportedFormulaError, normalize_formula
+from workbooklens.i18n import (
+    Language,
+    change_type_label,
+    normalize_language,
+    severity_label,
+    translate,
+)
 from workbooklens.models import (
     CellChange,
     CellSnapshot,
@@ -444,7 +451,12 @@ def compare_workbooks(before_path: Path, after_path: Path) -> WorkbookDiff:
     return compare_snapshots(create_snapshot(before_path), create_snapshot(after_path))
 
 
-def write_diff_report(diff: WorkbookDiff, output_html: Path) -> dict[str, Path]:
+def write_diff_report(
+    diff: WorkbookDiff,
+    output_html: Path,
+    *,
+    language: Language | str | None = None,
+) -> dict[str, Path]:
     """Write JSON beside a self-contained, filterable HTML semantic diff."""
 
     if output_html.suffix.lower() != ".html":
@@ -456,6 +468,13 @@ def write_diff_report(diff: WorkbookDiff, output_html: Path) -> dict[str, Path]:
         loader=PackageLoader("workbooklens.diff", "templates"),
         autoescape=select_autoescape(("html", "xml")),
     )
-    html = environment.get_template("diff.html.j2").render(diff=diff)
+    display_language = normalize_language(language)
+    html = environment.get_template("diff.html.j2").render(
+        diff=diff,
+        language=display_language,
+        t=lambda key, **params: translate(key, display_language, **params),
+        severity_label=lambda severity: severity_label(severity, display_language),
+        change_type_label=lambda change_type: change_type_label(change_type, display_language),
+    )
     atomic_write_bytes(output_html, html.encode("utf-8"))
     return {"html": output_html, "json": json_path}
