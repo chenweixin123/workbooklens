@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -31,6 +32,10 @@ else:
 
 class PortableSmokeError(RuntimeError):
     pass
+
+
+_RETRYABLE_WINDOWS_DELETE_ERRORS = frozenset({5, 32, 33, 145})
+_RETRYABLE_DELETE_ERRNOS = frozenset({errno.EACCES, errno.EBUSY, errno.ENOTEMPTY})
 
 
 def configure_utf8_stdio(
@@ -393,6 +398,38 @@ def _directory_snapshot(root: Path) -> dict[str, tuple[int, str]]:
             ) from exc
         snapshot[path.relative_to(root).as_posix()] = (size, digest.hexdigest())
     return snapshot
+
+
+def _is_retryable_temporary_delete_error(error: OSError) -> bool:
+    winerror = getattr(error, "winerror", None)
+    if winerror is not None:
+        return winerror in _RETRYABLE_WINDOWS_DELETE_ERRORS
+    return error.errno in _RETRYABLE_DELETE_ERRNOS
+
+
+def _remove_temporary_tree(
+    path: Path,
+    *,
+    timeout: float = 15.0,
+    retry_delay: float = 0.25,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as exc:
+            if isinstance(exc, FileNotFoundError):
+                if not path.exists():
+                    return
+            elif not _is_retryable_temporary_delete_error(exc):
+                raise
+            if time.monotonic() >= deadline:
+                raise PortableSmokeError(
+                    f"portable smoke workspace could not be removed within {timeout:g}s: "
+                    f"{path}: {exc}"
+                ) from exc
+            time.sleep(retry_delay)
 
 
 def _stop_server(
@@ -804,7 +841,7 @@ def smoke_portable(
         return None
     finally:
         if not keep_temp and temporary.exists():
-            shutil.rmtree(temporary)
+            _remove_temporary_tree(temporary)
 
 
 def _build_parser() -> argparse.ArgumentParser:
