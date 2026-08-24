@@ -71,16 +71,16 @@
   runs without Python on `PATH`, and uninstalls without residual test state.
 - [ ] When the immediately previous release has Windows installer and portable artifacts, run
   `scripts/smoke_installer_windows.py` with both `--previous-installer` and
-  `--previous-portable-zip` and record the exact previous artifact hashes. Version 2.2.1 is the
-  first Windows-installer release, so the published 2.2.0 wheel/sdist-only assets cannot supply this
-  baseline; do not substitute an unpinned or same-version download.
+  `--previous-portable-zip` and record the exact previous artifact hashes. For 2.4.0, use the pinned
+  2.3.0 setup executable and portable ZIP; do not substitute an unpinned, same-version, or newer
+  download. The script uses the legacy portable profile only when the baseline is exactly 2.2.1.
 - [ ] README Bash and PowerShell commands match a clean checkout.
 - [ ] Representative layout repairs are opened in the target spreadsheet application; text is not
   clipped, identifiers are exact, the initial viewport is useful, and printer/page layout is reviewed.
 
 ## Release candidate and publication
 
-- [ ] Push v2.3.0; the release-candidate workflow validates the tag, builds distributions,
+- [ ] Push v2.4.0; the release-candidate workflow validates the tag, builds distributions,
   generates SHA256SUMS, and uploads workflow artifacts.
 - [ ] Inspect the downloaded artifacts before external publication.
 - [ ] Record whether the release is GitHub-only or also publishes to PyPI.
@@ -90,4 +90,4 @@
   chenweixin123/workbooklens, then publish only from the validated tag using OIDC; do not add a
   long-lived PyPI token.
 - [ ] If publishing to PyPI, verify the project page, uvx installation, and pipx installation for
-  version 2.3.0.
+  version 2.4.0.

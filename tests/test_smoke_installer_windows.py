@@ -10,9 +10,19 @@ pytest.importorskip("winreg")
 from scripts import smoke_installer_windows as installer_smoke
 
 
-def test_previous_v2_2_1_portable_uses_legacy_profile_for_inspection_and_extraction(
+@pytest.mark.parametrize(
+    ("current_version", "previous_version", "expected_profile"),
+    [
+        ("2.3.0", "2.2.1", installer_smoke.LEGACY_V2_2_1_PROFILE),
+        ("2.4.0", "2.3.0", installer_smoke.CURRENT_PROFILE),
+    ],
+)
+def test_previous_portable_uses_version_appropriate_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    current_version: str,
+    previous_version: str,
+    expected_profile: str,
 ) -> None:
     installer_calls: list[tuple[Path, str | None]] = []
     inspect_calls: list[dict[str, object]] = []
@@ -27,7 +37,8 @@ def test_previous_v2_2_1_portable_uses_legacy_profile_for_inspection_and_extract
         expected_version: str | None = None,
     ) -> SimpleNamespace:
         installer_calls.append((path, expected_version))
-        return SimpleNamespace(version=expected_version or "unexpected")
+        version = current_version if path == current_installer else previous_version
+        return SimpleNamespace(version=version)
 
     def fake_inspect_artifact(_path: Path, **kwargs: object) -> None:
         inspect_calls.append(kwargs)
@@ -52,28 +63,30 @@ def test_previous_v2_2_1_portable_uses_legacy_profile_for_inspection_and_extract
     monkeypatch.setattr(installer_smoke, "_default_install_dir", lambda: tmp_path / "install")
     monkeypatch.setattr(installer_smoke, "_uninstall_entries", lambda: [])
 
-    current_installer = tmp_path / "WorkbookLens-2.3.0-windows-x64-setup.exe"
-    previous_installer = tmp_path / "WorkbookLens-2.2.1-windows-x64-setup.exe"
+    current_installer = tmp_path / f"WorkbookLens-{current_version}-windows-x64-setup.exe"
+    previous_installer = tmp_path / f"WorkbookLens-{previous_version}-windows-x64-setup.exe"
     with pytest.raises(StopAfterPreviousExtraction):
         installer_smoke.smoke_installer(
             current_installer,
-            tmp_path / "WorkbookLens-2.3.0-windows-x64-portable.zip",
-            expected_version="2.3.0",
+            tmp_path / f"WorkbookLens-{current_version}-windows-x64-portable.zip",
+            expected_version=current_version,
             repository_root=tmp_path,
             previous_installer=previous_installer,
-            previous_portable_zip=(tmp_path / "WorkbookLens-2.2.1-windows-x64-portable.zip"),
+            previous_portable_zip=(
+                tmp_path / f"WorkbookLens-{previous_version}-windows-x64-portable.zip"
+            ),
         )
 
     assert installer_calls == [
-        (current_installer, "2.3.0"),
-        (previous_installer, installer_smoke.LEGACY_V2_2_1_VERSION),
+        (current_installer, current_version),
+        (previous_installer, None),
     ]
     assert "profile" not in inspect_calls[0]
-    assert inspect_calls[1]["expected_version"] == installer_smoke.LEGACY_V2_2_1_VERSION
-    assert inspect_calls[1]["profile"] == installer_smoke.LEGACY_V2_2_1_PROFILE
+    assert inspect_calls[1]["expected_version"] == previous_version
+    assert inspect_calls[1]["profile"] == expected_profile
     assert "profile" not in extract_calls[0]
-    assert extract_calls[1]["expected_version"] == installer_smoke.LEGACY_V2_2_1_VERSION
-    assert extract_calls[1]["profile"] == installer_smoke.LEGACY_V2_2_1_PROFILE
+    assert extract_calls[1]["expected_version"] == previous_version
+    assert extract_calls[1]["profile"] == expected_profile
 
 
 def test_inno_cleanup_requires_fixed_path_marker_and_reparse_checks() -> None:

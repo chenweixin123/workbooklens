@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.27,<2"]
+requires = ["hatchling>=1.27,<1.32"]
 build-backend = "hatchling.build"
 
 [project]
 name = "workbooklens"
-version = "2.3.0"
+version = "2.4.0"
 description = "Local-first linting, testing, semantic diffing, and safe repair for Excel workbooks"
 readme = "README.md"
 requires-python = ">=3.11"

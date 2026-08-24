@@ -6,11 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from workbooklens.exceptions import UsageError
 from workbooklens.models import SEVERITY_RANK, Finding, PatchKind, PatchOperation, WorkbookSnapshot
-from workbooklens.ooxml.formula_ranges import find_unsupported_formula_ranges
+from workbooklens.ooxml.formula_ranges import inspect_formula_metadata
 from workbooklens.ooxml.safety import PackageInspection, PackageLimits, inspect_package
 from workbooklens.regions import infer_data_regions, infer_formula_bands
 from workbooklens.rules import RuleContext, RuleRegistry, default_registry
+from workbooklens.rules.profile_quality import ProfileConfigurationError
 from workbooklens.snapshot import load_for_analysis, snapshot_from_workbook
 from workbooklens.utils import sha256_file
 
@@ -106,7 +108,7 @@ def scan_workbook(
         formula_bands = {
             worksheet.title: infer_formula_bands(worksheet) for worksheet in workbook.worksheets
         }
-        unsupported_formula_ranges = find_unsupported_formula_ranges(
+        formula_metadata = inspect_formula_metadata(
             inspection.path,
             limits,
         )
@@ -117,13 +119,17 @@ def scan_workbook(
             config=config or {},
             data_regions=data_regions,
             formula_bands=formula_bands,
-            unsupported_formula_ranges=unsupported_formula_ranges,
+            unsupported_formula_ranges=formula_metadata.unsupported_ranges,
+            cached_formula_errors=formula_metadata.cached_errors,
         )
         finding_by_id: dict[str, Finding] = {}
         patch_by_id: dict[str, PatchOperation] = {}
         active_registry = registry or default_registry()
         for rule in active_registry.values():
-            rule_result = rule.run(context)
+            try:
+                rule_result = rule.run(context)
+            except ProfileConfigurationError as exc:
+                raise UsageError(f"Workbook Profile configuration is invalid: {exc}") from exc
             for finding in rule_result.findings:
                 if finding.id in finding_by_id:
                     raise RuntimeError(

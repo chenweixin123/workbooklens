@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 import pytest
+from lxml import etree
 from openpyxl import Workbook
 from openpyxl.formula.tokenizer import TokenizerError
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
@@ -23,7 +25,34 @@ def demo_scan(tmp_path_factory: pytest.TempPathFactory) -> ScanResult:
     return scan_workbook(path, config=config)
 
 
-def test_demo_exercises_fifteen_rules_and_generated_patch_kinds(demo_scan: ScanResult) -> None:
+def _set_formula_cached_error(path: Path, coordinate: str, error: str) -> None:
+    temporary = path.with_name(f"{path.stem}-cached-error.xlsx")
+    with zipfile.ZipFile(path, "r") as source:
+        infos = source.infolist()
+        contents = {info.filename: source.read(info.filename) for info in infos}
+    part = "xl/worksheets/sheet1.xml"
+    root = etree.fromstring(contents[part])
+    target = next(
+        cell
+        for cell in root.iter()
+        if etree.QName(cell).localname == "c" and cell.get("r") == coordinate
+    )
+    target.set("t", "e")
+    value = next(
+        (child for child in target if etree.QName(child).localname == "v"),
+        None,
+    )
+    if value is None:
+        value = etree.SubElement(target, f"{{{etree.QName(target).namespace}}}v")
+    value.text = error
+    contents[part] = etree.tostring(root, xml_declaration=False, encoding="utf-8")
+    with zipfile.ZipFile(temporary, "w") as output:
+        for info in infos:
+            output.writestr(info, contents[info.filename])
+    temporary.replace(path)
+
+
+def test_demo_exercises_expected_rules_and_generated_patch_kinds(demo_scan: ScanResult) -> None:
     rule_ids = {finding.rule_id for finding in demo_scan.findings}
     assert rule_ids == {
         "WL001_BROKEN_REFERENCE",
@@ -41,6 +70,9 @@ def test_demo_exercises_fifteen_rules_and_generated_patch_kinds(demo_scan: ScanR
         "WL014_MERGED_CELL_IN_DATA_REGION",
         "WL015_INCONSISTENT_DATA_VALIDATION",
         "WL016_TEXT_DISPLAY_RISK",
+        "WL041_NUMBER_FORMAT_ROLE_CONFLICT",
+        "WL042_AGGREGATE_RANGE_COVERAGE",
+        "WL046_FORMULA_FORMAT_ROLE_MISMATCH",
     }
     assert {patch.kind for patch in demo_scan.patches} == {
         PatchKind.SET_FORMULA,
@@ -81,6 +113,8 @@ def test_formula_pattern_outlier_rule_and_safe_proposal(tmp_path: Path) -> None:
     ]
     assert len(findings) == 1
     assert findings[0].location == "K2"
+    assert findings[0].evidence.expected is not None
+    assert "aggregate" not in findings[0].explanation.lower()
     patches = [patch for patch in scan.patches if patch.cell == "K2"]
     assert len(patches) == 1
     assert patches[0].kind == PatchKind.SET_FORMULA
@@ -150,6 +184,553 @@ def test_multiple_isolated_formula_outliers_are_findings_only(tmp_path: Path) ->
     }
     assert findings == {"K2", "Q2"}
     assert not any(patch.cell in findings for patch in scan.patches)
+
+
+def test_data_region_formula_consensus_handles_multiple_anomaly_types(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Record", "Calculated", "Input"])
+    for row in range(2, 102):
+        worksheet.append([f"R{row}", f"=C{row}*2", row])
+    worksheet["B20"] = 999
+    worksheet["B30"] = "=C30*3"
+    worksheet["B40"] = 888
+    worksheet["B50"] = "'=C50*2"
+    worksheet["B60"] = None
+    worksheet["B70"] = "=C70+7"
+    worksheet["B80"] = None
+    path = tmp_path / "multi-anomaly-column.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    locations = {
+        rule_id: {finding.location for finding in scan.findings if finding.rule_id == rule_id}
+        for rule_id in {
+            "WL002_FORMULA_PATTERN_OUTLIER",
+            "WL003_BLANK_IN_FORMULA_BAND",
+            "WL004_HARDCODED_VALUE_IN_FORMULA_BAND",
+            "WL028_TEXT_FORMULA",
+        }
+    }
+    assert locations["WL002_FORMULA_PATTERN_OUTLIER"] == {"B30", "B70"}
+    assert locations["WL003_BLANK_IN_FORMULA_BAND"] == {"B60", "B80"}
+    assert locations["WL004_HARDCODED_VALUE_IN_FORMULA_BAND"] == {"B20", "B40"}
+    assert locations["WL028_TEXT_FORMULA"] == {"B50"}
+
+    anomaly_cells = {"B20", "B30", "B40", "B50", "B60", "B70", "B80"}
+    formula_patches = {
+        patch.cell
+        for patch in scan.patches
+        if patch.kind in {PatchKind.SET_FORMULA, PatchKind.CREATE_FORMULA}
+    }
+    assert not anomaly_cells & formula_patches
+
+
+def test_two_anomalies_in_a_ninety_eight_percent_consensus_are_findings_only(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Record", "Calculated", "Input"])
+    for row in range(2, 102):
+        worksheet.append([f"R{row}", f"=C{row}*2", row])
+    worksheet["B20"] = 999
+    worksheet["B40"] = None
+    path = tmp_path / "two-anomalies-strong-consensus.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL004_HARDCODED_VALUE_IN_FORMULA_BAND" and finding.location == "B20"
+        for finding in scan.findings
+    )
+    assert any(
+        finding.rule_id == "WL003_BLANK_IN_FORMULA_BAND" and finding.location == "B40"
+        for finding in scan.findings
+    )
+    assert not any(
+        patch.cell in {"B20", "B40"}
+        and patch.kind in {PatchKind.SET_FORMULA, PatchKind.CREATE_FORMULA}
+        for patch in scan.patches
+    )
+
+
+def test_single_data_region_formula_anomaly_keeps_safe_patch(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Record", "Calculated", "Input"])
+    for row in range(2, 52):
+        worksheet.append([f"R{row}", f"=C{row}*2", row])
+    worksheet["B20"] = 999
+    path = tmp_path / "single-data-region-anomaly.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    patches = [
+        patch
+        for patch in scan.patches
+        if patch.cell == "B20" and patch.kind == PatchKind.SET_FORMULA
+    ]
+    assert len(patches) == 1
+    assert patches[0].after == "=C20*2"
+
+
+def test_interior_aggregate_is_reported_but_real_total_is_not(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Record", "Quantity", "Price", "Amount"])
+    for row in range(2, 22):
+        worksheet.append([f"R{row}", row, row + 0.5, f"=B{row}*C{row}"])
+    worksheet["D10"] = "=SUM(B10:C10)"
+    worksheet.append(["Total", None, None, "=SUM(D2:D21)"])
+    path = tmp_path / "interior-aggregate.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert any(
+        finding.rule_id == "WL002_FORMULA_PATTERN_OUTLIER" and finding.location == "D10"
+        for finding in scan.findings
+    )
+    assert not any(
+        finding.rule_id == "WL002_FORMULA_PATTERN_OUTLIER" and finding.location == "D22"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell in {"D10", "D22"} for patch in scan.patches)
+
+
+def test_truncated_aggregate_outlier_requests_manual_range_and_label_review(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Record", "Quantity", "Price", "Amount"])
+    for row in range(2, 22):
+        worksheet.append([f"R{row}", row, row + 0.5, f"=B{row}*C{row}"])
+    worksheet.append(["TOTAL?", None, None, "=SUM(D2:D18)"])
+    path = tmp_path / "truncated-aggregate.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    finding = next(
+        finding
+        for finding in scan.findings
+        if finding.rule_id == "WL002_FORMULA_PATTERN_OUTLIER" and finding.location == "D22"
+    )
+    assert finding.evidence.expected == {
+        "review": "aggregate_range_and_label",
+        "detail_formula_replacement_inferred": False,
+    }
+    assert "aggregate formula" in finding.explanation.lower()
+    assert "aggregate range" in finding.expected.lower()
+    assert "detail rows" in finding.suggested_action.lower()
+    assert finding.patch_ids == []
+    assert not any(patch.cell == "D22" for patch in scan.patches)
+
+
+def test_provable_formula_errors_are_reported_without_evaluating_branches(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Errors"
+    worksheet["A1"] = "=NA()"
+    worksheet["A2"] = "=1/0"
+    worksheet["A3"] = "=1/-0.0"
+    worksheet["A4"] = '=VALUE("abc")'
+    worksheet["A5"] = "=#DIV/0!"
+    worksheet["B1"] = "=IFERROR(1/0,0)"
+    worksheet["B2"] = "=IF(FALSE,1/0,1)"
+    worksheet["B3"] = '=IF(TRUE,1,VALUE("abc"))'
+    worksheet["B4"] = "=1/C1"
+    worksheet["B5"] = '=VALUE("123")'
+    worksheet["B6"] = "=UNKNOWN(1/0)"
+    worksheet["B7"] = '="#N/A"'
+    worksheet["B8"] = "=IFERROR(NA(),0)"
+    path = tmp_path / "provable-formula-errors.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    findings = [
+        finding for finding in scan.findings if finding.rule_id == "WL034_PROVABLE_FORMULA_ERROR"
+    ]
+    assert {finding.location for finding in findings} == {"A1", "A2", "A3", "A4", "A5"}
+    assert {finding.evidence.details["error"] for finding in findings} == {
+        "#N/A",
+        "#DIV/0!",
+        "#VALUE!",
+    }
+    assert not any(patch.cell in {"A1", "A2", "A3", "A4", "A5"} for patch in scan.patches)
+
+
+def test_cached_formula_error_is_reported_as_stale_evidence_only(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet["A1"] = "=A2+1"
+    worksheet["A2"] = 1
+    path = tmp_path / "cached-formula-error.xlsx"
+    workbook.save(path)
+    workbook.close()
+    _set_formula_cached_error(path, "A1", "#NUM!")
+
+    scan = scan_workbook(path)
+    findings = [
+        finding for finding in scan.findings if finding.rule_id == "WL034_PROVABLE_FORMULA_ERROR"
+    ]
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.location == "A1"
+    assert finding.evidence.details == {
+        "error": "#NUM!",
+        "proof": "cached_formula_error",
+        "cached_error": "#NUM!",
+    }
+    assert float(finding.confidence) == 0.9
+    assert "may be stale" in finding.explanation
+    assert not any(patch.cell == "A1" for patch in scan.patches)
+
+
+def test_multiple_hardcodes_with_override_labels_or_styles_are_findings_only(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Record", "Calculated", "Input"])
+    for row in range(2, 102):
+        worksheet.append([f"R{row}", f"=C{row}*2", row])
+    worksheet["B20"] = 999
+    worksheet["A20"] = "Exception row"
+    worksheet["B40"] = 888
+    worksheet["C40"].fill = PatternFill("solid", fgColor="FFFF00")
+    path = tmp_path / "multiple-intentional-overrides.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    locations = {
+        finding.location
+        for finding in scan.findings
+        if finding.rule_id == "WL004_HARDCODED_VALUE_IN_FORMULA_BAND"
+    }
+    assert {"B20", "B40"} <= locations
+    assert not any(patch.cell in {"B20", "B40"} for patch in scan.patches)
+
+
+@pytest.mark.parametrize("hidden_scope", ["rows", "column", "sheet"])
+def test_multiple_hardcodes_in_hidden_targets_are_findings_only(
+    tmp_path: Path,
+    hidden_scope: str,
+) -> None:
+    workbook = Workbook()
+    cover = workbook.active
+    assert cover is not None
+    cover.title = "Cover"
+    worksheet = workbook.create_sheet("Data")
+    worksheet.append(["Record", "Calculated", "Input"])
+    for row in range(2, 52):
+        worksheet.append([f"R{row}", f"=C{row}*2", row])
+    worksheet["B20"] = 999
+    worksheet["B40"] = 888
+    if hidden_scope == "rows":
+        worksheet.row_dimensions[20].hidden = True
+        worksheet.row_dimensions[40].hidden = True
+    elif hidden_scope == "column":
+        worksheet.column_dimensions["B"].hidden = True
+    else:
+        worksheet.sheet_state = "hidden"
+    path = tmp_path / f"multiple-hidden-{hidden_scope}.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    locations = {
+        finding.location
+        for finding in scan.findings
+        if finding.rule_id == "WL004_HARDCODED_VALUE_IN_FORMULA_BAND" and finding.sheet == "Data"
+    }
+    assert {"B20", "B40"} <= locations
+    assert not any(patch.sheet == "Data" and patch.cell in {"B20", "B40"} for patch in scan.patches)
+
+
+def test_large_formula_column_reports_several_adjacent_outliers_below_eighty_percent(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Record", "Calculated", "Input"])
+    for row in range(2, 19):
+        worksheet.append([f"R{row}", f"=C{row}*2", row])
+    worksheet["B10"] = "=C9*2"
+    worksheet["B11"] = "=C11*3"
+    worksheet["B12"] = "=NA()"
+    worksheet["B13"] = "=B13+1"
+    path = tmp_path / "several-adjacent-formula-outliers.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    locations = {
+        finding.location
+        for finding in scan.findings
+        if finding.rule_id == "WL002_FORMULA_PATTERN_OUTLIER"
+    }
+    assert locations == {"B10", "B11", "B12", "B13"}
+    assert not any(patch.cell in locations for patch in scan.patches)
+
+
+def test_blank_separator_before_total_is_never_auto_filled(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Sales"
+    worksheet.append(["Record", "Calculated"])
+    for row in range(2, 11):
+        worksheet.append([f"R{row}", f'=A{row}&"-ok"'])
+    worksheet["A12"] = "Total"
+    worksheet["B12"] = "=COUNTA(B2:B10)"
+    path = tmp_path / "formula-separator-total.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert not any(
+        finding.rule_id == "WL003_BLANK_IN_FORMULA_BAND" and finding.location == "B11"
+        for finding in scan.findings
+    )
+    assert not any(patch.cell == "B11" for patch in scan.patches)
+
+
+def test_static_formula_cycles_are_reported_as_sccs_without_patches(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Cycle"
+    worksheet["A1"] = "=A1+1"
+    worksheet["B1"] = "=C1+1"
+    worksheet["C1"] = "=B1+1"
+    worksheet["D1"] = "='Other Sheet'!A1"
+    worksheet["E1"] = "=1+1"
+    other = workbook.create_sheet("Other Sheet")
+    other["A1"] = "='Cycle'!D1"
+    path = tmp_path / "formula-cycles.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    findings = [
+        finding for finding in scan.findings if finding.rule_id == "WL029_CIRCULAR_REFERENCE"
+    ]
+    assert len(findings) == 3
+    assert sorted(finding.evidence.details["component_size"] for finding in findings) == [1, 2, 2]
+    peer_sets = {frozenset(finding.evidence.peers) for finding in findings}
+    assert frozenset({"Cycle!A1"}) in peer_sets
+    assert frozenset({"Cycle!B1", "Cycle!C1"}) in peer_sets
+    assert frozenset({"Cycle!D1", "Other Sheet!A1"}) in peer_sets
+    circular_cells = {
+        peer.rsplit("!", maxsplit=1)[-1] for finding in findings for peer in finding.evidence.peers
+    }
+    assert not any(patch.cell in circular_cells for patch in scan.patches)
+
+
+def test_circular_dependency_graph_is_computed_once_per_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Record", "Calculated", "Input"])
+    for row in range(2, 12):
+        worksheet.append([f"R{row}", f"=C{row}*2", row])
+    worksheet["B6"] = "=B6+1"
+    path = tmp_path / "dependency-cache.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    calls = 0
+    original = builtin_rules._static_formula_dependency_graph
+
+    def counted(workbook: Workbook) -> dict[tuple[str, str], set[tuple[str, str]]]:
+        nonlocal calls
+        calls += 1
+        return original(workbook)
+
+    monkeypatch.setattr(builtin_rules, "_static_formula_dependency_graph", counted)
+    scan = scan_workbook(path)
+
+    assert calls == 1
+    assert any(
+        finding.rule_id == "WL029_CIRCULAR_REFERENCE" and finding.location == "B6"
+        for finding in scan.findings
+    )
+
+
+def test_large_formula_ranges_do_not_expand_and_still_detect_self_reference(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Large"
+    worksheet["A1"] = "=SUM(A:A)"
+    for row in range(1, 40):
+        worksheet.cell(row, 2, f"=SUM(A:A)+{row}")
+    path = tmp_path / "large-formula-ranges.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    findings = [
+        finding for finding in scan.findings if finding.rule_id == "WL029_CIRCULAR_REFERENCE"
+    ]
+    assert len(findings) == 1
+    assert findings[0].location == "A1"
+    assert findings[0].evidence.peers == ["Large!A1"]
+
+
+def test_large_formula_range_links_real_formula_dependencies_without_expansion(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Cycle"
+    worksheet["A1"] = "=SUM(B:B)"
+    worksheet["B1"] = "=A1"
+    path = tmp_path / "large-range-formula-cycle.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    findings = [
+        finding
+        for finding in scan_workbook(path).findings
+        if finding.rule_id == "WL029_CIRCULAR_REFERENCE"
+    ]
+
+    assert len(findings) == 1
+    assert findings[0].evidence.details["component_size"] == 2
+    assert findings[0].evidence.peers == ["Cycle!A1", "Cycle!B1"]
+
+
+def test_circular_dependencies_resolve_sheet_names_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    data = workbook.active
+    assert data is not None
+    data.title = "Data"
+    summary = workbook.create_sheet("Summary")
+    data["A1"] = "=summary!A1"
+    summary["A1"] = "=DATA!A1"
+    path = tmp_path / "case-insensitive-formula-cycle.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    findings = [
+        finding
+        for finding in scan_workbook(path).findings
+        if finding.rule_id == "WL029_CIRCULAR_REFERENCE"
+    ]
+
+    assert len(findings) == 1
+    assert findings[0].evidence.peers == ["Data!A1", "Summary!A1"]
+
+
+def test_dense_formula_range_dependencies_are_bounded_and_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        builtin_rules,
+        "MAX_STATIC_CIRCULAR_DEPENDENCIES_PER_REFERENCE",
+        16,
+    )
+    monkeypatch.setattr(
+        builtin_rules,
+        "MAX_STATIC_CIRCULAR_GRAPH_NONSELF_EDGES",
+        100,
+    )
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Dense"
+    for row in range(1, 1001):
+        worksheet.cell(row, 1, "=SUM(A:A)")
+
+    observed_limits: list[int | None] = []
+    original_iterator = builtin_rules.WorksheetContentIndex.iter_nonblank_rectangle
+
+    def recorded_rectangle(self, **kwargs):
+        observed_limits.append(kwargs.get("limit"))
+        yield from original_iterator(self, **kwargs)
+
+    monkeypatch.setattr(
+        builtin_rules.WorksheetContentIndex,
+        "iter_nonblank_rectangle",
+        recorded_rectangle,
+    )
+
+    graph = builtin_rules._static_formula_dependency_graph(workbook)
+
+    assert len(graph) == 1000
+    assert all(dependencies == {node} for node, dependencies in graph.items())
+    assert observed_limits == [17]
+
+
+def test_circular_dependency_graph_skips_nonself_batch_when_budget_is_insufficient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        builtin_rules,
+        "MAX_STATIC_CIRCULAR_DEPENDENCIES_PER_REFERENCE",
+        10,
+    )
+    monkeypatch.setattr(
+        builtin_rules,
+        "MAX_STATIC_CIRCULAR_GRAPH_NONSELF_EDGES",
+        1,
+    )
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Budget"
+    worksheet["A1"] = "=SUM(B1:B2)"
+    worksheet["A2"] = "=A2"
+    worksheet["B1"] = "=1"
+    worksheet["B2"] = "=1"
+
+    graph = builtin_rules._static_formula_dependency_graph(workbook)
+
+    assert graph[("Budget", "A1")] == set()
+    assert graph[("Budget", "A2")] == {("Budget", "A2")}
+    assert (
+        sum(
+            len({dependency for dependency in dependencies if dependency != node})
+            for node, dependencies in graph.items()
+        )
+        == 0
+    )
 
 
 def test_merged_formula_outlier_is_findings_only(tmp_path: Path) -> None:
@@ -722,6 +1303,82 @@ def test_single_sided_shared_border_is_visually_equivalent(
     )
 
 
+@pytest.mark.parametrize(
+    ("target_row", "perimeter_side"),
+    [(2, "top"), (21, "bottom")],
+)
+def test_detail_row_perimeter_border_is_not_a_style_outlier(
+    tmp_path: Path,
+    target_row: int,
+    perimeter_side: str,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Context", "Amount"])
+    side = Side(style="thin", color="336699")
+    perimeter = Side(style="medium", color="336699")
+    grid = Border(left=side, right=side, top=side, bottom=side)
+    for row in range(2, 22):
+        worksheet.append([f"R{row}", row * 100])
+        for cell in worksheet[row]:
+            cell.border = grid
+    targets = worksheet[target_row]
+    for target in targets:
+        target.border = Border(
+            left=side,
+            right=side,
+            top=perimeter if perimeter_side == "top" else side,
+            bottom=perimeter if perimeter_side == "bottom" else side,
+        )
+    path = tmp_path / f"detail-{perimeter_side}-perimeter-border.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+
+    assert not any(
+        finding.rule_id == "WL007_STYLE_OUTLIER"
+        and finding.location in {target.coordinate for target in targets}
+        for finding in scan.findings
+    )
+
+
+def test_single_first_detail_row_top_border_without_boundary_consensus_is_reported(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Context", "Amount", "Status"])
+    side = Side(style="thin", color="336699")
+    grid = Border(left=side, right=side, top=side, bottom=side)
+    for row in range(2, 22):
+        worksheet.append([f"R{row}", row * 100, "Open"])
+        for cell in worksheet[row]:
+            cell.border = grid
+    worksheet["B2"].border = Border(
+        left=side,
+        right=side,
+        top=Side(style="medium", color="FF0000"),
+        bottom=side,
+    )
+    path = tmp_path / "single-first-detail-row-top-border.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+
+    assert any(
+        finding.rule_id == "WL007_STYLE_OUTLIER" and finding.location == "B2"
+        for finding in scan.findings
+    )
+    assert not any(
+        finding.rule_id == "WL017_BORDER_EDGE_INCONSISTENCY" and finding.location == "B2"
+        for finding in scan.findings
+    )
+
+
 @pytest.mark.parametrize("component", ["font", "fill", "alignment", "number_format", "border"])
 def test_material_visual_style_difference_remains_an_outlier(
     tmp_path: Path, component: str
@@ -755,6 +1412,29 @@ def test_material_visual_style_difference_remains_an_outlier(
     scan = scan_workbook(path)
     assert any(
         finding.rule_id == "WL007_STYLE_OUTLIER" and finding.location == "B10"
+        for finding in scan.findings
+    )
+
+
+def test_last_detail_row_bottom_border_variant_is_not_a_style_outlier(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Month", "Sales"])
+    side = Side(style="thin", color="D9E2F3")
+    interior = Border(top=side, bottom=side)
+    last_row = Border(top=side)
+    for row in range(2, 14):
+        worksheet.append([f"2026-{row - 1:02d}", row * 100])
+        for cell in worksheet[row]:
+            cell.border = last_row if row == 13 else interior
+    path = tmp_path / "last-row-perimeter-style.xlsx"
+    workbook.save(path)
+    workbook.close()
+
+    scan = scan_workbook(path)
+    assert not any(
+        finding.rule_id == "WL007_STYLE_OUTLIER" and finding.location in {"A13", "B13"}
         for finding in scan.findings
     )
 
@@ -1383,8 +2063,8 @@ def test_hidden_literal_is_never_replaced(tmp_path: Path) -> None:
     assert not any(patch.cell == "B10" for patch in scan.patches)
 
 
-def test_all_twenty_one_builtin_rule_ids_are_stable() -> None:
-    assert {rule.rule_id for rule in BUILTIN_RULES} == {
+def test_builtin_rule_ids_are_stable() -> None:
+    legacy_rule_ids = {
         f"WL{number:03d}_{suffix}"
         for number, suffix in enumerate(
             [
@@ -1412,4 +2092,9 @@ def test_all_twenty_one_builtin_rule_ids_are_stable() -> None:
             ],
             start=1,
         )
+    }
+    assert {rule.rule_id for rule in BUILTIN_RULES} == legacy_rule_ids | {
+        "WL028_TEXT_FORMULA",
+        "WL029_CIRCULAR_REFERENCE",
+        "WL034_PROVABLE_FORMULA_ERROR",
     }

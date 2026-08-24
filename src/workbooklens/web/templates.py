@@ -158,6 +158,7 @@ TEMPLATES = {
     .file-name { min-width: 0; color: var(--muted); overflow-wrap: anywhere; }
     .field-hint, .status-text { margin: 0; color: var(--muted); font-size: 13px; }
     .form-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
+    .selection-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin: 0 0 12px; }
     button, .button {
       display: inline-flex;
       align-items: center;
@@ -386,7 +387,11 @@ TEMPLATES = {
   <form id="apply-form" action="/sessions/{{ session_id }}/apply" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="language" value="{{ language }}">
-    {% if patches %}<div class="patch-list">
+    {% if patches %}<div class="selection-actions">
+      <button id="select-all-patches" class="secondary" type="button" aria-controls="patch-list">{{ t("web.results_select_all") }}</button>
+      <button id="clear-all-patches" class="secondary" type="button" aria-controls="patch-list" disabled>{{ t("web.results_clear_all") }}</button>
+      <p id="patch-selection-status" class="status-text" aria-live="polite">{{ t("web.results_selection_count", selected=0, total=patches|length) }}</p>
+    </div><div id="patch-list" class="patch-list">
     {% for patch in patches %}
       <label class="patch-row">
         <input type="checkbox" name="patch_id" value="{{ patch.id }}" data-risk="{{ patch.risk.value }}">
@@ -413,9 +418,43 @@ TEMPLATES = {
 {% endblock %}{% block script %}
 <script>
   const applyForm = document.getElementById('apply-form');
+  const patchCheckboxes = applyForm ? Array.from(
+    applyForm.querySelectorAll('#patch-list input[name="patch_id"]:not(:disabled)')
+  ) : [];
+  const selectAllButton = document.getElementById('select-all-patches');
+  const clearAllButton = document.getElementById('clear-all-patches');
+  const patchSelectionStatus = document.getElementById('patch-selection-status');
+  const selectionCountTemplate = {{ t("web.results_selection_count", selected="__SELECTED__", total="__TOTAL__")|tojson }};
+
+  const updatePatchSelectionControls = () => {
+    const selectedCount = patchCheckboxes.filter((checkbox) => checkbox.checked).length;
+    if (selectAllButton) selectAllButton.disabled = selectedCount === patchCheckboxes.length;
+    if (clearAllButton) clearAllButton.disabled = selectedCount === 0;
+    if (patchSelectionStatus) {
+      patchSelectionStatus.textContent = selectionCountTemplate
+        .replace('__SELECTED__', String(selectedCount))
+        .replace('__TOTAL__', String(patchCheckboxes.length));
+    }
+  };
+
+  if (selectAllButton) selectAllButton.addEventListener('click', () => {
+    patchCheckboxes.forEach((checkbox) => { checkbox.checked = true; });
+    updatePatchSelectionControls();
+  });
+  if (clearAllButton) clearAllButton.addEventListener('click', () => {
+    patchCheckboxes.forEach((checkbox) => { checkbox.checked = false; });
+    updatePatchSelectionControls();
+  });
+  patchCheckboxes.forEach((checkbox) => {
+    checkbox.addEventListener('change', updatePatchSelectionControls);
+  });
+  updatePatchSelectionControls();
+
   if (applyForm) applyForm.addEventListener('submit', () => {
     const button = document.getElementById('apply-button');
     const status = document.getElementById('apply-status');
+    if (selectAllButton) selectAllButton.disabled = true;
+    if (clearAllButton) clearAllButton.disabled = true;
     if (button) { button.disabled = true; button.textContent = {{ t("web.apply_running")|tojson }}; }
     if (status) status.textContent = {{ t("web.apply_running_detail")|tojson }};
   });

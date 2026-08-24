@@ -18,6 +18,7 @@ from typing import Any, Final
 if __package__:
     from .check_installer_artifact import InstallerArtifactError, inspect_installer
     from .check_portable_artifact import (
+        CURRENT_PROFILE,
         LEGACY_V2_2_1_PROFILE,
         LEGACY_V2_2_1_VERSION,
         PortableArtifactError,
@@ -27,6 +28,7 @@ if __package__:
 else:
     from check_installer_artifact import InstallerArtifactError, inspect_installer
     from check_portable_artifact import (
+        CURRENT_PROFILE,
         LEGACY_V2_2_1_PROFILE,
         LEGACY_V2_2_1_VERSION,
         PortableArtifactError,
@@ -48,6 +50,15 @@ UPGRADE_STALE_MEMBERS: Final = (
 
 class InstallerSmokeError(RuntimeError):
     """The setup executable failed an end-to-end user installation check."""
+
+
+def _release_version_key(version: str) -> tuple[int, int, int]:
+    parts = version.split(".")
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        raise InstallerSmokeError(
+            f"installer version {version!r} is not a numeric major.minor.patch release"
+        )
+    return int(parts[0]), int(parts[1]), int(parts[2])
 
 
 def _run(
@@ -527,16 +538,25 @@ def smoke_installer(
     baseline_installer = installer
     baseline_portable = portable_zip
     baseline_version = installer_report.version
+    baseline_profile = CURRENT_PROFILE
     if previous_installer is not None and previous_portable_zip is not None:
-        previous_report = inspect_installer(
-            previous_installer,
-            expected_version=LEGACY_V2_2_1_VERSION,
+        previous_report = inspect_installer(previous_installer)
+        if _release_version_key(previous_report.version) >= _release_version_key(
+            installer_report.version
+        ):
+            raise InstallerSmokeError(
+                "the previous installer must be an earlier numeric release than the candidate"
+            )
+        baseline_profile = (
+            LEGACY_V2_2_1_PROFILE
+            if previous_report.version == LEGACY_V2_2_1_VERSION
+            else CURRENT_PROFILE
         )
         inspect_artifact(
             previous_portable_zip,
-            expected_version=LEGACY_V2_2_1_VERSION,
+            expected_version=previous_report.version,
             repository_root=None,
-            profile=LEGACY_V2_2_1_PROFILE,
+            profile=baseline_profile,
         )
         baseline_installer = previous_installer
         baseline_portable = previous_portable_zip
@@ -576,7 +596,7 @@ def smoke_installer(
                 scratch / "portable-previous",
                 expected_version=baseline_version,
                 repository_root=None,
-                profile=LEGACY_V2_2_1_PROFILE,
+                profile=baseline_profile,
             )
         baseline_hashes = _file_hashes(baseline_root)
         primary_error: BaseException | None = None

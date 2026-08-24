@@ -6,6 +6,31 @@ keys:
   - sheet: Invoices
     range: A2:A10000
     ignore_blank: true
+profile:
+  infer_semantics: true
+  report_trailing_whitespace: true
+  review_trailing_whitespace_patches: false
+  sheets:
+    - sheet: Invoices
+      range: A1:G10000
+      header_row: 1
+      columns:
+        - column: A
+          role: identifier
+          required: true
+        - column: B
+          role: text
+          trim_trailing_whitespace: true
+        - column: C
+          role: email
+        - column: D
+          role: date
+        - column: F
+          role: currency
+        - column: G
+          role: category
+          required: true
+          allowed_values: [Open, Paid, Void]
 suppressions:
   - id: accepted-template-volatility
     reason: Legacy template intentionally uses NOW() on the Cover sheet.

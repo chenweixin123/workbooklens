@@ -117,18 +117,18 @@ jobs:
           $python = (Get-Command python.exe).Source
           & $python scripts/check_portable_artifact.py $archives[0].FullName --expected-version ${{ needs.verify.outputs.version }}
           & $python scripts/smoke_portable.py $archives[0].FullName --expected-version ${{ needs.verify.outputs.version }}
-      - name: Download and verify the v2.2.1 upgrade baseline
+      - name: Download and verify the v2.3.0 upgrade baseline
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $baselineTag = 'v2.2.1'
-          $baselineDirectory = Join-Path $env:RUNNER_TEMP 'workbooklens-v2.2.1-upgrade-baseline'
-          $portableName = 'WorkbookLens-2.2.1-windows-x64-portable.zip'
-          $installerName = 'WorkbookLens-2.2.1-windows-x64-setup.exe'
+          $baselineTag = 'v2.3.0'
+          $baselineDirectory = Join-Path $env:RUNNER_TEMP 'workbooklens-v2.3.0-upgrade-baseline'
+          $portableName = 'WorkbookLens-2.3.0-windows-x64-portable.zip'
+          $installerName = 'WorkbookLens-2.3.0-windows-x64-setup.exe'
           $expectedHashes = @{
-            $portableName = 'c5b2eb0b6b4e1b97de2563918dc3b35b969c767a8dc3ce6a8ab5ceb9fe093538'
-            $installerName = 'd54b874e1c540df65e099e860b5df5a3c658dde507f46e20995ae93db7aa4fef'
+            $portableName = '0a0e3bde2f89b71dfb8324719cd01ecb7794dd2fee40540231580599afd1a441'
+            $installerName = 'ad9103f84936ca018e7bde9cc69dd4d13b03d583dd7f4eacda9127b735cb6ab4'
           }
           [void][IO.Directory]::CreateDirectory($baselineDirectory)
           gh release download $baselineTag --repo chenweixin123/workbooklens --pattern $portableName --pattern $installerName --dir $baselineDirectory

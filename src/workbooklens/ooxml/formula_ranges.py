@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import posixpath
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -15,6 +16,23 @@ from workbooklens.formulas import analyze_formula
 from workbooklens.ooxml.safety import PackageLimits, parse_xml_part
 
 UNSUPPORTED_FORMULA_TYPES = {"shared", "array", "dataTable"}
+CACHED_FORMULA_ERRORS = {
+    "#NULL!",
+    "#DIV/0!",
+    "#VALUE!",
+    "#REF!",
+    "#NAME?",
+    "#NUM!",
+    "#N/A",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaMetadata:
+    """Bounded formula metadata extracted from one OOXML traversal."""
+
+    unsupported_ranges: dict[str, tuple[CellRange, ...]]
+    cached_errors: dict[str, dict[str, str]]
 
 
 def _bounded_part(archive: zipfile.ZipFile, part: str, limits: PackageLimits) -> bytes:
@@ -85,20 +103,22 @@ def _sheet_parts(archive: zipfile.ZipFile, limits: PackageLimits) -> dict[str, s
     return result
 
 
-def find_unsupported_formula_ranges(
+def inspect_formula_metadata(
     path: Path,
     limits: PackageLimits | None = None,
-) -> dict[str, tuple[CellRange, ...]]:
-    """Return raw shared/array/data-table/dynamic formula ranges by worksheet."""
+) -> FormulaMetadata:
+    """Return unsupported formula ranges and cached errors from one bounded traversal."""
 
     active_limits = limits or PackageLimits()
-    result: dict[str, tuple[CellRange, ...]] = {}
+    unsupported_result: dict[str, tuple[CellRange, ...]] = {}
+    cached_result: dict[str, dict[str, str]] = {}
     try:
         with zipfile.ZipFile(path, "r") as archive:
             sheet_parts = _sheet_parts(archive, active_limits)
             for sheet_name, part in sheet_parts.items():
                 root = parse_xml_part(_bounded_part(archive, part, active_limits), part)
                 ranges: dict[str, CellRange] = {}
+                errors: dict[str, str] = {}
                 for cell in root.iter():
                     if etree.QName(cell).localname != "c":
                         continue
@@ -109,6 +129,14 @@ def find_unsupported_formula_ranges(
                     )
                     if coordinate is None or formula is None:
                         continue
+                    if cell.get("t") == "e":
+                        value = next(
+                            (child for child in cell if etree.QName(child).localname == "v"),
+                            None,
+                        )
+                        cached = (value.text or "").strip().upper() if value is not None else ""
+                        if cached in CACHED_FORMULA_ERRORS:
+                            errors[coordinate] = cached
                     formula_type = formula.get("t")
                     reference = formula.get("ref")
                     text = "=" + (formula.text or "")
@@ -128,9 +156,31 @@ def find_unsupported_formula_ranges(
                             f"Malformed formula range {range_text!r} in {part!r}"
                         ) from exc
                     ranges[str(formula_range)] = formula_range
-                result[sheet_name] = tuple(ranges[key] for key in sorted(ranges))
+                unsupported_result[sheet_name] = tuple(ranges[key] for key in sorted(ranges))
+                cached_result[sheet_name] = dict(sorted(errors.items()))
     except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
         raise UnsafeWorkbookError(
             f"Unable to inspect worksheet formula metadata safely: {exc}"
         ) from exc
-    return result
+    return FormulaMetadata(
+        unsupported_ranges=unsupported_result,
+        cached_errors=cached_result,
+    )
+
+
+def find_unsupported_formula_ranges(
+    path: Path,
+    limits: PackageLimits | None = None,
+) -> dict[str, tuple[CellRange, ...]]:
+    """Return raw shared/array/data-table/dynamic formula ranges by worksheet."""
+
+    return inspect_formula_metadata(path, limits).unsupported_ranges
+
+
+def find_cached_formula_errors(
+    path: Path,
+    limits: PackageLimits | None = None,
+) -> dict[str, dict[str, str]]:
+    """Return cached formula errors as potentially stale, non-recalculated evidence."""
+
+    return inspect_formula_metadata(path, limits).cached_errors

@@ -20,6 +20,11 @@ from workbooklens.exceptions import UsageError
 from workbooklens.models import AssertionResult, Severity, WorkbookAssertion
 from workbooklens.ooxml.safety import PackageLimits, inspect_package
 from workbooklens.policy import FindingPolicyResult, FindingSuppression, apply_finding_policy
+from workbooklens.rules.profile_quality import (
+    normalize_profile_column_selector,
+    normalize_profile_range,
+    profile_range_bounds,
+)
 from workbooklens.scanner import ScanResult, scan_workbook
 from workbooklens.snapshot import load_for_analysis
 
@@ -59,18 +64,135 @@ class ConfiguredKey(BaseModel):
         return value
 
 
+class ProfileColumnConfig(BaseModel):
+    """One optional semantic field contract used by profile-aware scan rules."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    header: str | None = None
+    column: int | str | None = None
+    role: (
+        Literal[
+            "identifier",
+            "category",
+            "email",
+            "phone",
+            "currency",
+            "percentage",
+            "date",
+            "number",
+            "text",
+        ]
+        | None
+    ) = None
+    required: bool = False
+    allowed_values: list[Any] = Field(default_factory=list)
+    identifier_width: int | None = Field(default=None, ge=1, le=64)
+    preserve_leading_zeros: bool = False
+    trim_trailing_whitespace: bool = False
+
+    @field_validator("header")
+    @classmethod
+    def validate_header(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("profile column header cannot be blank")
+        return normalized
+
+    @field_validator("column", mode="before")
+    @classmethod
+    def validate_column(cls, value: int | str | None) -> int | str | None:
+        return normalize_profile_column_selector(value)
+
+    @model_validator(mode="after")
+    def require_selector(self) -> ProfileColumnConfig:
+        if (self.header is None) == (self.column is None):
+            raise ValueError("profile columns require exactly one header or column selector")
+        return self
+
+
+class ProfileSheetConfig(BaseModel):
+    """One bounded worksheet table and its optional semantic field contracts."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    sheet: str = Field(min_length=1)
+    range: str | None = None
+    header_row: int | None = Field(default=None, ge=1, le=1_048_576)
+    columns: list[ProfileColumnConfig] = Field(default_factory=list)
+
+    @field_validator("sheet")
+    @classmethod
+    def normalize_sheet(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("profile sheet cannot be blank")
+        return normalized
+
+    @field_validator("range")
+    @classmethod
+    def validate_range(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_profile_range(value)
+
+    @model_validator(mode="after")
+    def validate_profile_sheet(self) -> ProfileSheetConfig:
+        bounds = profile_range_bounds(self.range) if self.range is not None else None
+        if self.header_row is None:
+            self.header_row = bounds[0] if bounds is not None else 1
+        elif bounds is not None and not bounds[0] <= self.header_row <= bounds[1]:
+            raise ValueError("profile header_row must be inside the configured range")
+        selectors: list[tuple[str, str]] = []
+        for column in self.columns:
+            if column.column is not None:
+                selectors.append(("column", str(column.column).casefold()))
+            elif column.header is not None:
+                selectors.append(("header", column.header.casefold()))
+        if len(selectors) != len(set(selectors)):
+            raise ValueError("profile sheet contains duplicate column selectors")
+        return self
+
+
+class WorkbookProfileConfig(BaseModel):
+    """Optional user-editable semantics for conservative scan-time validation."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    infer_semantics: bool = True
+    report_trailing_whitespace: bool = True
+    review_trailing_whitespace_patches: bool = False
+    sheets: list[ProfileSheetConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def reject_duplicate_tables(self) -> WorkbookProfileConfig:
+        selectors = [sheet.sheet.casefold() for sheet in self.sheets]
+        if len(selectors) != len(set(selectors)):
+            raise ValueError("profile contains duplicate sheet table selectors")
+        return self
+
+
 class TestConfig(BaseModel):
     """Validated workbook policy configuration."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
     version: Literal[1, 2]
     workbook: WorkbookThresholds = Field(default_factory=WorkbookThresholds)
     assertions: list[WorkbookAssertion] = Field(default_factory=list)
     keys: list[ConfiguredKey] = Field(default_factory=list)
+    profile: WorkbookProfileConfig | None = None
     suppressions: list[FindingSuppression] = Field(default_factory=list)
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version_type(cls, value: Any) -> Any:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("configuration version must be the integer 1 or 2")
+        return value
 
     @model_validator(mode="after")
     def validate_policy_version(self) -> TestConfig:
+        if self.version == 1 and self.profile is not None:
+            raise ValueError("workbook profiles require configuration version 2")
         if self.version == 1 and self.suppressions:
             raise ValueError("finding suppressions require configuration version 2")
         identifiers = [suppression.id for suppression in self.suppressions]

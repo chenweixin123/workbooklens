@@ -57,6 +57,113 @@ BUILTIN_RULE_TITLES: dict[str, tuple[str, str]] = {
         "Whitespace-only cells extend beyond the visible layout",
         "纯空白字符单元格超出可见布局",
     ),
+    "WL022_INFERRED_DUPLICATE_IDENTIFIER": (
+        "Duplicate value in inferred identifier column",
+        "推断标识符列中存在重复值",
+    ),
+    "WL023_MISSING_INFERRED_IDENTIFIER": (
+        "Missing value in inferred identifier column",
+        "推断标识符列中缺少值",
+    ),
+    "WL024_MIXED_NUMERIC_STORAGE": (
+        "Non-numeric text in a numeric-dominant column",
+        "数值主导列中存在非数值文本",
+    ),
+    "WL025_ROBUST_NUMERIC_OUTLIER": ("Extreme numeric outlier", "极端数值异常"),
+    "WL026_PERCENTAGE_SCALE_OUTLIER": (
+        "Percentage scale or range anomaly",
+        "百分比尺度或范围异常",
+    ),
+    "WL027_DATE_STORAGE_ANOMALY": (
+        "Invalid or inconsistent date storage",
+        "无效或不一致的日期存储",
+    ),
+    "WL028_TEXT_FORMULA": ("Formula stored as text", "以文本形式存储的公式"),
+    "WL029_CIRCULAR_REFERENCE": ("Circular formula dependency", "公式循环依赖"),
+    "WL030_AUTOFILTER_COVERAGE": (
+        "AutoFilter excludes part of an inferred table",
+        "自动筛选未覆盖推断表格的部分区域",
+    ),
+    "WL031_CHART_SOURCE_STRUCTURE": (
+        "Chart source range is structurally inconsistent",
+        "图表数据源范围结构不一致",
+    ),
+    "WL032_DEEP_FREEZE_PANE": (
+        "Freeze pane starts deep inside visible content",
+        "冻结窗格起点深入可见内容区域",
+    ),
+    "WL033_PRINT_AREA_COVERAGE": (
+        "Print area truncates meaningful worksheet content",
+        "打印区域截断了有效工作表内容",
+    ),
+    "WL034_PROVABLE_FORMULA_ERROR": (
+        "Provable formula error",
+        "可证明的公式错误",
+    ),
+    "WL035_SIGN_CONSTRAINED_MEASURE": (
+        "Invalid sign in a constrained measure",
+        "受符号约束度量中的无效值",
+    ),
+    "WL036_TRAILING_WHITESPACE": (
+        "Trailing whitespace in a record field",
+        "记录字段末尾存在空白字符",
+    ),
+    "WL037_REQUIRED_FIELD": (
+        "Configured required field is blank",
+        "配置的必填字段为空",
+    ),
+    "WL038_ENUM_VALUE": (
+        "Value is outside a configured enumeration",
+        "值不在配置的枚举范围内",
+    ),
+    "WL039_CONTACT_FORMAT": (
+        "Contact value has an invalid format",
+        "联系方式格式无效",
+    ),
+    "WL040_LEADING_ZERO_IDENTIFIER": (
+        "Identifier width conflicts with leading-zero semantics",
+        "标识符位数与前导零语义冲突",
+    ),
+    "WL041_NUMBER_FORMAT_ROLE_CONFLICT": (
+        "Number format conflicts with the field role",
+        "数字格式与字段角色冲突",
+    ),
+    "WL042_AGGREGATE_RANGE_COVERAGE": (
+        "Aggregate range excludes contiguous table rows",
+        "聚合范围遗漏连续表格行",
+    ),
+    "WL043_CROSS_SHEET_REFERENCE_VALIDITY": (
+        "Cross-sheet reference target requires review",
+        "跨表引用目标需要复核",
+    ),
+    "WL044_FORMULA_IN_NOTES_COLUMN": (
+        "Formula appears in a notes or instructions column",
+        "备注或说明列中出现公式",
+    ),
+    "WL045_DEGENERATE_FORMULA": (
+        "Formula collapses to an algebraic identity or constant",
+        "公式退化为代数恒等式或常量",
+    ),
+    "WL046_FORMULA_FORMAT_ROLE_MISMATCH": (
+        "Formula result role conflicts with its number format",
+        "公式结果角色与数字格式冲突",
+    ),
+    "WL047_DRAWING_CONTENT_OVERLAP": (
+        "Drawing overlaps non-source worksheet content",
+        "绘图遮挡了非数据源工作表内容",
+    ),
+    "WL048_NUMERIC_DISPLAY_WIDTH_RISK": (
+        "Fixed-format numeric value may not fit its column",
+        "固定格式数值可能无法在列中完整显示",
+    ),
+    "WL049_DATA_REGION_ROW_HEIGHT_OUTLIER": (
+        "Data-region row height is an unexplained outlier",
+        "数据区域行高存在无法解释的异常",
+    ),
+    "WL050_ROLE_AWARE_STYLE_OUTLIER": (
+        "Style is inconsistent with its inferred worksheet role",
+        "样式与推断的工作表角色不一致",
+    ),
 }
 
 
@@ -67,21 +174,34 @@ ZH_CANONICAL_TEXT: dict[str, str] = {
     "Review the deleted or moved source range; no automatic guess was made.": "请检查已删除或移动的源区域；WorkbookLens 未进行自动猜测。",
     "Replace the one-off formula with the exact translated peer consensus.": "用参照单元格一致推导出的精确公式替换此孤立公式。",
     "A formula has a different relative-reference signature from a strong band consensus.": "此公式的相对引用结构与该公式序列的强一致模式不同。",
+    "An aggregate formula differs from the surrounding detail-formula consensus and may represent a subtotal or total with an incorrect range.": "此聚合公式与周围明细公式的一致模式不同，可能是范围错误的小计或总计公式。",
+    "Aggregate formula differs from the surrounding detail-formula consensus": "聚合公式与周围明细公式的一致模式不同",
     "Copied formulas in this band have the same structural signature.": "此序列中的复制公式应具有相同的结构签名。",
+    "The aggregate range is manually verified and accompanied by an explicit subtotal or total label.": "聚合范围应经过人工核对，并配有明确的小计或总计标签。",
+    "Review the aggregate range and nearby subtotal or total label manually; no replacement formula is inferred from detail rows.": "请人工核对聚合范围及附近的小计或总计标签；WorkbookLens 不会根据明细行推断替换公式。",
+    "The formula participates in a circular dependency, so no automatic replacement is offered.": "该公式参与循环依赖，因此不提供自动替换。",
+    "The target is outside an inferred data body, so automatic formula replacement is withheld.": "目标单元格位于推断的数据主体之外，因此不执行自动公式替换。",
+    "Multiple formula anomalies were found without a 0.95 repair confidence; compare each cell with the listed peers.": "发现多个公式异常，但修复置信度未达到 0.95；请逐一与列出的参照单元格比较。",
     "Multiple isolated anomalies were found, so no automatic patch is offered; compare each cell with the listed peers.": "发现多个孤立异常，因此不提供自动修复；请逐一与列出的参照单元格比较。",
     "Aggregate formulas are never replaced automatically; review the subtotal or total manually.": "聚合公式绝不会被自动替换；请手动检查小计或总计。",
     "The row context does not match stable detail-row semantics, so automatic replacement is withheld.": "该行上下文不符合稳定的明细行语义，因此不执行自动替换。",
     "Compare the cell with the listed peers and review any proposed formula.": "请将此单元格与列出的参照单元格比较，并检查建议公式。",
     "Create the missing cell with the exact translated formula agreed by peers.": "使用参照单元格一致推导出的精确公式创建缺失单元格。",
+    "A blank interrupts a formula-dominated data-region column whose peers translate exactly at this cell.": "一个空白单元格中断了公式主导的数据区域列，且参照公式平移到此处后完全一致。",
+    "Independent peer formulas translate to the same expression": "独立参照公式平移后得到相同表达式",
+    "Formula-dominated data-region columns have no unexplained blank.": "公式主导的数据区域列中不应存在无法解释的空白。",
     "A single blank lies between formulas whose translations agree exactly at this cell.": "一个空白单元格位于公式之间，而两侧公式平移到此处后完全一致。",
     "Independent neighboring formulas translate to the same expression": "相邻公式独立平移后得到相同表达式",
     "The contiguous formula band has no unexplained blank.": "连续公式序列中不应存在无法解释的空白。",
     "The blank is inside a merged range and cannot safely receive a formula; review the merge manually.": "空白单元格位于合并区域内，无法安全写入公式；请手动检查合并区域。",
     "The blank is in a hidden sheet, row, or column, so automatic formula creation is withheld.": "空白单元格位于隐藏的工作表、行或列中，因此不自动创建公式。",
     "The blank is locked on a protected sheet, so automatic formula creation is withheld.": "空白单元格在受保护工作表中被锁定，因此不自动创建公式。",
+    "The target is outside an inferred data body, so automatic formula creation is withheld.": "目标单元格位于推断的数据主体之外，因此不自动创建公式。",
+    "The formula consensus is below the safe automatic-repair threshold; review the proposed formula manually.": "公式一致性低于安全自动修复阈值；请手动检查建议公式。",
     "The row context does not match stable detail-row semantics, so automatic formula creation is withheld.": "该行上下文不符合稳定的明细行语义，因此不自动创建公式。",
     "Review and select the proposed translated formula.": "请检查并选择建议的平移公式。",
     "Replace the isolated literal with the exact translated peer formula.": "用参照单元格精确平移得到的公式替换孤立常量。",
+    "A literal value replaces a formula in a formula-dominated data-region column.": "一个常量值替代了公式主导的数据区域列中的公式。",
     "A literal value replaces one cell in an otherwise consistent copied-formula band.": "在原本一致的复制公式序列中，有一个单元格被常量值替代。",
     "Peer formulas translate to one exact replacement": "参照公式平移后得到唯一且精确的替换公式",
     "The formula band follows its consensus structure.": "公式序列应遵循其一致结构。",
@@ -89,6 +209,21 @@ ZH_CANONICAL_TEXT: dict[str, str] = {
     "The cell is in a hidden sheet, row, or column, so automatic replacement is withheld.": "该单元格位于隐藏的工作表、行或列中，因此不执行自动替换。",
     "The cell is locked on a protected sheet, so automatic replacement is withheld.": "该单元格在受保护工作表中被锁定，因此不执行自动替换。",
     "Confirm the literal is not an intentional override before selecting the patch.": "选择修复前，请确认该常量不是有意的人工覆盖。",
+    "A formula-looking string is stored as text inside a formula-dominated data-region column.": "一个看似公式的字符串在公式主导的数据区域列中以文本形式存储。",
+    "Text begins with '=' inside a formula-dominated column": "公式主导列中的文本以“=”开头",
+    "Formula-dominated data-region columns store calculations as formulas, not text.": "公式主导的数据区域列应将计算内容存储为公式，而不是文本。",
+    "Confirm the leading equals sign is intended as a calculation, then convert the text to a real formula manually; no automatic patch is offered.": "请确认开头的等号确实表示计算，再手动将文本转换为真实公式；不提供自动修复。",
+    "One or more formulas form a static circular dependency in the direct cell-reference graph.": "一个或多个公式在直接单元格引用图中形成静态循环依赖。",
+    "Static formula dependency graph contains a strongly connected component": "静态公式依赖图包含一个强连通分量",
+    "Direct formula dependencies form an acyclic graph.": "直接公式依赖应构成无环图。",
+    "Review every formula in the reported component and break the cycle manually; WorkbookLens does not guess which dependency is intentional.": "请检查报告分量中的每个公式并手动打破循环；WorkbookLens 不会猜测哪个依赖是有意的。",
+    "The complete formula is statically guaranteed to return an Excel error without evaluating workbook data.": "无需计算工作簿数据即可静态证明该完整公式必然返回 Excel 错误。",
+    "The workbook stores an Excel error as this formula's cached result; cached values may be stale and were not recalculated.": "工作簿将 Excel 错误保存为该公式的缓存结果；缓存值可能已经过时，WorkbookLens 未重新计算公式。",
+    "Formula text proves an unconditional Excel error": "公式文本可证明存在无条件 Excel 错误",
+    "Formula has a cached Excel error result": "公式具有缓存的 Excel 错误结果",
+    "Formulas do not contain unconditional error expressions.": "公式不应包含无条件产生错误的表达式。",
+    "Saved formula results do not contain Excel error values.": "已保存的公式结果不应包含 Excel 错误值。",
+    "Review the formula logic and source intent; no automatic replacement is offered.": "请检查公式逻辑和原始意图；不提供自动替换。",
     "A simple contiguous total includes its directly adjacent peer row.": "简单连续总计应包含紧邻的同类数据行。",
     "The adjacent row has subtotal or total semantics, so automatic SUM extension is withheld.": "相邻行具有小计或总计语义，因此不自动扩展 SUM 范围。",
     "The SUM target is merged, hidden, or locked on a protected sheet, so automatic extension is withheld.": "SUM 目标已合并、隐藏或在受保护工作表中锁定，因此不自动扩展。",
@@ -147,6 +282,7 @@ ZH_CANONICAL_TEXT: dict[str, str] = {
     "Cells in a homogeneous input column share validation constraints.": "同质输入列中的单元格应共享数据验证约束。",
     "Review and restore the intended validation rule manually.": "请手动检查并恢复预期的数据验证规则。",
     "Widen the repeatedly overflowing text column to the measured local maximum.": "将反复溢出的文本列加宽到本地测量的最大需求宽度。",
+    "Widen the long-text column before wrapping to avoid excessive row heights.": "先适度加宽长文本所在列，再启用换行，以避免行高异常增大。",
     "Wrap the blocked text within its existing cell after review.": "检查后，在现有单元格内对受阻文本启用自动换行。",
     "Unwrapped text exceeds its cell and natural overflow is blocked": "未换行文本超出单元格，且自然溢出受阻",
     "The text is wider than the available cell width and either an adjacent value or a visible border prevents a clean natural overflow.": "文本宽于可用单元格宽度，且相邻值或可见边框阻止其正常自然溢出。",
@@ -154,6 +290,7 @@ ZH_CANONICAL_TEXT: dict[str, str] = {
     "Static text measurement indicates that the saved explicit row height is too small for all wrapped lines.": "静态文本测量表明，保存的明确行高不足以容纳全部换行内容。",
     "Visible text remains inside its intended cell boundary without clipping.": "可见文本应完整显示在预期单元格边界内，不被截断。",
     "The row would exceed Excel's maximum height; widen the layout or shorten the content manually.": "所需行高会超过 Excel 上限；请手动加宽布局或缩短内容。",
+    "The estimated wrapped row would be excessively tall; widen the column or shorten the content manually.": "估算的换行后行高会过大；请手动加宽列或缩短内容。",
     "Review the proposed local wrap/row-height change in Excel; font rendering can vary by device.": "请在 Excel 中检查建议的局部换行和行高更改；不同设备的字体渲染可能不同。",
     "Both sides of one or more shared edges are absent inside a dense rectangular table, or a table perimeter edge is absent, while parallel edges show a stable style. A border present on either side remains visually continuous and is not reported.": "密集矩形表格内部一个或多个共享边的两侧均缺失，或表格外周边缺失，而平行边呈现稳定样式。只要任一侧存在边框，视觉上仍连续，就不会报告。",
     "Shared and perimeter table edges remain visually continuous.": "表格的共享边和外周边应保持视觉连续。",
@@ -184,6 +321,118 @@ ZH_CANONICAL_TEXT: dict[str, str] = {
     "Literal whitespace values outside the intended layout are cleared; only intentional non-default style nodes may continue to define stored bounds.": "预期布局之外的纯空白字符值应被清除；只有有意保留的非默认样式节点可以继续定义存储范围。",
     "Apply the exact value cleanup after reviewing the preserved cell styles and blank-row layout.": "检查保留的单元格样式和空白行布局后，应用精确值清理。",
     "Review the referenced structure or formula blocker; no automatic cleanup is offered.": "请检查相关结构或公式阻碍因素；不提供自动清理。",
+    "A column with an explicit identifier-like header and high uniqueness contains a repeated normalized value.": "具有明确标识符类表头且高度唯一的列中出现了重复的规范化值。",
+    "Inferred identifier columns contain one nonblank value per record.": "推断的标识符列中，每条记录都应有且仅有一个非空值。",
+    "Review the repeated records or configure the intended key explicitly; no record is deleted automatically.": "请检查重复记录，或显式配置预期键；WorkbookLens 不会自动删除记录。",
+    "A populated record is missing its inferred identifier": "一条已有数据的记录缺少推断标识符",
+    "nonblank identifier": "非空标识符",
+    "A populated table row is blank in a column whose header and peer uniqueness strongly indicate record-identifier semantics.": "一个已有数据的表格行在某列中为空，而该列表头及参照值唯一性强烈表明其具有记录标识符语义。",
+    "Recover the identifier from an authoritative source or mark the record for review; WorkbookLens does not invent identifiers.": "请从权威来源恢复标识符，或将该记录标记为待复核；WorkbookLens 不会编造标识符。",
+    "A rare text value appears in a column whose populated peers are overwhelmingly numeric.": "在已填充值绝大多数为数值的列中出现了少见的文本值。",
+    "Numeric-dominant columns use numeric storage or a documented exception.": "数值主导列应使用数值存储，或明确记录例外情况。",
+    "Review the source text and convert it only when its intended numeric value is unambiguous; no value is guessed automatically.": "请检查源文本，仅在预期数值明确时进行转换；WorkbookLens 不会自动猜测数值。",
+    "A numeric literal is extremely far from the column median under a median-absolute-deviation check.": "按中位数绝对偏差检查，一个数值常量与该列中位数相距极远。",
+    "Values remain within the robust peer distribution unless the exception is documented.": "除非已记录例外情况，数值应处于稳健的参照分布范围内。",
+    "Verify the source value, unit, and decimal placement; statistical outliers are reported but never rewritten automatically.": "请核验源值、单位和小数点位置；统计异常值仅报告，绝不会自动改写。",
+    "A percentage-like column is dominated by fractional values, but one literal uses a different scale or lies outside the peer range.": "一个百分比类列以小数比例值为主，但某个常量使用了不同尺度或超出参照范围。",
+    "Percentage-like inputs use one documented scale and valid range.": "百分比类输入应使用一种明确记录的尺度和有效范围。",
+    "Confirm whether the literal should be divided by 100 or rejected; WorkbookLens does not rewrite semantic values automatically.": "请确认该常量应除以 100 还是应被拒绝；WorkbookLens 不会自动改写具有业务语义的值。",
+    "Date-like text uses a different storage representation from peer dates": "日期类文本采用了与参照日期不同的存储表示",
+    "Text in a date column cannot be parsed by supported unambiguous date formats": "日期列中的文本无法按支持的明确日期格式解析",
+    "A numeric Excel serial appears among typed date cells": "类型化日期单元格中出现了 Excel 数字序列值",
+    "A date-dominant column contains an invalid value or a storage representation inconsistent with typed date peers.": "以日期为主的列中包含无效值，或包含与类型化日期参照值不一致的存储表示。",
+    "Date columns use valid typed dates with one consistent storage convention.": "日期列应使用有效的类型化日期和一致的存储约定。",
+    "Review the source date and locale, then convert explicitly; WorkbookLens does not guess ambiguous dates.": "请检查源日期及区域设置后再显式转换；WorkbookLens 不会猜测含义不明确的日期。",
+    "The worksheet AutoFilter does not cover the header and dense populated extent of the intersecting inferred table.": "工作表自动筛选未覆盖相交推断表格的表头及密集填充范围。",
+    "AutoFilter ranges cover the intended table header and all populated records.": "自动筛选范围应覆盖预期表头和全部已有数据的记录。",
+    "Review the intended table boundary and reset the filter range manually; no filter definition is changed automatically.": "请检查预期表格边界并手动重设筛选范围；WorkbookLens 不会自动更改筛选定义。",
+    "A chart series has an unresolved, blank, length-mismatched, or semantically inconsistent source reference.": "图表序列的数据源引用无法解析、为空、长度不匹配或语义不一致。",
+    "Chart titles, categories, series labels, and value ranges resolve consistently.": "图表标题、分类、序列标签和值区域应一致解析。",
+    "Review the chart's Select Data dialog and source headers; WorkbookLens does not rewrite chart definitions automatically.": "请检查图表的“选择数据”对话框和源表头；WorkbookLens 不会自动改写图表定义。",
+    "The saved freeze pane locks many rows or columns and begins within the main visible data instead of near its header or leading identifiers.": "保存的冻结窗格锁定了许多行或列，并从主要可见数据内部开始，而不是靠近表头或前导标识符。",
+    "Freeze panes preserve headers or leading identifiers without obscuring data.": "冻结窗格应保留表头或前导标识符，同时避免遮挡数据。",
+    "Review the intended navigation point and reset the pane manually; WorkbookLens does not change freeze-pane definitions automatically.": "请检查预期导航起点并手动重设窗格；WorkbookLens 不会自动更改冻结窗格定义。",
+    "The saved print area intersects a dense table without covering it fully, or prints a chart while excluding a same-sheet source range.": "保存的打印区域与密集表格相交但未完整覆盖，或打印图表时排除了同一工作表中的数据源范围。",
+    "Print areas include the intended dense tables and printed chart sources.": "打印区域应包含预期的密集表格和所打印图表的数据源。",
+    "The saved print area intersects a dense table without covering it fully, or contains a chart anchor whose saved frame extends beyond the printed bounds.": "保存的打印区域与密集表格相交但未完整覆盖，或包含保存边框超出打印边界的图表锚点。",
+    "Print areas include intended dense tables and complete printed chart frames.": "打印区域应包含预期的密集表格和完整的打印图表边框。",
+    "Review page setup and expand or redefine the print area manually; WorkbookLens does not alter print settings automatically.": "请检查页面设置，并手动扩展或重新定义打印区域；WorkbookLens 不会自动更改打印设置。",
+    "Numeric peers overwhelmingly satisfy the inferred positive domain": "数值参照值绝大多数满足推断的正值范围",
+    "Numeric peers overwhelmingly satisfy the inferred nonnegative domain": "数值参照值绝大多数满足推断的非负范围",
+    "A literal violates a strongly inferred positive or nonnegative domain while the numeric peers overwhelmingly satisfy that domain.": "一个常量违反了强推断的正值或非负范围，而数值参照值绝大多数满足该范围。",
+    "A zero literal is unusual in a column whose header and peers suggest a positive measure, but valid business exceptions may exist.": "在表头和参照值表明该列通常应为正值时，零值较为异常，但仍可能存在有效的业务例外。",
+    "A negative literal conflicts with a strongly inferred positive or nonnegative measure domain.": "一个负值常量与强推断的正值或非负度量范围冲突。",
+    "Review whether zero is valid for this positive-like measure.": "请检查零值对该正值类度量是否有效。",
+    "Strongly constrained measures respect their inferred positive or nonnegative domain.": "具有强约束语义的度量应符合推断的正值或非负范围。",
+    "Verify the source value, sign, and unit; WorkbookLens reports the violation but does not replace semantic values automatically.": "请核验源值、符号和单位；WorkbookLens 会报告该问题，但不会自动替换具有业务语义的值。",
+    "A clear result label and the cell number format imply incompatible roles": "明确的结果标签与单元格数字格式表示互相冲突的角色",
+    "A cross-sheet dependency points to a missing, structurally blank, out-of-content, or visibly truncated source target.": "跨表依赖指向缺失、结构性空白、超出内容范围或明显截断的源目标。",
+    "A densely populated detail row has an extreme explicit height, without wrapped text, merged content, or an anchored drawing that explains it.": "一个密集填充的明细行设置了极端显式行高，且没有换行文本、合并内容或锚定绘图可以解释该高度。",
+    "A fixed-width identifier does not match its configured or inferred width": "一个定宽标识符不符合配置或推断出的位数",
+    "A labeled summary row is allowed to use distinct emphasis, but its numeric cells use number formats inconsistent with the value semantics established by their columns.": "带标签的汇总行可以使用不同的强调样式，但其数值单元格所用数字格式与所在列确立的数值语义不一致。",
+    "A literal record value ends with horizontal whitespace": "一个记录常量值以水平空白字符结尾",
+    "A literal text field has horizontal whitespace after its final visible character, which can break exact matching and deduplication.": "一个文本常量字段在最后一个可见字符后仍有水平空白，这可能破坏精确匹配和去重。",
+    "A nonblank value is absent from the configured allowed-value set": "一个非空值不在配置的允许值集合中",
+    "A numeric or date-dominated column uses explicit display formats whose estimated rendered text is wider than the saved column. Excel may show hash marks or clipped values.": "一个以数值或日期为主的列使用了显式显示格式，估算后的显示文本宽于已保存列宽；Excel 可能显示井号或截断值。",
+    "A populated record is blank in a configured required field": "一条已有数据的记录在配置的必填字段中为空",
+    "A summary-labelled aggregate stops before or starts after adjacent same-kind rows in the same inferred table column.": "一个带汇总标签的聚合范围在同一推断表格列的相邻同类型行之前结束，或在其之后开始。",
+    "A text-dominant notes column contains an isolated formula": "一个以文本为主的备注列中出现了孤立公式",
+    "A wide merged title combines several style choices that are unusual relative to the table beneath it; no single choice is treated as an error by itself.": "一个宽合并标题组合了多项相对于下方表格较异常的样式选择；任何单项选择本身都不会单独视为错误。",
+    "Aggregate range omits adjacent same-kind rows in one inferred table column": "聚合范围遗漏了同一推断表格列中的相邻同类型行",
+    "Cells serving the same header role use coherent styling and text-appropriate formats.": "承担同一表头角色的单元格应使用一致样式和适合文本的格式。",
+    "Cells with the same body-column role use stable component-level formatting.": "具有相同正文列角色的单元格应使用稳定的组件级格式。",
+    "Charts and images do not obscure non-source table or KPI content.": "图表和图片不应遮挡非数据源表格或 KPI 内容。",
+    "Choose an allowed value or update the workbook profile if this is a legitimate category.": "请选择允许值；如果这是合法类别，请更新工作簿 Profile。",
+    "Comparable detail rows use heights consistent with their visible content.": "可比较的明细行应使用与其可见内容相符的行高。",
+    "Component-wise comparison finds clustered or diffuse body-cell deviations that a single whole-style comparison can miss. Row-wide coherent highlights are excluded.": "按组件比较可发现单一整体样式比较可能遗漏的成簇或分散正文单元格偏差；一致的整行高亮已排除。",
+    "Confirm the KPI meaning and then review the number format manually; the formula and format are not changed automatically.": "请确认 KPI 含义后手动检查数字格式；公式和格式均不会自动更改。",
+    "Confirm the identifier width and restore the original identifier manually; WorkbookLens does not guess missing or extra digits.": "请确认标识符宽度并手动恢复原标识符；WorkbookLens 不会猜测缺失或多余数字。",
+    "Confirm the intended contact value manually; WorkbookLens does not rewrite personal contact information.": "请手动确认预期联系方式；WorkbookLens 不会改写个人联系方式。",
+    "Confirm whether the formula was pasted into the wrong column or should be stored as literal text; no automatic edit is proposed.": "请确认该公式是否误贴到错误列，或是否本应存为文本常量；不提供自动编辑。",
+    "Contact fields contain structurally valid email addresses or phone numbers.": "联系方式字段应包含结构有效的电子邮箱地址或电话号码。",
+    "Cross-sheet dependency target requires review": "跨表依赖目标需要复核",
+    "The referenced cells are currently blank outside the source sheet's populated content and may be planned future input, so this advisory does not prove the formula is erroneous.": "引用单元格当前位于源工作表已有内容之外且为空，可能是预留的未来输入；此提示仅供参考，不能证明公式有误。",
+    "The referenced cells are currently blank outside the sheet's populated content and may be reserved for future input; confirm the template intent before editing the formula.": "引用单元格当前位于工作表已有内容之外且为空，可能是预留的未来输入；编辑公式前请确认模板意图。",
+    "Cross-sheet references resolve to the intended populated source region.": "跨表引用应解析到预期且已有数据的源区域。",
+    "Enumerated fields use one of the values declared in the workbook profile.": "枚举字段应使用工作簿 Profile 中声明的值之一。",
+    "Every populated record has a nonblank value in configured required fields.": "每条已有数据的记录都应在配置的必填字段中具有非空值。",
+    "Fixed-format numeric and date values remain legible at the saved width.": "固定格式的数值和日期在已保存列宽下应保持清晰可读。",
+    "Fixed-width identifiers use the declared or strongly inferred digit width consistently.": "定宽标识符应一致使用已声明或强推断的位数。",
+    "Formula results use a number format compatible with the labelled role.": "公式结果应使用与标签角色兼容的数字格式。",
+    "Header role has incompatible number formats or multi-component style fragmentation": "表头角色存在不兼容的数字格式或多组件样式碎片化",
+    "Inspect the source worksheet and intended table boundary before editing the formula; WorkbookLens does not guess replacement references.": "编辑公式前请检查源工作表和预期表格边界；WorkbookLens 不会猜测替换引用。",
+    "Notes and instruction columns normally contain literal text.": "备注和说明列通常应包含文本常量。",
+    "Number formats do not contradict amount, percentage, or date field semantics.": "数字格式不应与金额、百分比或日期字段语义冲突。",
+    "Record text has no unintended horizontal whitespace at the end.": "记录文本末尾不应含有非预期的水平空白。",
+    "Remove configured ASCII trailing spaces after explicit review; the source text and style preconditions must still match.": "在明确复核后移除配置允许处理的 ASCII 尾随空格；源文本和样式前置条件仍必须匹配。",
+    "Review a local column-width adjustment or a deliberate number format; no width or format is changed automatically.": "请复核局部列宽调整或有意设置的数字格式；列宽和格式均不会自动更改。",
+    "Review and apply the proposed text patch; it is never selected by safe-only repair.": "请复核后应用建议的文本补丁；该补丁绝不会被仅安全修复自动选中。",
+    "Review each total-row format manually; no formula or style is changed.": "请逐一手动复核总计行格式；公式和样式均不会更改。",
+    "Review the aggregate boundary against the complete table body; business formulas are not changed automatically.": "请依据完整表格主体复核聚合边界；业务公式不会自动更改。",
+    "Review the drawing position and size in Excel; WorkbookLens does not move or resize drawings automatically.": "请在 Excel 中复核绘图位置和大小；WorkbookLens 不会自动移动或调整绘图尺寸。",
+    "Review the header row as a group; no global header style is imposed.": "请将表头行作为整体复核；不会强制应用全局表头样式。",
+    "Review the listed components and preserve intentional exceptions; no body style is copied automatically.": "请复核列出的样式组件并保留有意例外；不会自动复制正文样式。",
+    "Review the operands and intended KPI logic; the structural fact is proven, but WorkbookLens does not infer the replacement formula.": "请复核操作数和预期 KPI 逻辑；结构事实已得到静态证明，但 WorkbookLens 不会推断替换公式。",
+    "Review the possible near match and choose the intended value manually; no spelling correction is applied automatically.": "请复核可能的近似匹配并手动选择预期值；不会自动应用拼写修正。",
+    "Review the row locally and reset or resize it if the difference is accidental; WorkbookLens does not normalize row heights automatically.": "请局部复核该行；若差异并非有意，请重置或调整行高；WorkbookLens 不会自动统一行高。",
+    "Review the source text and remove the trailing whitespace manually if unintended.": "请复核源文本；若尾随空白并非有意，请手动移除。",
+    "Review the stored value and intended display role before changing the number format; no format is copied automatically.": "更改数字格式前，请复核存储值和预期显示角色；不会自动复制格式。",
+    "Review the title's font, fill, and alignment as one unit; no style is copied automatically.": "请将标题的字体、填充和对齐作为整体复核；不会自动复制样式。",
+    "Summary emphasis may differ while numeric display semantics remain compatible.": "汇总行可以采用不同强调方式，但数值显示语义仍应保持兼容。",
+    "Supply or confirm the business value manually; WorkbookLens does not invent required-field contents.": "请手动补充或确认业务值；WorkbookLens 不会编造必填字段内容。",
+    "The cell number format expresses a semantic role that contradicts the configured or strongly inferred column role.": "单元格数字格式表达的语义角色与配置或强推断的列角色相冲突。",
+    "The formula expresses the intended non-degenerate business calculation.": "公式应表达预期且非退化的业务计算。",
+    "The identifier digit count conflicts with the configured width or a strong fixed-width peer pattern, including possible missing or extra leading zeros.": "该标识符位数与配置宽度或强一致的定宽参照模式冲突，包括可能缺失或多出的前导零。",
+    "The inferred column role is free-text notes or instructions, while this isolated cell contains an executable formula.": "推断的列角色为自由文本备注或说明，但该孤立单元格含有可执行公式。",
+    "The inferred header row contains text labels with numeric display formats or is fragmented across several independent style components.": "推断表头行包含使用数值显示格式的文本标签，或在多个独立样式组件上出现碎片化。",
+    "The label strongly describes a rate or monetary amount, but the formula cell uses the opposite percentage/currency display role.": "标签明确描述比例或金额，但公式单元格使用了相反的百分比或货币显示角色。",
+    "The literal value does not match any configured enumeration value after Unicode, whitespace, and case normalization.": "对 Unicode、空白和大小写进行规范化后，该常量值仍不匹配任何配置的枚举值。",
+    "The saved drawing frame intersects populated cells in an inferred data or KPI region after excluding cells used by the chart itself.": "排除图表自身使用的单元格后，已保存绘图边框仍与推断数据区域或 KPI 区域中的已有数据单元格相交。",
+    "The value does not satisfy the conservative structural validator for the configured or strongly inferred contact-field role.": "该值未通过配置或强推断联系方式字段角色的保守结构校验。",
+    "The workbook profile marks this field as required, and the row contains other record data but no value in this field.": "工作簿 Profile 将此字段标记为必填；该行含有其他记录数据，但此字段没有值。",
+    "Title styling is internally coherent and intentionally distinct from table data.": "标题样式应内部一致，并有意区别于表格数据。",
+    "Top-level formula structure is algebraically degenerate": "顶层公式结构在代数上发生退化",
+    "nonblank value": "非空值",
 }
 
 
@@ -258,6 +507,95 @@ DYNAMIC_TRANSLATIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r"(?P<count>\d+) literal-whitespace cells form an outer tail"),
         "{count} 个纯空白字符单元格形成外部尾部",
+    ),
+    (
+        re.compile(r"Identifier value appears (?P<count>\d+) times in an inferred key column"),
+        "推断键列中的标识符值出现了 {count} 次",
+    ),
+    (
+        re.compile(r"(?P<numeric>\d+) of (?P<total>\d+) populated peers use numeric storage"),
+        "{total} 个已填充参照值中有 {numeric} 个使用数值存储",
+    ),
+    (
+        re.compile(
+            r"Robust modified z-score is (?P<score>[0-9.]+) across (?P<count>\d+) numeric peers"
+        ),
+        "在 {count} 个数值参照值中，稳健修正 z 分数为 {score}",
+    ),
+    (
+        re.compile(
+            r"(?P<fractional>\d+) of (?P<total>\d+) numeric peers use fractional "
+            r"percentage storage"
+        ),
+        "{total} 个数值参照值中有 {fractional} 个使用小数百分比存储",
+    ),
+    (
+        re.compile(
+            r"AutoFilter excludes (?P<rows>\d+) populated rows and "
+            r"(?P<columns>\d+) populated columns"
+        ),
+        "自动筛选排除了 {rows} 个已有数据的行和 {columns} 个已有数据的列",
+    ),
+    (
+        re.compile(r"Chart (?P<chart>\d+) has (?P<count>\d+) source-range issues"),
+        "图表 {chart} 存在 {count} 个数据源范围问题",
+    ),
+    (
+        re.compile(r"Freeze pane at (?P<cell>[A-Z]+\d+) is deep inside visible content"),
+        "冻结窗格起点 {cell} 深入可见内容区域",
+    ),
+    (
+        re.compile(r"Print area leaves (?P<count>\d+) meaningful ranges outside its bounds"),
+        "打印区域边界之外仍有 {count} 个有效范围",
+    ),
+    (
+        re.compile(
+            r"A nonblank (?P<role>email|phone) value fails conservative structural validation"
+        ),
+        "一个非空{role}值未通过保守结构校验",
+    ),
+    (
+        re.compile(
+            r"A (?P<role>currency|percentage|date) field uses a conflicting "
+            r"number-format role"
+        ),
+        "一个{role}字段使用了冲突的数字格式角色",
+    ),
+    (
+        re.compile(
+            r"(?P<kind>Chart|Image) (?P<index>\d+) covers (?P<count>\d+) populated "
+            r"non-source cells"
+        ),
+        "{kind} {index} 遮挡了 {count} 个已有数据的非数据源单元格",
+    ),
+    (
+        re.compile(r"(?P<count>\d+) fixed-format numeric values exceed the estimated column width"),
+        "{count} 个固定格式数值超过估算列宽",
+    ),
+    (
+        re.compile(
+            r"Explicit row height (?P<height>[0-9.]+) is (?P<ratio>[0-9.]+) times "
+            r"the detail-row median"
+        ),
+        "显式行高 {height} 是明细行中位行高的 {ratio} 倍",
+    ),
+    (
+        re.compile(r"Merged title combines (?P<count>\d+) unusual role-specific style components"),
+        "合并标题组合了 {count} 个异常的角色特定样式组件",
+    ),
+    (
+        re.compile(r"Body-role component consensus identifies (?P<count>\d+) anomalous cells"),
+        "正文角色组件共识识别出 {count} 个异常单元格",
+    ),
+    (
+        re.compile(
+            r"(?P<count>\d+) total-row cells use formats inconsistent with their body columns"
+        ),
+        "{count} 个总计行单元格使用了与正文列不一致的格式",
+    ),
+    (
+        re.compile(r"Confirm whether (?P<observed>.+) should cover (?P<expected>.+)\."),
+        "请确认 {observed} 是否应覆盖 {expected}。",
     ),
 )
 

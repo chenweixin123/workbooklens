@@ -24,10 +24,23 @@ def _dynamic_translation(text: str) -> str | None:
         if match is None:
             continue
         values = match.groupdict()
-        if values.get("kind") == "numeric":
-            values["kind"] = "数值"
-        elif values.get("kind") == "formula":
-            values["kind"] = "公式"
+        kind = values.get("kind")
+        if kind:
+            values["kind"] = {
+                "numeric": "数值",
+                "formula": "公式",
+                "Chart": "图表",
+                "Image": "图片",
+            }.get(kind, kind)
+        role = values.get("role")
+        if role:
+            values["role"] = {
+                "email": "邮箱",
+                "phone": "电话",
+                "currency": "金额",
+                "percentage": "百分比",
+                "date": "日期",
+            }.get(role, role)
         if values.get("state") == "hidden":
             values["state"] = "隐藏"
         elif values.get("state") == "veryHidden":

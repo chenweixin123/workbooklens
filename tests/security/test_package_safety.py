@@ -263,8 +263,9 @@ def test_external_relationship_is_recorded_but_not_opened(tmp_path: Path) -> Non
 def test_wrong_extension_and_non_zip_fail_clearly(tmp_path: Path) -> None:
     wrong = tmp_path / "book.xls"
     wrong.write_bytes(b"not a workbook")
-    with pytest.raises(UsageError, match=r"only \.xlsx"):
+    with pytest.raises(UsageError, match=r"only \.xlsx") as error:
         inspect_package(wrong)
+    assert "2.2" not in str(error.value)
     fake = tmp_path / "book.xlsx"
     fake.write_bytes(b"not a zip")
     with pytest.raises(UnsafeWorkbookError, match="not a valid ZIP"):

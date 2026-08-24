@@ -2,6 +2,80 @@
 
 All notable changes are documented here. WorkbookLens follows Semantic Versioning.
 
+## [Unreleased]
+
+## [2.4.0] - 2026-08-24
+
+### Added
+
+- Add an optional user-editable Workbook Profile with bounded sheet/column contracts for required
+  fields, enumerations and near-match evidence, email and phone structure, fixed-width identifiers,
+  trailing whitespace, and currency/percentage/date role conflicts. Business values remain
+  report-only; an explicitly requested ASCII-space cleanup is always `layout_review`.
+- Add a conservative Formula IR and report-only rules for truncated aggregate ranges, invalid or
+  structurally blank cross-sheet targets, isolated formulas in notes columns, algebraically
+  degenerate top-level formulas, and formula-label/number-format role conflicts.
+- Add report-only layout geometry for chart/image overlap with non-source data or KPI regions,
+  fixed-format numeric display width risk, unexplained explicit row-height outliers, and
+  role-aware title/header/body/total style fragmentation.
+- Add report-only inferred data-quality rules for duplicate or missing identifiers, mixed numeric
+  storage, robust numeric outliers, percentage-scale anomalies, date-storage anomalies, and
+  sign-domain violations: negative values under nonnegative headers, and zero or negative values
+  under positive headers.
+- Add report-only structure checks for partial AutoFilter coverage, chart category/value range
+  mismatches, deeply displaced freeze panes, and print areas that truncate inferred tables or chart
+  frames already included by the print area.
+- Add formula-text, bounded static circular-dependency, and provable formula-error findings. The
+  provable error rule is intentionally narrow and recognizes only deterministic expressions such as
+  direct NA(), simple constant division by zero, and clearly nonnumeric literal VALUE(...) calls.
+  Saved OOXML formula-error caches are reported separately as advisory evidence and may be stale.
+
+### Changed
+
+- Add bilingual Select all/Clear all controls and a live selected-count summary to the local repair
+  review page. Bulk selection is scoped only to proposed repairs and never checks the separate
+  layout-risk consent on the user's behalf.
+- Keep references to missing worksheets as `ERROR`, while classifying an empty target outside
+  recorded content as low-confidence advisory `INFO`. Add scan-scoped sparse-index,
+  formula-cell, and row-label caches; these formula checks remain findings-only.
+- Apply one 1,000,000-cell Profile-range limit to direct scanner configuration and YAML Profiles,
+  and resolve sparse Profile body rows without walking the full declared rectangle.
+- Make Profile configuration fail closed for boolean-to-integer coercion, out-of-range header rows,
+  duplicate worksheet/table definitions, ambiguous or missing headers, out-of-range columns, and
+  multiple selectors resolving to the same physical column. A bounded range now defaults its
+  header row to the range's first row, and Profiles require configuration version 2.
+- Resolve chart source worksheet names plus global and worksheet-local defined names
+  case-insensitively, matching Excel semantics. Suppress overlap findings only for exact chart
+  source cells, preserving covered non-source columns for WL047 detection.
+- Interpret zero-offset TwoCellAnchor end markers at the leading edge of the marker cell, avoiding
+  false print-area truncation findings while retaining real row or column overflow findings.
+- Expand the built-in deterministic registry from 35 to 50 rules and require exact Chinese/English
+  title, explanation, evidence-summary, expectation, and suggested-action coverage for every
+  built-in module.
+- Extend version-2 YAML validation with a strict, bounded `profile.sheets[].columns[]` schema while
+  preserving direct scanner calls that omit a Profile.
+- Bound Hatchling below 1.32 because 1.32 emits Core Metadata 2.5, which current Twine 6.2 rejects;
+  the compatible build emits Core Metadata 2.4 and passes strict distribution checks.
+- Build copied-formula consensus across inferred data-body columns so several anomalies no longer
+  split the evidence into short bands. Multiple formula, blank, or hardcoded anomalies are reported
+  but are never patched automatically; a formula patch still requires one anomaly, at least 0.95
+  confidence, exact translation agreement, and stable visible detail-row semantics.
+- Exclude fully blank structural separator rows from missing-formula findings, preventing false
+  creation of formulas immediately before subtotal or total rows.
+- Cache circular-reference analysis once per scan and bound range expansion to avoid quadratic work
+  on broad references while retaining direct and bounded-range cycle detection.
+- Prefer an atomic bounded-width, wrap, and row-height proposal for one isolated extreme long-text
+  row. Multiple dependent rows remain findings-only, and automatic row-height proposals no longer
+  grow to visually disruptive sizes.
+- Remove the stale fixed-version wording from the OOXML input safety message.
+- Harden role-aware style inspection when an OOXML border side is absent instead of represented by
+  an empty `Side`, preventing a valid workbook from raising `WL-INT-001`.
+- Keep WL007 from treating a data region's first-row top edge or last-row bottom edge as a column
+  style anomaly when every other visible style component matches; WL017 remains responsible for
+  border continuity findings.
+- Generalize the Windows installer upgrade smoke test to accept a pinned earlier numeric release,
+  while retaining the legacy portable-profile exception only for version 2.2.1.
+
 ## [2.3.0] - 2026-08-23
 
 ### Added

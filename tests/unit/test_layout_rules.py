@@ -101,9 +101,12 @@ def test_default_height_blocked_overflow_applies_without_stale_layout_fingerprin
     patches = [
         patch
         for patch in scan.patches
-        if patch.cell == "A1" and patch.kind in {PatchKind.SET_WRAP_TEXT, PatchKind.SET_ROW_HEIGHT}
+        if patch.cell == "A1"
+        and patch.kind
+        in {PatchKind.SET_COLUMN_WIDTH, PatchKind.SET_WRAP_TEXT, PatchKind.SET_ROW_HEIGHT}
     ]
     assert {patch.kind for patch in patches} == {
+        PatchKind.SET_COLUMN_WIDTH,
         PatchKind.SET_WRAP_TEXT,
         PatchKind.SET_ROW_HEIGHT,
     }
@@ -155,14 +158,25 @@ def test_row_height_covers_existing_vertical_and_new_horizontal_issue(
         for patch in scan.patches
         if patch.kind == PatchKind.SET_WRAP_TEXT and patch.cell == "B1"
     )
+    width_patch = next(
+        patch
+        for patch in scan.patches
+        if patch.kind == PatchKind.SET_COLUMN_WIDTH and patch.cell == "B1"
+    )
     measured = load_workbook(source)
     measured_sheet = measured.active
     assert measured_sheet is not None
-    wrapped_measurement = measure_text_cell(measured_sheet, measured_sheet["B1"], assume_wrap=True)
+    wrapped_measurement = measure_text_cell(
+        measured_sheet,
+        measured_sheet["B1"],
+        assume_wrap=True,
+        available_width_override=width_patch.after["width"],
+    )
     assert wrapped_measurement is not None
     assert row_patch.after["height"] >= wrapped_measurement.required_height
     measured.close()
     assert row_patch.atomic_group == wrap_patch.atomic_group
+    assert row_patch.atomic_group == width_patch.atomic_group
 
     repaired = load_workbook(source)
     repaired_sheet = repaired.active
@@ -170,6 +184,7 @@ def test_row_height_covers_existing_vertical_and_new_horizontal_issue(
     alignment = copy(repaired_sheet["B1"].alignment)
     alignment.wrap_text = True
     repaired_sheet["B1"].alignment = alignment
+    repaired_sheet.column_dimensions["B"].width = width_patch.after["width"]
     repaired_sheet.row_dimensions[1].height = row_patch.after["height"]
     repaired_path = tmp_path / "mixed-row-display-risk-repaired.xlsx"
     repaired.save(repaired_path)
@@ -273,6 +288,89 @@ def test_repeated_overflow_at_width_cap_falls_back_to_atomic_wrap_and_height(
         assert row_patches[0].atomic_group is not None
 
 
+def test_isolated_long_text_widens_before_wrapping_to_avoid_excessive_row_height(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet["A1"] = (
+        "This item description is intentionally far too long for this tiny column and "
+        "would otherwise produce an excessively tall wrapped row."
+    )
+    worksheet["B1"] = "blocker"
+    worksheet.column_dimensions["A"].width = 6
+    worksheet.row_dimensions[1].height = 8
+    source = tmp_path / "isolated-long-text.xlsx"
+    scan = _scan(workbook, source)
+
+    patches = [
+        patch
+        for patch in scan.patches
+        if patch.cell == "A1"
+        and patch.kind
+        in {PatchKind.SET_COLUMN_WIDTH, PatchKind.SET_WRAP_TEXT, PatchKind.SET_ROW_HEIGHT}
+    ]
+    assert {patch.kind for patch in patches} == {
+        PatchKind.SET_COLUMN_WIDTH,
+        PatchKind.SET_WRAP_TEXT,
+        PatchKind.SET_ROW_HEIGHT,
+    }
+    assert len({patch.atomic_group for patch in patches}) == 1
+    assert patches[0].atomic_group is not None
+    width_patch = next(patch for patch in patches if patch.kind == PatchKind.SET_COLUMN_WIDTH)
+    row_patch = next(patch for patch in patches if patch.kind == PatchKind.SET_ROW_HEIGHT)
+    assert 6 < width_patch.after["width"] <= 40
+    assert row_patch.after["height"] <= 90
+
+    output = tmp_path / "isolated-long-text-fixed.xlsx"
+    apply_patch_plan(
+        source,
+        build_patch_plan(scan),
+        output,
+        selected_ids={patch.id for patch in patches},
+        accept_layout_risk=True,
+    )
+    repaired = load_workbook(output)
+    repaired_sheet = repaired.active
+    assert repaired_sheet is not None
+    assert repaired_sheet.column_dimensions["A"].width == width_patch.after["width"]
+    assert repaired_sheet["A1"].alignment.wrap_text
+    assert repaired_sheet.row_dimensions[1].height == row_patch.after["height"]
+    repaired.close()
+    assert not _findings(scan_workbook(output), "WL016_TEXT_DISPLAY_RISK")
+
+
+def test_multiple_extreme_rows_do_not_share_a_partially_selectable_width_patch(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    long_text = (
+        "This deliberately long description would need an excessive row height in a tiny column, "
+        "and the same problem occurs on more than one row."
+    )
+    for row in (1, 2):
+        worksheet.cell(row, 1, long_text)
+        worksheet.cell(row, 2, "blocker")
+        worksheet.row_dimensions[row].height = 8
+    worksheet.column_dimensions["A"].width = 6
+
+    scan = _scan(workbook, tmp_path / "multiple-extreme-rows.xlsx")
+
+    assert {finding.location for finding in _findings(scan, "WL016_TEXT_DISPLAY_RISK")} == {
+        "A1",
+        "A2",
+    }
+    assert not any(
+        patch.cell in {"A1", "A2"}
+        and patch.kind
+        in {PatchKind.SET_COLUMN_WIDTH, PatchKind.SET_WRAP_TEXT, PatchKind.SET_ROW_HEIGHT}
+        for patch in scan.patches
+    )
+
+
 def test_extreme_blocked_overflow_is_finding_only_above_excel_row_height_limit(
     tmp_path: Path,
 ) -> None:
@@ -362,6 +460,61 @@ def test_single_row_merged_title_uses_atomic_wrap_and_height(tmp_path: Path) -> 
     assert repaired_sheet["A1"].alignment.wrap_text
     assert repaired_sheet.row_dimensions[1].height is not None
     repaired.close()
+    assert not _findings(scan_workbook(output), "WL016_TEXT_DISPLAY_RISK")
+
+
+def test_mixed_merged_and_plain_long_text_in_column_does_not_override_merged_width(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.merge_cells("A1:C1")
+    worksheet["A1"] = "A merged title that is substantially wider than the merged region"
+    worksheet["A2"] = (
+        "This item description is intentionally far too long for this tiny column and "
+        "would otherwise produce an excessively tall wrapped row."
+    )
+    worksheet["B2"] = "blocker"
+    for column in ("A", "B", "C"):
+        worksheet.column_dimensions[column].width = 6
+    worksheet.row_dimensions[1].height = 15
+    worksheet.row_dimensions[2].height = 8
+    source = tmp_path / "mixed-merged-and-plain-long-text.xlsx"
+
+    scan = _scan(workbook, source)
+
+    findings = _findings(scan, "WL016_TEXT_DISPLAY_RISK")
+    findings_by_location = {finding.location: finding for finding in findings}
+    assert set(findings_by_location) == {"A1", "A2"}
+    assert findings_by_location["A1"].evidence.details["merged_range"] == "A1:C1"
+    assert findings_by_location["A2"].evidence.details["merged_range"] is None
+    layout_kinds = {
+        PatchKind.SET_COLUMN_WIDTH,
+        PatchKind.SET_WRAP_TEXT,
+        PatchKind.SET_ROW_HEIGHT,
+    }
+    a1_kinds = {
+        patch.kind for patch in scan.patches if patch.cell == "A1" and patch.kind in layout_kinds
+    }
+    a2_kinds = {
+        patch.kind for patch in scan.patches if patch.cell == "A2" and patch.kind in layout_kinds
+    }
+    assert a1_kinds == {PatchKind.SET_WRAP_TEXT, PatchKind.SET_ROW_HEIGHT}
+    assert a2_kinds == layout_kinds
+    width_patches = [patch for patch in scan.patches if patch.kind == PatchKind.SET_COLUMN_WIDTH]
+    assert len(width_patches) == 1
+    assert width_patches[0].cell == "A2"
+    assert 6 < width_patches[0].after["width"] <= 40
+
+    output = tmp_path / "mixed-merged-and-plain-long-text-fixed.xlsx"
+    apply_patch_plan(
+        source,
+        build_patch_plan(scan),
+        output,
+        selected_ids={patch_id for finding in findings for patch_id in finding.patch_ids},
+        accept_layout_risk=True,
+    )
     assert not _findings(scan_workbook(output), "WL016_TEXT_DISPLAY_RISK")
 
 

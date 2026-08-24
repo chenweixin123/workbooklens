@@ -150,8 +150,29 @@ def test_local_web_scan_apply_and_download_workflow(tmp_path: Path) -> None:
         session_id = session_match.group(1)
         result_token = _csrf_token(response.text)
         patch_ids = re.findall(r'name="patch_id" value="([^"]+)" data-risk="safe"', response.text)
+        all_patch_ids = re.findall(
+            r'name="patch_id" value="([^"]+)" data-risk="[^"]+"', response.text
+        )
         assert len(patch_ids) == 4
+        assert len(all_patch_ids) > len(patch_ids)
         assert 'data-risk="layout_review"' in response.text
+        assert re.search(
+            r'<button id="select-all-patches" class="secondary" type="button" '
+            r'aria-controls="patch-list">Select all</button>',
+            response.text,
+        )
+        assert re.search(
+            r'<button id="clear-all-patches" class="secondary" type="button" '
+            r'aria-controls="patch-list" disabled>Clear all</button>',
+            response.text,
+        )
+        assert f"0 of {len(all_patch_ids)} repairs selected" in response.text
+        assert (
+            "applyForm.querySelectorAll('#patch-list input[name=\"patch_id\"]:not(:disabled)')"
+            in response.text
+        )
+        assert "querySelectorAll('input[type=\"checkbox\"]')" not in response.text
+        assert 'name="accept_layout_risk"' in response.text
         report = client.get(f"/sessions/{session_id}/report")
         assert report.status_code == 200
         assert report.headers["content-disposition"].startswith("inline")
@@ -159,6 +180,11 @@ def test_local_web_scan_apply_and_download_workflow(tmp_path: Path) -> None:
         assert client.get(f"/sessions/{session_id}/plan").status_code == 200
         rejected_apply = client.post(f"/sessions/{session_id}/apply", data={"patch_id": patch_ids})
         assert rejected_apply.status_code == 403
+        rejected_layout_apply = client.post(
+            f"/sessions/{session_id}/apply",
+            data={"csrf_token": result_token, "patch_id": all_patch_ids},
+        )
+        assert rejected_layout_apply.status_code == 400
         applied = client.post(
             f"/sessions/{session_id}/apply",
             data={"csrf_token": result_token, "patch_id": patch_ids},
@@ -276,6 +302,10 @@ def test_web_results_can_switch_language_without_resubmitting_upload(tmp_path: P
         assert '<html lang="zh-CN">' in chinese.text
         assert "检查结果" in chinese.text
         assert "检查建议修复" in chinese.text
+        assert ">全选</button>" in chinese.text
+        assert ">取消全选</button>" in chinese.text
+        assert "Select all</button>" not in chinese.text
+        assert "Clear all</button>" not in chinese.text
         assert "Inspection results" not in chinese.text
 
         persisted = client.get(f"/sessions/{session_id}")
@@ -443,7 +473,9 @@ def test_xlsm_web_scan_does_not_offer_repairs(tmp_path: Path) -> None:
             },
         )
     assert response.status_code == 200
-    assert 'name="patch_id"' not in response.text
+    assert not re.search(r'<input[^>]+name="patch_id"', response.text)
+    assert 'id="select-all-patches"' not in response.text
+    assert 'id="clear-all-patches"' not in response.text
     assert "No reviewable repairs were proposed" in response.text
 
 

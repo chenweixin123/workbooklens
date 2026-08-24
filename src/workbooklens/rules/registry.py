@@ -44,5 +44,18 @@ def default_registry() -> RuleRegistry:
     """Construct a fresh registry containing all built-in rules."""
 
     from workbooklens.rules.builtin import BUILTIN_RULES
+    from workbooklens.rules.data_quality import DATA_QUALITY_RULES
+    from workbooklens.rules.formula_semantics import FORMULA_SEMANTIC_RULES
+    from workbooklens.rules.layout_geometry import LAYOUT_GEOMETRY_RULES
+    from workbooklens.rules.profile_quality import PROFILE_QUALITY_RULES
 
-    return RuleRegistry(rule_type() for rule_type in BUILTIN_RULES)
+    return RuleRegistry(
+        rule_type()
+        for rule_type in (
+            *BUILTIN_RULES,
+            *DATA_QUALITY_RULES,
+            *PROFILE_QUALITY_RULES,
+            *FORMULA_SEMANTIC_RULES,
+            *LAYOUT_GEOMETRY_RULES,
+        )
+    )

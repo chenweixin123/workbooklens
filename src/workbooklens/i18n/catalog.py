@@ -119,6 +119,12 @@ _MESSAGE_PAIRS: dict[str, tuple[str, str]] = {
         "Only explicitly selected repairs are applied. Original files are never overwritten.",
         "只会应用明确选中的修复，原文件绝不会被覆盖。",
     ),
+    "web.results_select_all": ("Select all", "全选"),
+    "web.results_clear_all": ("Clear all", "取消全选"),
+    "web.results_selection_count": (
+        "{selected} of {total} repairs selected",
+        "已选择 {selected}/{total} 项修复",
+    ),
     "web.results_layout_consent": (
         "I reviewed and accept the layout changes",
         "我已检查并接受这些布局更改",
