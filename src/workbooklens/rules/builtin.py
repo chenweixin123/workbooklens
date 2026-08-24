@@ -11,6 +11,7 @@ from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from itertools import pairwise
+from statistics import median
 from typing import Any, cast
 
 from openpyxl.cell.cell import Cell, MergedCell
@@ -32,6 +33,10 @@ from workbooklens.formulas import (
     analyze_formula,
     normalize_formula,
     translate_formula,
+)
+from workbooklens.formulas.error_propagation import (
+    StaticFormulaErrorProof,
+    find_static_formula_errors,
 )
 from workbooklens.formulas.ir import WorksheetContentIndex
 from workbooklens.layout import (
@@ -79,6 +84,29 @@ MAX_EXCEL_ROW_HEIGHT = 409.5
 MAX_AUTOMATIC_TEXT_ROW_HEIGHT = 90.0
 MAX_AUTOMATIC_TEXT_COLUMN_WIDTH = 40.0
 TEXT_COLUMN_WIDTH_STEPS = (18.0, 24.0, 30.0, 36.0, 40.0)
+FREE_TEXT_HEADER_MARKERS = (
+    "email",
+    "mail",
+    "mobile",
+    "note",
+    "notes",
+    "comment",
+    "comments",
+    "remark",
+    "remarks",
+    "phone",
+    "telephone",
+    "description",
+    "details",
+    "说明",
+    "手机",
+    "电话",
+    "备注",
+    "描述",
+    "详情",
+    "邮箱",
+    "邮件",
+)
 MAX_STATIC_CIRCULAR_DEPENDENCIES_PER_REFERENCE = 4096
 MAX_STATIC_CIRCULAR_GRAPH_NONSELF_EDGES = 250_000
 DECIMAL_LITERAL_PATTERN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?"
@@ -788,6 +816,114 @@ def _visible_text_cells(worksheet: Worksheet) -> list[Cell]:
     )
 
 
+def _header_is_identifier_or_free_text(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().casefold()
+    if not normalized:
+        return False
+    if any(marker in normalized for marker in FREE_TEXT_HEADER_MARKERS):
+        return True
+    return _looks_like_identifier_header(value)
+
+
+def _text_body_profile(worksheet: Worksheet, region: Region, column: int) -> tuple[float, int]:
+    values = [
+        cell.value
+        for row in range(region.min_row + 1, region.max_row + 1)
+        if isinstance(cell := worksheet._cells.get((row, column)), Cell)
+        and cell.value is not None
+        and not (isinstance(cell.value, str) and not cell.value.strip())
+        and not _is_hidden_cell(worksheet, cell)
+    ]
+    if not values:
+        return 0.0, 0
+    text_count = sum(isinstance(value, str) for value in values)
+    return text_count / len(values), text_count
+
+
+def _text_width_block_advisory(
+    worksheet: Worksheet,
+    region: Region,
+    horizontal_by_column: Mapping[int, Sequence[tuple[Cell, Any, str]]],
+) -> dict[str, Any] | None:
+    """Find a multi-column width pattern worth reviewing without proposing a patch."""
+
+    if (
+        region.kind != "data"
+        or float(region.confidence) < 0.85
+        or region.max_row - region.min_row + 1 < 8
+        or region.max_column - region.min_column + 1 < 5
+    ):
+        return None
+    profile_cache: dict[int, tuple[float, int]] = {}
+
+    def profile(column: int) -> tuple[float, int]:
+        if column not in profile_cache:
+            profile_cache[column] = _text_body_profile(worksheet, region, column)
+        return profile_cache[column]
+
+    columns: list[dict[str, Any]] = []
+    for column, issues in sorted(horizontal_by_column.items()):
+        if not region.min_column <= column <= region.max_column:
+            continue
+        scoped = [issue for issue in issues if region.min_row < issue[0].row <= region.max_row]
+        if len(scoped) < 3:
+            continue
+        header = worksheet._cells.get((region.min_row, column))
+        if not isinstance(header, Cell) or _header_is_identifier_or_free_text(header.value):
+            continue
+        text_ratio, text_count = profile(column)
+        issue_density = len(scoped) / max(1, text_count)
+        if text_ratio < 0.5 or issue_density < 0.2:
+            continue
+        columns.append(
+            {
+                "column": get_column_letter(column),
+                "index": column,
+                "header": str(header.value).strip(),
+                "width": round(column_width(worksheet, column), 2),
+                "text_ratio": round(text_ratio, 3),
+                "issue_density": round(issue_density, 3),
+                "issues": sorted(issue[0].coordinate for issue in scoped),
+            }
+        )
+    if len(columns) < 2:
+        return None
+    comparable: list[dict[str, Any]] = []
+    for column in range(region.min_column, region.max_column + 1):
+        header = worksheet._cells.get((region.min_row, column))
+        if not isinstance(header, Cell) or _header_is_identifier_or_free_text(header.value):
+            continue
+        text_ratio, _ = profile(column)
+        if text_ratio >= 0.5:
+            comparable.append(
+                {
+                    "column": get_column_letter(column),
+                    "width": round(column_width(worksheet, column), 2),
+                }
+            )
+    if len(comparable) < 3:
+        return None
+    widths = [float(item["width"]) for item in comparable]
+    width_median = float(median(widths))
+    width_span = max(widths) - min(widths)
+    if width_span < 2.5:
+        return None
+    affected = [item for item in columns if float(item["width"]) <= width_median]
+    if len(affected) < 2:
+        return None
+    return {
+        "affected_columns": affected,
+        "comparable_columns": comparable,
+        "median_comparable_width": round(width_median, 2),
+        "width_span": round(width_span, 2),
+        "region": f"{get_column_letter(region.min_column)}{region.min_row}:"
+        f"{get_column_letter(region.max_column)}{region.max_row}",
+        "region_confidence": round(float(region.confidence), 4),
+    }
+
+
 def _merged_range(worksheet: Worksheet, cell: Cell) -> CellRange | None:
     return next(
         (merged for merged in worksheet.merged_cells.ranges if cell.coordinate in merged),
@@ -852,6 +988,40 @@ def _overflow_is_visually_blocked(
         if remaining > 0:
             return True
     return False
+
+
+def _overflow_exits_inferred_data_region(
+    context: RuleContext,
+    worksheet: Worksheet,
+    cell: Cell,
+    required_width: float,
+    available_width: float,
+) -> bool:
+    """Return whether extreme natural overflow leaves a strong table boundary."""
+
+    if required_width < max(24.0, available_width * 3.0):
+        return False
+    merged = _merged_range(worksheet, cell)
+    min_column = merged.min_col if merged is not None else cell.column
+    max_column = merged.max_col if merged is not None else cell.column
+    alignment = (cell.alignment.horizontal or "general").lower()
+
+    def exits_region(region: Region) -> bool:
+        if alignment == "right":
+            return min_column == region.min_column
+        if alignment in {"center", "centercontinuous", "distributed"}:
+            return min_column == region.min_column or max_column == region.max_column
+        return max_column == region.max_column
+
+    return any(
+        region.min_row < cell.row <= region.max_row
+        and region.min_column <= min_column <= max_column <= region.max_column
+        and region.max_row - region.min_row >= 4
+        and region.max_column - region.min_column >= 2
+        and float(region.confidence) >= 0.85
+        and exits_region(region)
+        for region in context.data_regions.get(worksheet.title, ())
+    )
 
 
 def _actual_border_source(
@@ -1586,6 +1756,18 @@ def _provable_formula_error(formula: Any) -> tuple[str, str] | None:
         if re.fullmatch(r"[A-Za-z]+", text):
             return "#VALUE!", "nonnumeric_value_literal"
     return None
+
+
+def _static_formula_error_proofs(
+    context: RuleContext,
+) -> dict[tuple[str, str], StaticFormulaErrorProof]:
+    cache_key = "builtin.static_formula_error_proofs.v1"
+    cached = context.analysis_cache.get(cache_key)
+    if isinstance(cached, dict):
+        return cast(dict[tuple[str, str], StaticFormulaErrorProof], cached)
+    proofs = find_static_formula_errors(context.workbook, _provable_formula_error)
+    context.analysis_cache[cache_key] = proofs
+    return proofs
 
 
 def _blank_formula_is_structural_separator(worksheet: Worksheet, cell: Cell) -> bool:
@@ -2505,12 +2687,13 @@ class ProvableFormulaErrorRule(WorkbookRule):
 
     def run(self, context: RuleContext) -> RuleResult:
         result = RuleResult()
+        static_errors = _static_formula_error_proofs(context)
         for worksheet in context.workbook.worksheets:
             cached_errors = context.cached_formula_errors.get(worksheet.title, {})
             for cell in worksheet._cells.values():
                 if cell.data_type != "f" or not isinstance(cell.value, str):
                     continue
-                proven = _provable_formula_error(cell.value)
+                proven = static_errors.get((worksheet.title, cell.coordinate))
                 cached_error = cached_errors.get(cell.coordinate)
                 if (
                     proven is None
@@ -2518,25 +2701,45 @@ class ProvableFormulaErrorRule(WorkbookRule):
                     and analyze_formula(cell.value).broken_references
                 ):
                     continue
+                if proven is not None and not proven.reportable:
+                    continue
                 if proven is None and cached_error is None:
                     continue
-                error, proof = (
-                    proven
-                    if proven is not None
-                    else (cast(str, cached_error), "cached_formula_error")
-                )
-                static_proof = proven is not None
+                if proven is not None:
+                    error, proof = proven.error, proven.proof
+                    static_proof = True
+                    propagated_proof = proven if proven.source is not None else None
+                else:
+                    error, proof = cast(str, cached_error), "cached_formula_error"
+                    static_proof = False
+                    propagated_proof = None
+                propagation_details: dict[str, Any] = {}
+                if propagated_proof is not None:
+                    propagation_details = {
+                        "source": (
+                            f"{propagated_proof.source[0]}!{propagated_proof.source[1]}"
+                            if propagated_proof.source is not None
+                            else None
+                        ),
+                        "function": propagated_proof.function,
+                        "source_proof": propagated_proof.source_proof,
+                    }
                 result.findings.append(
                     _make_finding(
                         context=context,
                         rule_id=self.rule_id,
                         title=self.title,
                         explanation=(
-                            "The complete formula is statically guaranteed to return an Excel "
-                            "error without evaluating workbook data."
-                            if static_proof
-                            else "The workbook stores an Excel error as this formula's cached "
-                            "result; cached values may be stale and were not recalculated."
+                            "The complete formula is a strictly supported expression whose statically "
+                            "proven error source cannot be suppressed."
+                            if propagated_proof is not None
+                            else (
+                                "The complete formula is statically guaranteed to return an Excel "
+                                "error without evaluating workbook data."
+                                if static_proof
+                                else "The workbook stores an Excel error as this formula's cached "
+                                "result; cached values may be stale and were not recalculated."
+                            )
                         ),
                         severity=Severity.ERROR,
                         confidence=1.0 if static_proof else 0.9,
@@ -2544,15 +2747,21 @@ class ProvableFormulaErrorRule(WorkbookRule):
                         location=cell.coordinate,
                         evidence=Evidence(
                             summary=(
-                                "Formula text proves an unconditional Excel error"
-                                if static_proof
-                                else "Formula has a cached Excel error result"
+                                "Formula depends on a statically proven Excel error"
+                                if propagated_proof is not None
+                                else (
+                                    "Formula text proves an unconditional Excel error"
+                                    if static_proof
+                                    else "Formula has a cached Excel error result"
+                                )
                             ),
                             observed=cell.value,
                             details={
                                 "error": error,
+                                "error_code_proven": error is not None,
                                 "proof": proof,
                                 "cached_error": cached_error,
+                                **propagation_details,
                             },
                         ),
                         expected=(
@@ -3489,11 +3698,20 @@ class TextDisplayRiskRule(WorkbookRule):
                     not wrap_text
                     and not forced_multiline
                     and measurement.width_ratio >= 1.10
-                    and _overflow_is_visually_blocked(
-                        worksheet,
-                        cell,
-                        measurement.required_width,
-                        measurement.available_width,
+                    and (
+                        _overflow_is_visually_blocked(
+                            worksheet,
+                            cell,
+                            measurement.required_width,
+                            measurement.available_width,
+                        )
+                        or _overflow_exits_inferred_data_region(
+                            context,
+                            worksheet,
+                            cell,
+                            measurement.required_width,
+                            measurement.available_width,
+                        )
                     )
                 ):
                     wrapped_measurement = measure_text_cell(
@@ -3755,11 +3973,22 @@ class TextDisplayRiskRule(WorkbookRule):
                         patches.append(row_patch)
                     if issue_kind == "horizontal":
                         summary = "Unwrapped text exceeds its cell and natural overflow is blocked"
+                        crosses_data_boundary = _overflow_exits_inferred_data_region(
+                            context,
+                            worksheet,
+                            cell,
+                            measurement.required_width,
+                            measurement.available_width,
+                        )
                         explanation = (
-                            "The text is wider than the available cell width and either an adjacent value "
-                            "or a visible border prevents a clean natural overflow."
+                            "The text is wider than the available cell width and would spill beyond a "
+                            "strongly inferred table boundary."
+                            if crosses_data_boundary
+                            else "The text is wider than the available cell width and either an adjacent "
+                            "value or a visible border prevents a clean natural overflow."
                         )
                     else:
+                        crosses_data_boundary = False
                         summary = "Wrapped or multiline text exceeds an explicit row height"
                         explanation = (
                             "Static text measurement indicates that the saved explicit row height is too "
@@ -3808,7 +4037,10 @@ class TextDisplayRiskRule(WorkbookRule):
                                         }
                                     )
                                 ),
-                                details={"merged_range": measurement.merged_range},
+                                details={
+                                    "merged_range": measurement.merged_range,
+                                    "crosses_inferred_data_region": crosses_data_boundary,
+                                },
                             ),
                             expected="Visible text remains inside its intended cell boundary without clipping.",
                             suggested_action=(
@@ -3828,6 +4060,62 @@ class TextDisplayRiskRule(WorkbookRule):
                             identity_discriminator=issue_kind,
                         )
                     )
+            if worksheet.sheet_state != "visible":
+                continue
+            for region in context.data_regions.get(worksheet.title, ()):
+                advisory = _text_width_block_advisory(
+                    worksheet,
+                    region,
+                    horizontal_by_column,
+                )
+                if advisory is None:
+                    continue
+                affected_columns = advisory["affected_columns"]
+                affected_names = [item["column"] for item in affected_columns]
+                affected_cells = [
+                    coordinate for item in affected_columns for coordinate in item["issues"]
+                ]
+                result.findings.append(
+                    _make_finding(
+                        context=context,
+                        rule_id=self.rule_id,
+                        title=self.title,
+                        explanation=(
+                            "Several non-free-text columns in the same inferred table have repeated "
+                            "confirmed clipping, and their saved widths vary substantially."
+                        ),
+                        severity=Severity.INFO,
+                        confidence=0.86,
+                        sheet=worksheet.title,
+                        location=advisory["region"],
+                        evidence=Evidence(
+                            summary="Multiple table columns contain repeated confirmed text clipping",
+                            observed={
+                                "affected_columns": affected_names,
+                                "confirmed_clipped_cells": len(affected_cells),
+                            },
+                            expected={
+                                "review_columns_individually": True,
+                                "uniform_width_required": False,
+                            },
+                            peers=affected_cells[:24],
+                            details={
+                                "finding_kind": "multi_column_repeated_clipping",
+                                **advisory,
+                                "automatic_layout_change": False,
+                            },
+                        ),
+                        expected=(
+                            "Repeatedly clipped columns are reviewed individually; table columns do "
+                            "not need a uniform width."
+                        ),
+                        suggested_action=(
+                            "Review the listed columns and the existing local layout suggestions; do "
+                            "not normalize every table column to one width."
+                        ),
+                        identity_discriminator=("block", tuple(affected_names)),
+                    )
+                )
         return result
 
 

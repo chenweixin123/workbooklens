@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +20,7 @@ from workbooklens.rules.profile_quality import (
     NumberFormatRoleConflictRule,
     RequiredFieldRule,
     TrailingWhitespaceRule,
+    _valid_email,
     parse_workbook_profile,
 )
 from workbooklens.rules.registry import RuleRegistry
@@ -764,6 +767,10 @@ def test_contact_validation_accepts_common_legitimate_forms_and_skips_blanks(
     worksheet.append(["R002", "alice@@example.com", ")1234567("])
     worksheet.append(["R003", None, None])
     worksheet.append(["R004", "bob.smith@sub.example.org", 13800138000])
+    worksheet.append(["R005", "first.middle.last+tag@example.co.uk", None])
+    worksheet.append(["R006", ".leading@example.com", None])
+    worksheet.append(["R007", "trailing.@example.com", None])
+    worksheet.append(["R008", "double..dot@example.com", None])
 
     scan = _save_and_scan(
         workbook,
@@ -777,9 +784,36 @@ def test_contact_validation_accepts_common_legitimate_forms_and_skips_blanks(
         rules=(ContactFormatRule,),
     )
 
-    assert {finding.location for finding in scan.findings} == {"B3", "C3"}
+    assert {finding.location for finding in scan.findings} == {
+        "B3",
+        "C3",
+        "B7",
+        "B8",
+        "B9",
+    }
     assert all(float(finding.confidence) == 0.99 for finding in scan.findings)
     assert not scan.patches
+
+
+def test_email_validation_rejects_ambiguous_dot_input_without_backtracking() -> None:
+    assert _valid_email("first.middle.last+tag@example.co.uk")
+    assert not _valid_email(".leading@example.com")
+    assert not _valid_email("trailing.@example.com")
+    assert not _valid_email("double..dot@example.com")
+    assert not _valid_email(("!." * 10_000) + "@example.com")
+
+    script = (
+        "from workbooklens.rules.profile_quality import _valid_email; "
+        "assert not _valid_email(('!.' * 30) + '!')"
+    )
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter and constant script
+        [sys.executable, "-c", script],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=5,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_leading_zero_rule_respects_zero_mask_and_non_numeric_identifiers(tmp_path: Path) -> None:

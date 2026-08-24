@@ -13,6 +13,7 @@ from workbooklens.rules.layout_geometry import (
     DataRegionRowHeightOutlierRule,
     DrawingContentOverlapRule,
     NumericDisplayWidthRiskRule,
+    OrphanMicroLabelRule,
     RoleAwareStyleOutlierRule,
     _style_components,
 )
@@ -396,4 +397,5 @@ def test_layout_geometry_rule_export_order_is_stable() -> None:
         NumericDisplayWidthRiskRule,
         DataRegionRowHeightOutlierRule,
         RoleAwareStyleOutlierRule,
+        OrphanMicroLabelRule,
     ) == LAYOUT_GEOMETRY_RULES

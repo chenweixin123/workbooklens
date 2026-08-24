@@ -698,6 +698,58 @@ def _color_signature(color: Any) -> tuple[Any, ...]:
     )
 
 
+def _vivid_explicit_rgb(color: Any) -> str | None:
+    """Return a vivid explicit RGB color, excluding theme/default text colors."""
+
+    if getattr(color, "type", None) != "rgb":
+        return None
+    raw = getattr(color, "rgb", None)
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip().upper()
+    if len(raw) == 8:
+        raw = raw[-6:]
+    if len(raw) != 6:
+        return None
+    try:
+        channels = tuple(int(raw[index : index + 2], 16) for index in (0, 2, 4))
+    except ValueError:
+        return None
+    if max(channels) < 192 or max(channels) - min(channels) < 128 or min(channels) > 96:
+        return None
+    return raw
+
+
+def _region_contains_cell(region: Region, cell: Cell) -> bool:
+    return (
+        region.min_row <= cell.row <= region.max_row
+        and region.min_column <= cell.column <= region.max_column
+    )
+
+
+def _only_title_is_adjacent(
+    worksheet: Worksheet,
+    cell: Cell,
+    title_range: CellRange,
+) -> bool:
+    """Return whether nearby populated cells belong only to the adjacent title."""
+
+    for row in range(max(1, cell.row - 1), cell.row + 2):
+        for column in range(max(1, cell.column - 1), cell.column + 2):
+            if (row, column) == (cell.row, cell.column):
+                continue
+            neighbor = worksheet._cells.get((row, column))
+            if not isinstance(neighbor, Cell) or neighbor.value is None:
+                continue
+            if (
+                title_range.min_row <= row <= title_range.max_row
+                and title_range.min_col <= column <= title_range.max_col
+            ):
+                continue
+            return False
+    return True
+
+
 def _style_components(cell: Cell) -> dict[str, tuple[Any, ...] | str]:
     return {
         "font": (
@@ -783,6 +835,129 @@ def _summary_rows_near_region(worksheet: Worksheet, region: Region) -> list[int]
         if _row_has_summary(worksheet, probe, row):
             rows.append(row)
     return sorted(set(rows))
+
+
+class OrphanMicroLabelRule(WorkbookRule):
+    """Report one detached, unusually tiny vivid label beside a merged title."""
+
+    rule_id = "WL056_ORPHAN_MICRO_LABEL"
+    title = "Detached micro-label beside an inferred worksheet title"
+
+    def run(self, context: RuleContext) -> RuleResult:
+        result = RuleResult()
+        for worksheet in context.workbook.worksheets:
+            regions = [
+                region
+                for region in context.data_regions.get(worksheet.title, ())
+                if region.max_row - region.min_row >= 5 and region.max_column > region.min_column
+            ]
+            if worksheet.sheet_state != "visible" or not regions:
+                continue
+            first_region = min(regions, key=lambda item: (item.min_row, item.min_column))
+            if first_region.min_row <= 2:
+                continue
+            body_sizes = [
+                float(cell.font.sz)
+                for cell in worksheet._cells.values()
+                if isinstance(cell, Cell)
+                and cell.value is not None
+                and _visible_cell(worksheet, cell)
+                and _region_contains_cell(first_region, cell)
+                and cell.font.sz is not None
+            ]
+            if len(body_sizes) < 8:
+                continue
+            body_median = float(statistics.median(body_sizes))
+            maximum_micro_size = min(8.0, body_median * 0.75)
+            minimum_title_span = max(
+                3,
+                math.ceil((first_region.max_column - first_region.min_column + 1) * 0.4),
+            )
+            for merged in worksheet.merged_cells.ranges:
+                if (
+                    merged.max_row >= first_region.min_row
+                    or merged.min_row < max(1, first_region.min_row - 4)
+                    or merged.max_col - merged.min_col + 1 < minimum_title_span
+                ):
+                    continue
+                anchor = worksheet._cells.get((merged.min_row, merged.min_col))
+                if (
+                    not isinstance(anchor, Cell)
+                    or not isinstance(anchor.value, str)
+                    or not anchor.value.strip()
+                ):
+                    continue
+                candidates: list[tuple[Cell, str]] = []
+                adjacent_columns = {
+                    column for column in (merged.min_col - 1, merged.max_col + 1) if column >= 1
+                }
+                for row in range(merged.min_row, merged.max_row + 1):
+                    for column in sorted(adjacent_columns):
+                        cell = worksheet._cells.get((row, column))
+                        if (
+                            not isinstance(cell, Cell)
+                            or not isinstance(cell.value, str)
+                            or not cell.value.strip()
+                            or not _visible_cell(worksheet, cell)
+                            or any(_region_contains_cell(region, cell) for region in regions)
+                            or cell.font.sz is None
+                            or float(cell.font.sz) > maximum_micro_size
+                            or len(cell.value.strip()) > 64
+                            or not _only_title_is_adjacent(worksheet, cell, merged)
+                        ):
+                            continue
+                        vivid_rgb = _vivid_explicit_rgb(cell.font.color)
+                        if vivid_rgb is not None:
+                            candidates.append((cell, vivid_rgb))
+                if len(candidates) != 1:
+                    continue
+                cell, vivid_rgb = candidates[0]
+                result.findings.append(
+                    _finding(
+                        context=context,
+                        rule_id=self.rule_id,
+                        title=self.title,
+                        explanation=(
+                            "A very small, vividly colored text cell sits outside the inferred table "
+                            "and immediately beside a wide merged title, without any same-role peer."
+                        ),
+                        severity=Severity.INFO,
+                        confidence=0.86,
+                        worksheet=worksheet,
+                        location=cell.coordinate,
+                        evidence=Evidence(
+                            summary=(
+                                "An isolated micro-label uses unusually small, vivid text beside the title"
+                            ),
+                            observed={
+                                "font_size": float(cell.font.sz),
+                                "font_rgb": vivid_rgb,
+                                "adjacent_title_range": str(merged),
+                            },
+                            expected={
+                                "body_font_size_median": round(body_median, 2),
+                                "maximum_micro_label_size": round(maximum_micro_size, 2),
+                            },
+                            peers=[anchor.coordinate],
+                            details={
+                                "proof_level": "advisory",
+                                "outside_inferred_tables": True,
+                                "only_adjacent_content_is_title": True,
+                                "automatic_style_change": False,
+                            },
+                        ),
+                        expected=(
+                            "Top-of-sheet labels beside a title are intentional, legible, and visually "
+                            "integrated with the worksheet structure."
+                        ),
+                        suggested_action=(
+                            "Confirm whether the detached label is intentional; WorkbookLens does not "
+                            "remove or restyle it automatically."
+                        ),
+                        discriminator=(str(merged), cell.coordinate),
+                    )
+                )
+        return result
 
 
 class RoleAwareStyleOutlierRule(WorkbookRule):
@@ -1165,6 +1340,7 @@ LAYOUT_GEOMETRY_RULES: tuple[type[WorkbookRule], ...] = (
     NumericDisplayWidthRiskRule,
     DataRegionRowHeightOutlierRule,
     RoleAwareStyleOutlierRule,
+    OrphanMicroLabelRule,
 )
 
 

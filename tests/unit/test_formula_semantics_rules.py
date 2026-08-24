@@ -12,7 +12,7 @@ from workbooklens.formulas.ir import (
     parse_formula_ir,
     worksheet_content_index,
 )
-from workbooklens.models import Severity
+from workbooklens.models import Finding, Severity
 from workbooklens.rules import RuleRegistry
 from workbooklens.rules.formula_semantics import (
     AggregateRangeCoverageRule,
@@ -168,6 +168,105 @@ def test_cross_sheet_metric_label_reports_truncated_aggregate(tmp_path: Path) ->
         ("B2", "WL042_AGGREGATE_RANGE_COVERAGE")
     ]
     assert scan.findings[0].evidence.details["excluded_cells"] == ["B6", "B7", "B8"]
+
+
+def _kpi_block_book(*, proven_count: int = 3, all_proven: bool = False) -> Workbook:
+    workbook = Workbook()
+    source = workbook.active
+    assert source is not None
+    source.title = "Source Data"
+    source.append(["ID", "Sales", "Gross", "Salary", "Inventory"])
+    for row in range(2, 9):
+        source.append([row - 1, row * 10, row * 12, row * 100, row * 4])
+    dashboard = workbook.create_sheet("Dashboard")
+    dashboard["A4"] = "Metric"
+    dashboard["B4"] = "Value"
+    labels = ["Total Sales", "Gross Sales", "Avg Salary", "Inventory Value"]
+    source_columns = ["B", "C", "D", "E"]
+    functions = ["SUM", "SUM", "AVERAGE", "SUM"]
+    proven_rows = {5, 6, 8} if proven_count == 3 else {5, 6}
+    if all_proven:
+        proven_rows = {5, 6, 7, 8}
+    for row, label, source_column, function in zip(
+        range(5, 9), labels, source_columns, functions, strict=True
+    ):
+        dashboard.cell(row, 1, label)
+        end_row = 5 if row in proven_rows else 8
+        dashboard.cell(
+            row, 2, f"={function}('Source Data'!{source_column}2:{source_column}{end_row})"
+        )
+    return workbook
+
+
+def _aggregate_block_advisories(scan: ScanResult) -> list[Finding]:
+    return [
+        finding
+        for finding in scan.findings
+        if finding.evidence.details.get("proof_level") == "advisory"
+        and "unproven_formulas" in finding.evidence.details
+    ]
+
+
+def test_aggregate_range_summarizes_only_independently_proven_kpi_omissions(
+    tmp_path: Path,
+) -> None:
+    scan = _scan(tmp_path, _kpi_block_book(), AggregateRangeCoverageRule())
+
+    advisories = _aggregate_block_advisories(scan)
+    assert len(advisories) == 1
+    advisory = advisories[0]
+    assert advisory.location == "B5:B8"
+    assert advisory.severity == Severity.INFO
+    assert advisory.evidence.observed == {
+        "proven_cells": ["B5", "B6", "B8"],
+        "unproven_cells": ["B7"],
+    }
+    assert advisory.patch_ids == []
+
+
+def test_aggregate_range_does_not_add_block_advisory_without_unproven_formula(
+    tmp_path: Path,
+) -> None:
+    scan = _scan(
+        tmp_path,
+        _kpi_block_book(all_proven=True),
+        AggregateRangeCoverageRule(),
+    )
+
+    assert not _aggregate_block_advisories(scan)
+
+
+def test_aggregate_range_requires_three_independent_block_omissions(tmp_path: Path) -> None:
+    scan = _scan(
+        tmp_path,
+        _kpi_block_book(proven_count=2),
+        AggregateRangeCoverageRule(),
+    )
+
+    assert not _aggregate_block_advisories(scan)
+
+
+def test_aggregate_range_counts_one_formula_once_when_it_has_two_truncated_inputs(
+    tmp_path: Path,
+) -> None:
+    workbook = _kpi_block_book(proven_count=2)
+    dashboard = workbook["Dashboard"]
+    dashboard["B5"] = "=SUM('Source Data'!B2:B5)+SUM('Source Data'!C2:C5)"
+
+    scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
+
+    assert not _aggregate_block_advisories(scan)
+
+
+def test_aggregate_range_does_not_add_block_advisory_for_hidden_dashboard(
+    tmp_path: Path,
+) -> None:
+    workbook = _kpi_block_book()
+    workbook["Dashboard"].sheet_state = "hidden"
+
+    scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
+
+    assert not _aggregate_block_advisories(scan)
 
 
 @pytest.mark.parametrize("label", ["Q1 Sales", "Rolling Sales", "Last period revenue"])
@@ -427,6 +526,65 @@ def test_cross_sheet_reference_accepts_populated_target(tmp_path: Path) -> None:
     dashboard["B1"] = "='Source Data'!B4"
 
     scan = _scan(tmp_path, workbook, CrossSheetReferenceValidityRule())
+
+    assert scan.findings == []
+
+
+def test_cross_sheet_sum_reports_incompatible_source_column_roles(tmp_path: Path) -> None:
+    workbook = Workbook()
+    source = workbook.active
+    assert source is not None
+    source.title = "Source Data"
+    source.append(["ID", "Qty", "Unit Price"])
+    for row in range(2, 7):
+        source.append([row - 1, row, row * 10])
+        source.cell(row, 3).number_format = "$#,##0.00"
+    dashboard = workbook.create_sheet("Dashboard")
+    dashboard["A1"] = "Check"
+    dashboard["B1"] = "=SUM('Source Data'!B2:C2)"
+
+    scan = _scan(tmp_path, workbook, CrossSheetReferenceValidityRule())
+
+    assert len(scan.findings) == 1
+    finding = scan.findings[0]
+    assert finding.location == "B1"
+    assert finding.evidence.details["reason"] == "heterogeneous_aggregate_column_roles"
+    assert finding.evidence.details["source_roles"] == ["amount", "quantity"]
+    assert finding.evidence.details["source_columns"] == [
+        {"column": "B", "header": "Qty", "role": "quantity"},
+        {"column": "C", "header": "Unit Price", "role": "amount"},
+    ]
+    assert finding.severity == Severity.WARNING
+    assert scan.patches == []
+
+
+@pytest.mark.parametrize("function", ["COUNT", "SUM"])
+def test_cross_sheet_aggregate_accepts_compatible_or_non_additive_columns(
+    tmp_path: Path,
+    function: str,
+) -> None:
+    workbook = Workbook()
+    source = workbook.active
+    assert source is not None
+    source.title = "Source Data"
+    if function == "SUM":
+        source.append(["ID", "Q1 Sales", "Q2 Sales"])
+    else:
+        source.append(["ID", "Qty", "Unit Price"])
+    for row in range(2, 7):
+        source.append([row - 1, row * 10, row * 20])
+        source.cell(row, 2).number_format = "$#,##0.00"
+        source.cell(row, 3).number_format = "$#,##0.00"
+    dashboard = workbook.create_sheet("Dashboard")
+    dashboard["A1"] = "Check"
+    dashboard["B1"] = f"={function}('Source Data'!B2:C2)"
+
+    scan = _scan(
+        tmp_path,
+        workbook,
+        CrossSheetReferenceValidityRule(),
+        name=f"compatible-{function.casefold()}.xlsx",
+    )
 
     assert scan.findings == []
 

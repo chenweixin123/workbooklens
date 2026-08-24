@@ -17,6 +17,7 @@ from workbooklens.conversion import ConversionProvider, ConversionResult
 from workbooklens.demo.workflow import generate_demo_workbook
 from workbooklens.exceptions import UsageError
 from workbooklens.i18n import require_translation
+from workbooklens.scanner import scan_workbook
 from workbooklens.web import create_app
 from workbooklens.web.app import (
     CSRF_COOKIE_NAME,
@@ -171,6 +172,10 @@ def test_local_web_scan_apply_and_download_workflow(tmp_path: Path) -> None:
             "applyForm.querySelectorAll('#patch-list input[name=\"patch_id\"]:not(:disabled)')"
             in response.text
         )
+        assert "document.activeElement === selectAllButton" in response.text
+        assert "clearAllButton.focus()" in response.text
+        assert "document.activeElement === clearAllButton" in response.text
+        assert "selectAllButton.focus()" in response.text
         assert "querySelectorAll('input[type=\"checkbox\"]')" not in response.text
         assert 'name="accept_layout_risk"' in response.text
         report = client.get(f"/sessions/{session_id}/report")
@@ -311,6 +316,75 @@ def test_web_results_can_switch_language_without_resubmitting_upload(tmp_path: P
         persisted = client.get(f"/sessions/{session_id}")
         assert '<html lang="zh-CN">' in persisted.text
         assert "发现的问题" in persisted.text
+
+
+def test_web_localizes_structured_evidence_without_changing_canonical_scan(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workbook = tmp_path / "demo.xlsx"
+    generate_demo_workbook(workbook)
+    scan = scan_workbook(workbook)
+    assert scan.findings
+    canonical_observed = {
+        "source_proof": [{"font_size": 8}],
+        "unknown_key": "用户原文",
+    }
+    canonical_details = {
+        "proof": "propagated_formula_error",
+        "fixed_total_pages": 3,
+    }
+    finding = scan.findings[0]
+    scan.findings[0] = finding.model_copy(
+        update={
+            "evidence": finding.evidence.model_copy(
+                update={
+                    "observed": canonical_observed,
+                    "details": canonical_details,
+                }
+            )
+        }
+    )
+    monkeypatch.setattr(
+        "workbooklens.web.app.scan_workbook",
+        lambda *_args, **_kwargs: scan,
+    )
+
+    app = create_app(max_file_bytes=5 * 1024 * 1024)
+    with _client(app) as client:
+        home = client.get("/?lang=en")
+        with workbook.open("rb") as handle:
+            english = client.post(
+                "/scan",
+                data={"csrf_token": _csrf_token(home.text), "language": "en"},
+                files={
+                    "workbook": (
+                        "demo.xlsx",
+                        handle,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                },
+            )
+        assert english.status_code == 200
+        assert "Source proof" in english.text
+        assert "Font size" in english.text
+        assert "Proof" in english.text
+        assert "Propagated formula error" in english.text
+        assert "Fixed total pages" in english.text
+        session_match = re.search(r"/sessions/([^/]+)/apply", english.text)
+        assert session_match
+
+        chinese = client.get(f"/sessions/{session_match.group(1)}?lang=zh-CN")
+        assert chinese.status_code == 200
+        assert "源证明" in chinese.text
+        assert "字号" in chinese.text
+        assert "证明" in chinese.text
+        assert "传播的公式错误" in chinese.text
+        assert "固定总页数" in chinese.text
+        assert "用户原文" in chinese.text
+
+    assert scan.findings[0].evidence.observed == canonical_observed
+    assert scan.findings[0].evidence.details == canonical_details
 
 
 def test_web_converts_legacy_xls_with_an_installed_local_provider(

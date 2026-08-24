@@ -75,7 +75,7 @@ _ROLE_ALIASES = {
 }
 _HORIZONTAL_TRAILING_WHITESPACE_RE = re.compile(r"[ \t\u00a0\u3000]+$")
 _EMAIL_RE = re.compile(
-    r'^[^\s@<>(),;:\\"]+(?:\.[^\s@<>(),;:\\"]+)*@'
+    r'^[^\s.@<>(),;:\\"]+(?:\.[^\s.@<>(),;:\\"]+)*@'
     r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
 )

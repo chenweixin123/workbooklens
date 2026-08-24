@@ -153,6 +153,8 @@ WINDOW_SCOPE_MARKERS = (
     "后几",
 )
 CURRENCY_MARKERS = ("$", "€", "£", "¥", "￥", "usd", "eur", "gbp", "cny", "rmb")
+QUANTITY_TOKENS = {"count", "qty", "quantities", "quantity", "units"}
+QUANTITY_MARKERS = ("件数", "数量", "数目", "个数", "套数", "台数")
 
 
 def _confidence(value: float) -> Confidence:
@@ -331,6 +333,61 @@ def _row_has_summary_label(context: RuleContext, worksheet: Worksheet, row: int)
     )
     cached[key] = result
     return result
+
+
+def _summary_label_cells(context: RuleContext, worksheet: Worksheet, row: int) -> tuple[Cell, ...]:
+    return tuple(
+        cell
+        for cell in worksheet_content_index(context, worksheet).iter_nonblank_row(row)
+        if cell.data_type != "f"
+        and isinstance(cell.value, str)
+        and SUMMARY_RE.search(_normalize_text(cell.value))
+    )
+
+
+def _nearby_explicit_aggregate_label(
+    worksheet: Worksheet,
+    cell: Cell,
+    function: str,
+) -> Cell | None:
+    """Return a tight upper-left label that explicitly names this aggregate role."""
+
+    markers: dict[str, tuple[re.Pattern[str], tuple[str, ...]]] = {
+        "SUM": (
+            re.compile(
+                r"(?<![a-z0-9])(?:grand[\s-]+total|subtotal|total|sum)(?![a-z0-9])",
+                re.IGNORECASE,
+            ),
+            ("合计", "总计", "小计", "汇总"),
+        ),
+        "AVERAGE": (
+            re.compile(r"(?<![a-z0-9])(?:average|avg)(?![a-z0-9])", re.IGNORECASE),
+            ("平均",),
+        ),
+        "COUNT": (
+            re.compile(r"(?<![a-z0-9])count(?![a-z0-9])", re.IGNORECASE),
+            ("计数", "总数"),
+        ),
+        "MIN": (re.compile(r"(?<![a-z0-9])min(?:imum)?(?![a-z0-9])", re.IGNORECASE), ("最小",)),
+        "MAX": (re.compile(r"(?<![a-z0-9])max(?:imum)?(?![a-z0-9])", re.IGNORECASE), ("最大",)),
+    }
+    marker = markers.get(function.upper())
+    if marker is None:
+        return None
+    pattern, localized_markers = marker
+    for row in range(max(1, cell.row - 2), cell.row):
+        for column in range(max(1, cell.column - 1), cell.column + 1):
+            candidate = _cell_at(worksheet, row, column)
+            if (
+                candidate is None
+                or candidate.data_type == "f"
+                or not isinstance(candidate.value, str)
+            ):
+                continue
+            normalized = _normalize_text(candidate.value)
+            if pattern.search(normalized) or any(item in normalized for item in localized_markers):
+                return candidate
+    return None
 
 
 def _row_has_unscoped_metric_label(context: RuleContext, worksheet: Worksheet, row: int) -> bool:
@@ -583,6 +640,44 @@ def _semantic_role(value: Any) -> Literal["rate", "amount"] | None:
     return "rate" if rate else "amount"
 
 
+def _aggregate_input_role(value: Any) -> Literal["rate", "amount", "quantity"] | None:
+    semantic = _semantic_role(value)
+    if semantic is not None:
+        return semantic
+    normalized = _normalize_text(value)
+    if not normalized:
+        return None
+    words = _text_tokens(normalized)
+    quantity = bool(
+        words & QUANTITY_TOKENS or any(marker in normalized for marker in QUANTITY_MARKERS)
+    )
+    return "quantity" if quantity else None
+
+
+def _heterogeneous_aggregate_column_roles(
+    context: RuleContext,
+    worksheet: Worksheet,
+    reference: FormulaReference,
+) -> list[dict[str, Any]] | None:
+    """Return fully known, incompatible source-column roles for one aggregate range."""
+
+    if reference.is_single_column:
+        return None
+    region = _region_for_reference(context, worksheet, reference)
+    if region is None:
+        return None
+    columns: list[dict[str, Any]] = []
+    for column in range(reference.min_column, reference.max_column + 1):
+        header = _cell_at(worksheet, region.min_row, column)
+        if header is None or not isinstance(header.value, str):
+            return None
+        role = _aggregate_input_role(header.value)
+        if role is None:
+            return None
+        columns.append({"column": get_column_letter(column), "header": header.value, "role": role})
+    return columns if len({item["role"] for item in columns}) >= 2 else None
+
+
 def _format_role(number_format: str) -> Literal["percentage", "currency"] | None:
     normalized = number_format.casefold()
     percentage = "%" in number_format
@@ -621,7 +716,15 @@ class AggregateRangeCoverageRule(WorkbookRule):
     def run(self, context: RuleContext) -> RuleResult:
         result = RuleResult()
         for worksheet in context.workbook.worksheets:
-            for cell in _formula_cells(context, worksheet):
+            formula_cells = _formula_cells(context, worksheet)
+            formulas_by_column_lists: dict[int, list[Cell]] = {}
+            for formula_cell in formula_cells:
+                formulas_by_column_lists.setdefault(formula_cell.column, []).append(formula_cell)
+            formulas_by_column: dict[int, tuple[Cell, ...]] = {
+                column: tuple(cells) for column, cells in formulas_by_column_lists.items()
+            }
+            proven_by_column: dict[int, dict[str, Cell]] = {}
+            for cell in formula_cells:
                 ir = _formula_ir(context, worksheet, cell)
                 for aggregate in ir.aggregate_references:
                     has_scope_label = _row_has_summary_label(context, worksheet, cell.row)
@@ -679,6 +782,184 @@ class AggregateRangeCoverageRule(WorkbookRule):
                             discriminator=(aggregate.reference.raw, extension),
                         )
                     )
+                    proven_by_column.setdefault(cell.column, {})[cell.coordinate] = cell
+            if worksheet.sheet_state != "visible":
+                continue
+            for column, proven_by_coordinate in sorted(proven_by_column.items()):
+                proven_cells = sorted(
+                    proven_by_coordinate.values(),
+                    key=lambda item: (item.row, item.column),
+                )
+                if len(proven_cells) < 3:
+                    continue
+                rows = sorted(cell.row for cell in proven_cells)
+                if rows[-1] - rows[0] > 5 or rows[-1] - rows[0] + 1 > len(proven_cells) + 2:
+                    continue
+                proven_coordinates = {cell.coordinate for cell in proven_cells}
+                unproven_cells = []
+                for candidate in formulas_by_column.get(column, ()):
+                    if candidate.coordinate in proven_coordinates:
+                        continue
+                    if not rows[0] <= candidate.row <= rows[-1]:
+                        continue
+                    candidate_ir = _formula_ir(context, worksheet, candidate)
+                    if not candidate_ir.aggregate_references:
+                        continue
+                    if not _row_has_summary_label(context, worksheet, candidate.row) and not (
+                        any(
+                            aggregate.reference.is_cross_sheet
+                            for aggregate in candidate_ir.aggregate_references
+                        )
+                        and _row_has_unscoped_metric_label(context, worksheet, candidate.row)
+                    ):
+                        continue
+                    unproven_cells.append(candidate)
+                if not unproven_cells:
+                    continue
+                location = (
+                    f"{get_column_letter(column)}{rows[0]}:{get_column_letter(column)}{rows[-1]}"
+                )
+                result.findings.append(
+                    _make_finding(
+                        context=context,
+                        rule_id=self.rule_id,
+                        title=self.title,
+                        explanation=(
+                            "Several aggregate formulas in one KPI block have independently proven "
+                            "truncated ranges, while another formula in the same block lacks enough "
+                            "evidence to classify it."
+                        ),
+                        severity=Severity.INFO,
+                        confidence=0.82,
+                        worksheet=worksheet,
+                        location=location,
+                        evidence=Evidence(
+                            summary="KPI block contains multiple proven range omissions and one unproven formula",
+                            observed={
+                                "proven_cells": [cell.coordinate for cell in proven_cells],
+                                "unproven_cells": [cell.coordinate for cell in unproven_cells],
+                            },
+                            expected={
+                                "review_proven_boundaries": True,
+                                "unproven_cells_are_not_classified": True,
+                            },
+                            peers=[cell.coordinate for cell in proven_cells],
+                            details={
+                                "proof_level": "advisory",
+                                "automatic_formula_change": False,
+                                "independent_extension_count": len(proven_cells),
+                                "unproven_formulas": {
+                                    cell.coordinate: cell.value for cell in unproven_cells
+                                },
+                            },
+                        ),
+                        expected=(
+                            "Review each proven aggregate boundary separately; formulas without "
+                            "independent boundary evidence are not classified as errors."
+                        ),
+                        suggested_action=(
+                            "Review the listed KPI formulas against their source table bodies; do not "
+                            "copy a neighboring range automatically."
+                        ),
+                        discriminator=("block", tuple(cell.coordinate for cell in proven_cells)),
+                    )
+                )
+        return result
+
+
+class UnlabeledAggregateRoleRule(WorkbookRule):
+    rule_id = "WL052_UNLABELED_AGGREGATE_ROLE"
+    title = "Aggregate lacks a clear summary label"
+
+    def run(self, context: RuleContext) -> RuleResult:
+        result = RuleResult()
+        for worksheet in context.workbook.worksheets:
+            if worksheet.sheet_state != "visible":
+                continue
+            aggregates_by_row: dict[int, list[tuple[Cell, Any]]] = {}
+            for cell in _formula_cells(context, worksheet):
+                cell_aggregates = _formula_ir(context, worksheet, cell).aggregate_references
+                if len(cell_aggregates) == 1:
+                    aggregates_by_row.setdefault(cell.row, []).append((cell, cell_aggregates[0]))
+            for row, row_aggregates in aggregates_by_row.items():
+                labels = _summary_label_cells(context, worksheet, row)
+                if not labels:
+                    continue
+                first_label = min(labels, key=lambda cell: cell.column)
+                right = [item for item in row_aggregates if item[0].column > first_label.column]
+                if len(right) < 2:
+                    continue
+                dominant_function, dominant_count = Counter(
+                    aggregate.function for _, aggregate in right
+                ).most_common(1)[0]
+                if dominant_count < 2 or dominant_count / len(right) < 0.75:
+                    continue
+                for cell, aggregate in row_aggregates:
+                    if cell.column >= first_label.column or aggregate.function == dominant_function:
+                        continue
+                    if _nearby_explicit_aggregate_label(worksheet, cell, aggregate.function):
+                        continue
+                    reference = aggregate.reference
+                    if reference.is_cross_sheet or not reference.is_single_column:
+                        continue
+                    target_worksheet = _worksheet_by_name(context, reference.sheet)
+                    if target_worksheet is None:
+                        continue
+                    region = _region_for_reference(context, target_worksheet, reference)
+                    if region is None or cell.row <= region.max_row:
+                        continue
+                    evidence = Evidence(
+                        summary=(
+                            "Aggregate uses a different function to the left of the row's summary label"
+                        ),
+                        observed={
+                            "formula": cell.value,
+                            "function": aggregate.function,
+                            "reference": reference.raw,
+                        },
+                        expected={
+                            "explicit_metric_label": True,
+                            "labelled_summary_function": dominant_function,
+                        },
+                        peers=[peer.coordinate for peer, _ in right],
+                        details={
+                            "proof_level": "semantic_heuristic",
+                            "summary_label": first_label.value,
+                            "summary_label_cell": first_label.coordinate,
+                            "dominant_labelled_function": dominant_function,
+                            "labelled_aggregate_count": dominant_count,
+                            "automatic_formula_change": False,
+                        },
+                    )
+                    result.findings.append(
+                        _make_finding(
+                            context=context,
+                            rule_id=self.rule_id,
+                            title=self.title,
+                            explanation=(
+                                "An aggregate sits outside the labelled summary block and uses a different "
+                                "function from the aggregates clearly governed by that label."
+                            ),
+                            severity=Severity.WARNING,
+                            confidence=0.9,
+                            worksheet=worksheet,
+                            location=cell.coordinate,
+                            evidence=evidence,
+                            expected=(
+                                "Distinct aggregate metrics have an explicit nearby label or a clear summary "
+                                "block association."
+                            ),
+                            suggested_action=(
+                                "Confirm the metric intent and add an explicit label or relocate it into the "
+                                "labelled summary block; the formula is not changed automatically."
+                            ),
+                            discriminator=(
+                                first_label.coordinate,
+                                aggregate.function,
+                                dominant_function,
+                            ),
+                        )
+                    )
         return result
 
 
@@ -691,8 +972,8 @@ class CrossSheetReferenceValidityRule(WorkbookRule):
         for worksheet in context.workbook.worksheets:
             for cell in _formula_cells(context, worksheet):
                 ir = _formula_ir(context, worksheet, cell)
-                aggregate_keys = {
-                    _reference_key(item.reference) for item in ir.aggregate_references
+                aggregates_by_key = {
+                    _reference_key(item.reference): item for item in ir.aggregate_references
                 }
                 for reference in ir.references:
                     if not reference.is_cross_sheet:
@@ -718,6 +999,14 @@ class CrossSheetReferenceValidityRule(WorkbookRule):
                     }
                     peers: list[str] = []
                     expected: Any = {"review": "cross_sheet_target"}
+                    aggregate = aggregates_by_key.get(_reference_key(reference))
+                    role_columns = (
+                        _heterogeneous_aggregate_column_roles(context, target_worksheet, reference)
+                        if target_worksheet is not None
+                        and aggregate is not None
+                        and aggregate.function in {"AVERAGE", "SUM"}
+                        else None
+                    )
                     if not target.sheet_exists:
                         reason = "missing_worksheet"
                         severity = Severity.ERROR
@@ -734,7 +1023,22 @@ class CrossSheetReferenceValidityRule(WorkbookRule):
                         ):
                             reason = "blank_inside_dense_table"
                             confidence = 0.94
-                    elif _reference_key(reference) not in aggregate_keys and _row_has_summary_label(
+                    elif role_columns is not None:
+                        reason = "heterogeneous_aggregate_column_roles"
+                        confidence = 0.97
+                        details.update(
+                            {
+                                "aggregate_function": aggregate.function if aggregate else None,
+                                "source_columns": role_columns,
+                                "source_roles": sorted(
+                                    {str(item["role"]) for item in role_columns}
+                                ),
+                            }
+                        )
+                        expected = {"compatible_source_column_roles": True}
+                    elif _reference_key(
+                        reference
+                    ) not in aggregates_by_key and _row_has_summary_label(
                         context, worksheet, cell.row
                     ):
                         extension_data = _contiguous_extension(context, worksheet, cell, reference)
@@ -773,6 +1077,9 @@ class CrossSheetReferenceValidityRule(WorkbookRule):
                                 "populated content and may be planned future input, so this advisory "
                                 "does not prove the formula is erroneous."
                                 if reason == "blank_outside_content"
+                                else "A cross-sheet SUM or AVERAGE combines source columns whose explicit "
+                                "headers imply incompatible amount, rate, or quantity roles."
+                                if reason == "heterogeneous_aggregate_column_roles"
                                 else "A cross-sheet dependency points to a missing, structurally blank, "
                                 "out-of-content, or visibly truncated source target."
                             ),
@@ -787,6 +1094,9 @@ class CrossSheetReferenceValidityRule(WorkbookRule):
                                 "content and may be reserved for future input; confirm the template intent "
                                 "before editing the formula."
                                 if reason == "blank_outside_content"
+                                else "Confirm that every aggregated source column uses the same business unit; "
+                                "WorkbookLens does not guess a replacement formula."
+                                if reason == "heterogeneous_aggregate_column_roles"
                                 else "Inspect the source worksheet and intended table boundary before editing the "
                                 "formula; WorkbookLens does not guess replacement references."
                             ),
@@ -968,6 +1278,7 @@ class FormulaFormatRoleMismatchRule(WorkbookRule):
 
 FORMULA_SEMANTIC_RULES: tuple[type[WorkbookRule], ...] = (
     AggregateRangeCoverageRule,
+    UnlabeledAggregateRoleRule,
     CrossSheetReferenceValidityRule,
     FormulaInNotesColumnRule,
     DegenerateFormulaRule,
@@ -982,4 +1293,5 @@ __all__ = [
     "DegenerateFormulaRule",
     "FormulaFormatRoleMismatchRule",
     "FormulaInNotesColumnRule",
+    "UnlabeledAggregateRoleRule",
 ]

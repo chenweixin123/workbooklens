@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
+from typing import Any
 
 from workbooklens.i18n._rule_catalog import (
     BUILTIN_RULE_TITLES,
@@ -16,6 +18,148 @@ from workbooklens.scanner import ScanResult
 
 class MissingBuiltinTranslationError(RuntimeError):
     """A built-in human-readable message escaped its explicit translation catalog."""
+
+
+# Finding evidence remains canonical in models and machine-readable exports.
+# This explicit vocabulary is used only by the web presentation helper below.
+# Arbitrary workbook text must never be guessed or translated.
+_EVIDENCE_LABELS: dict[str, tuple[str, str]] = {
+    "proof": ("Proof", "证明"),
+    "source_proof": ("Source proof", "源证明"),
+    "font_size": ("Font size", "字号"),
+    "fixed_total_pages": ("Fixed total pages", "固定总页数"),
+    "proof_level": ("Proof level", "证明级别"),
+    "evidence_level": ("Evidence level", "证据级别"),
+    "coverage": ("Coverage", "覆盖范围"),
+    "source": ("Source", "来源"),
+    "source_cell": ("Source cell", "源单元格"),
+    "source_sheet": ("Source sheet", "源工作表"),
+    "cell": ("Cell", "单元格"),
+    "sheet": ("Sheet", "工作表"),
+    "range": ("Range", "范围"),
+    "formula": ("Formula", "公式"),
+    "error": ("Error", "错误"),
+    "reason": ("Reason", "原因"),
+    "kind": ("Kind", "类型"),
+    "role": ("Role", "角色"),
+    "anomaly": ("Anomaly", "异常类型"),
+    "observed": ("Observed", "实际值"),
+    "expected": ("Expected", "预期值"),
+    "excluded_cells": ("Excluded cells", "排除的单元格"),
+    "merged_range": ("Merged range", "合并范围"),
+    "fixed_rows": ("Fixed rows", "固定行数"),
+    "fixed_columns": ("Fixed columns", "固定列数"),
+    "total_pages": ("Total pages", "总页数"),
+}
+
+_EVIDENCE_VALUES: dict[str, tuple[str, str]] = {
+    "propagated_formula_error": ("Propagated formula error", "传播的公式错误"),
+    "numeric": ("Numeric", "数值"),
+    "formula": ("Formula", "公式"),
+    "Chart": ("Chart", "图表"),
+    "Image": ("Image", "图片"),
+    "hidden": ("Hidden", "隐藏"),
+    "veryHidden": ("Very hidden", "深度隐藏"),
+    "PROVEN_STATIC": ("Proven static", "静态证明"),
+    "STRONG_STRUCTURAL": ("Strong structural", "强结构证据"),
+    "strong_structural": ("Strong structural", "强结构证据"),
+    "proven_static_structure": ("Proven static structure", "静态结构证明"),
+    "advisory": ("Advisory", "提示性证据"),
+    "semantic_heuristic": ("Semantic heuristic", "语义启发式"),
+    "whole_percent_scale": ("Whole-percent scale", "整百分比倍率"),
+    "outside_fraction_range": ("Outside fraction range", "超出小数范围"),
+    "blank_outside_content": ("Blank outside content", "内容范围外空白"),
+    "blank_inside_dense_table": ("Blank inside dense table", "密集表格内空白"),
+    "single_edit": ("Single edit", "单点编辑"),
+    "placeholder_marker": ("Placeholder marker", "占位标记"),
+}
+_EVIDENCE_VALUE_CONTEXTS = frozenset(
+    {
+        "anomaly",
+        "candidate_kind",
+        "dominant_input_kind",
+        "dominant_kind",
+        "evidence_level",
+        "finding_kind",
+        "issue_kind",
+        "kind",
+        "method",
+        "proof",
+        "proof_level",
+        "reason",
+        "role",
+        "source_proof",
+        "state",
+        "type",
+    }
+)
+
+
+def _localize_evidence_key(value: str, language: Language) -> str:
+    """Translate a known structured-evidence key only."""
+
+    labels = _EVIDENCE_LABELS.get(value)
+    if labels is None:
+        return value
+    return labels[0] if language == "en" else labels[1]
+
+
+def _localize_evidence_string(
+    value: str,
+    language: Language,
+    *,
+    context_key: str | None = None,
+) -> str:
+    """Translate a known enum-like evidence value, leaving workbook text intact."""
+
+    # Short enum words (for example "formula" or "hidden") are translated only
+    # in their canonical field context so ordinary workbook text is never
+    # rewritten.
+    if context_key not in _EVIDENCE_VALUE_CONTEXTS:
+        return value
+    labels = _EVIDENCE_VALUES.get(value)
+    if labels is None:
+        return value
+    return labels[0] if language == "en" else labels[1]
+
+
+def localize_evidence_value(value: Any, language: str | None = None) -> Any:
+    """Return a recursively localized, non-mutating copy for web display.
+
+    Evidence is part of the canonical finding contract, so this helper belongs
+    at the presentation boundary. It translates only stable keys and enum-like
+    values while preserving unknown text, scalar types, and container shape.
+    """
+
+    normalized = normalize_language(language)
+
+    def visit(item: Any, context_key: str | None = None) -> Any:
+        if isinstance(item, dict):
+            localized: dict[Any, Any] = {}
+            original_keys = set(item)
+            for key, child in item.items():
+                display_key = (
+                    _localize_evidence_key(key, normalized)
+                    if isinstance(key, str)
+                    else deepcopy(key)
+                )
+                # A workbook/plugin may already use a translated-looking key.
+                # Keep canonical spelling instead of silently overwriting it.
+                if display_key != key and display_key in original_keys:
+                    display_key = key
+                if display_key in localized:
+                    display_key = key
+                localized[display_key] = visit(child, key if isinstance(key, str) else None)
+            return localized
+        if isinstance(item, list):
+            return [visit(child, context_key) for child in item]
+        if isinstance(item, tuple):
+            return tuple(visit(child, context_key) for child in item)
+        if isinstance(item, str):
+            return _localize_evidence_string(item, normalized, context_key=context_key)
+        return deepcopy(item)
+
+    return visit(value)
 
 
 def _dynamic_translation(text: str) -> str | None:
@@ -261,6 +405,7 @@ __all__ = [
     "MissingBuiltinTranslationError",
     "canonical_text_translation",
     "change_type_label",
+    "localize_evidence_value",
     "localize_finding",
     "localize_patch",
     "localize_scan_result",

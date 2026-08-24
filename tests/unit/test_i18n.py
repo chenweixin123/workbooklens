@@ -17,6 +17,7 @@ from workbooklens.i18n import (
     assert_catalog_complete,
     assert_error_catalog_complete,
     canonical_text_translation,
+    localize_evidence_value,
     localize_exception,
     localize_finding,
     localize_scan_result,
@@ -38,11 +39,61 @@ from workbooklens.rules import default_registry
 from workbooklens.rules.builtin import BUILTIN_RULES
 from workbooklens.rules.data_quality import DATA_QUALITY_RULES
 from workbooklens.rules.formula_semantics import FORMULA_SEMANTIC_RULES
+from workbooklens.rules.inferred_semantics import INFERRED_SEMANTIC_RULES
 from workbooklens.rules.layout_geometry import LAYOUT_GEOMETRY_RULES
+from workbooklens.rules.print_quality import PRINT_QUALITY_RULES
 from workbooklens.rules.profile_quality import PROFILE_QUALITY_RULES
 from workbooklens.scanner import scan_workbook
 
 runner = CliRunner()
+
+
+def test_evidence_values_localize_recursively_without_mutating_input() -> None:
+    canonical = {
+        "proof": "propagated_formula_error",
+        "source_proof": [
+            {"font_size": 8, "fixed_total_pages": 3},
+            ("unknown_key", {"custom": "业务原文"}),
+        ],
+    }
+
+    chinese = localize_evidence_value(canonical, "zh-CN")
+    english = localize_evidence_value(canonical, "en")
+
+    assert chinese == {
+        "证明": "传播的公式错误",
+        "源证明": [
+            {"字号": 8, "固定总页数": 3},
+            ("unknown_key", {"custom": "业务原文"}),
+        ],
+    }
+    assert english == {
+        "Proof": "Propagated formula error",
+        "Source proof": [
+            {"Font size": 8, "Fixed total pages": 3},
+            ("unknown_key", {"custom": "业务原文"}),
+        ],
+    }
+    assert localize_evidence_value(
+        {"observed": ["proof", "formula", "numeric", "hidden", "Chart"]}, "zh-CN"
+    ) == {"实际值": ["proof", "formula", "numeric", "hidden", "Chart"]}
+    assert localize_evidence_value(
+        {"kind": ["formula", "numeric", "hidden", "Chart"]}, "zh-CN"
+    ) == {"类型": ["公式", "数值", "隐藏", "图表"]}
+    assert localize_evidence_value({"proof": 1, "证明": 2}, "zh-CN") == {
+        "proof": 1,
+        "证明": 2,
+    }
+    assert canonical == {
+        "proof": "propagated_formula_error",
+        "source_proof": [
+            {"font_size": 8, "fixed_total_pages": 3},
+            ("unknown_key", {"custom": "业务原文"}),
+        ],
+    }
+    assert chinese is not canonical
+    assert chinese["源证明"] is not canonical["source_proof"]
+    assert english["Source proof"] is not canonical["source_proof"]
 
 
 def test_catalogs_are_complete_and_locale_normalization_is_bounded() -> None:
@@ -59,8 +110,10 @@ def test_every_builtin_rule_has_exact_bilingual_title_coverage() -> None:
         *BUILTIN_RULES,
         *DATA_QUALITY_RULES,
         *PROFILE_QUALITY_RULES,
+        *INFERRED_SEMANTIC_RULES,
         *FORMULA_SEMANTIC_RULES,
         *LAYOUT_GEOMETRY_RULES,
+        *PRINT_QUALITY_RULES,
     )
     emitted = {rule.rule_id: rule.title for rule in all_rule_types}
     assert set(emitted) == set(BUILTIN_RULE_TITLES)
@@ -81,12 +134,22 @@ def test_all_static_builtin_finding_patch_and_evidence_templates_are_translated(
     import workbooklens.rules.builtin as builtin
     import workbooklens.rules.data_quality as data_quality
     import workbooklens.rules.formula_semantics as formula_semantics
+    import workbooklens.rules.inferred_semantics as inferred_semantics
     import workbooklens.rules.layout_geometry as layout_geometry
+    import workbooklens.rules.print_quality as print_quality
     import workbooklens.rules.profile_quality as profile_quality
 
     fields = {"description", "explanation", "expected", "suggested_action", "summary"}
     texts: set[str] = set()
-    for module in (builtin, data_quality, formula_semantics, layout_geometry, profile_quality):
+    for module in (
+        builtin,
+        data_quality,
+        formula_semantics,
+        inferred_semantics,
+        layout_geometry,
+        print_quality,
+        profile_quality,
+    ):
         source = Path(module.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         texts.update(
@@ -132,6 +195,7 @@ def test_all_known_dynamic_builtin_templates_are_translated() -> None:
         "Body-role component consensus identifies 12 anomalous cells",
         "3 total-row cells use formats inconsistent with their body columns",
         "Confirm whether 'Sales'!B2:B5 should cover 'Sales'!B2:B8.",
+        "1 manual row break(s) split the dense leading portion of an inferred table",
     )
     assert all(canonical_text_translation(text, "zh-CN") for text in samples)
 

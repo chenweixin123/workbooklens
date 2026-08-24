@@ -28,13 +28,38 @@ All notable changes are documented here. WorkbookLens follows Semantic Versionin
 - Add formula-text, bounded static circular-dependency, and provable formula-error findings. The
   provable error rule is intentionally narrow and recognizes only deterministic expressions such as
   direct NA(), simple constant division by zero, and clearly nonnumeric literal VALUE(...) calls.
+  It also propagates a proven error through complete direct references, exact one-range
+  SUM/AVERAGE/MIN/MAX formulas, and strictly bounded pure-operator expressions over ordinary
+  single-cell references and literals. Other functions, conditions, error handlers, and
+  range/union/intersection syntax inside pure-operator expressions remain excluded, as do
+  arrays, dynamic-array syntax, and external references.
   Saved OOXML formula-error caches are reported separately as advisory evidence and may be stale.
+- Add six conservative report-only checks: WL051 detects success-green conditional formatting that
+  selects sign violations; WL052 identifies aggregates outside the labelled summary block; WL053
+  infers rare categorical near-spellings and explicit placeholder values; WL054 reports isolated
+  blanks in highly complete fields; and WL055 cross-checks manual page breaks, literal footer page
+  totals, print areas, and fit-to-width settings against independently inferred layout evidence.
+  WL056 flags only a unique, isolated, unusually tiny vivid label immediately beside a wide inferred
+  title, as an INFO-level manual-review advisory with no repair patch.
+  WL053 and WL054 also run without a Profile only when conservative structural thresholds are met;
+  they never invent or replace semantic values.
 
 ### Changed
 
+- Make WL051 conservative about every matching or unknown higher-priority conditional-format rule,
+  including `stopIfTrue=false`, so a lower-priority success-green fill is not falsely reported as
+  effective.
+- Make WL055 respect each page-break `min`/`max` span both with and without a saved print area,
+  preventing local row or column breaks from overstating the fixed footer page count.
 - Add bilingual Select all/Clear all controls and a live selected-count summary to the local repair
   review page. Bulk selection is scoped only to proposed repairs and never checks the separate
   layout-risk consent on the user's behalf.
+- Add INFO-level block summaries when a wide inferred table has repeated confirmed clipping in
+  multiple non-identifier, non-contact, non-notes text columns. The summary links the proven cells
+  but never normalizes every column to one width or adds another repair patch.
+- Summarize compact KPI blocks with at least three independently proven truncated aggregates while
+  explicitly listing neighboring aggregate formulas that lack enough boundary evidence as
+  unproven. The advisory does not classify or copy those neighboring formulas.
 - Keep references to missing worksheets as `ERROR`, while classifying an empty target outside
   recorded content as low-confidence advisory `INFO`. Add scan-scoped sparse-index,
   formula-cell, and row-label caches; these formula checks remain findings-only.
@@ -49,7 +74,7 @@ All notable changes are documented here. WorkbookLens follows Semantic Versionin
   source cells, preserving covered non-source columns for WL047 detection.
 - Interpret zero-offset TwoCellAnchor end markers at the leading edge of the marker cell, avoiding
   false print-area truncation findings while retaining real row or column overflow findings.
-- Expand the built-in deterministic registry from 35 to 50 rules and require exact Chinese/English
+- Expand the built-in deterministic registry from 35 to 56 rules and require exact Chinese/English
   title, explanation, evidence-summary, expectation, and suggested-action coverage for every
   built-in module.
 - Extend version-2 YAML validation with a strict, bounded `profile.sheets[].columns[]` schema while
@@ -75,6 +100,12 @@ All notable changes are documented here. WorkbookLens follows Semantic Versionin
   border continuity findings.
 - Generalize the Windows installer upgrade smoke test to accept a pinned earlier numeric release,
   while retaining the legacy portable-profile exception only for version 2.2.1.
+
+### Security
+
+- Remove ambiguous backtracking from the conservative email local-part validator and add
+  adversarial long-input timeout coverage, preventing a regular-expression denial of service while
+  retaining valid multi-segment addresses and rejecting leading, trailing, or consecutive dots.
 
 ## [2.3.0] - 2026-08-23
 

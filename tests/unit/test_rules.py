@@ -399,6 +399,7 @@ def test_cached_formula_error_is_reported_as_stale_evidence_only(tmp_path: Path)
     assert finding.location == "A1"
     assert finding.evidence.details == {
         "error": "#NUM!",
+        "error_code_proven": True,
         "proof": "cached_formula_error",
         "cached_error": "#NUM!",
     }

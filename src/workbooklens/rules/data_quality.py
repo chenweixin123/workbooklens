@@ -115,6 +115,14 @@ class _TableProfile:
     body_rows: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _ConditionalRuleEntry:
+    target: CellRange
+    rule: Any
+    priority: int
+    sequence: int
+
+
 def _confidence(value: float) -> Confidence:
     return Confidence(max(0.0, min(1.0, value)))
 
@@ -358,6 +366,124 @@ def _numeric_value(value: Any) -> float | None:
         return None
     result = float(value)
     return result if math.isfinite(result) else None
+
+
+def _conditional_rule_entries(worksheet: Worksheet) -> tuple[_ConditionalRuleEntry, ...]:
+    entries: list[_ConditionalRuleEntry] = []
+    sequence = 0
+    for conditional_formatting in worksheet.conditional_formatting:
+        for target in conditional_formatting.sqref.ranges:
+            target_range = CellRange(str(target))
+            for rule in conditional_formatting.rules:
+                raw_priority = getattr(rule, "priority", None)
+                priority = (
+                    raw_priority
+                    if isinstance(raw_priority, int)
+                    and not isinstance(raw_priority, bool)
+                    and raw_priority > 0
+                    else MAX_ROW + 1
+                )
+                entries.append(
+                    _ConditionalRuleEntry(
+                        target=target_range,
+                        rule=rule,
+                        priority=priority,
+                        sequence=sequence,
+                    )
+                )
+                sequence += 1
+    return tuple(sorted(entries, key=lambda entry: (entry.priority, entry.sequence)))
+
+
+def _literal_cell_is_operands(rule: Any) -> tuple[float, ...] | None:
+    if getattr(rule, "type", None) != "cellIs":
+        return None
+    operator = getattr(rule, "operator", None)
+    arity = 2 if operator in {"between", "notBetween"} else 1
+    if operator not in {
+        "between",
+        "equal",
+        "greaterThan",
+        "greaterThanOrEqual",
+        "lessThan",
+        "lessThanOrEqual",
+        "notBetween",
+        "notEqual",
+    }:
+        return None
+    formulas = getattr(rule, "formula", None)
+    if (
+        not isinstance(formulas, list)
+        or len(formulas) != arity
+        or not all(isinstance(formula, str) for formula in formulas)
+    ):
+        return None
+    operands: list[float] = []
+    for formula in formulas:
+        value = formula.strip().removeprefix("=").strip()
+        try:
+            operand = float(Decimal(value))
+        except (InvalidOperation, ValueError, OverflowError):
+            return None
+        if not math.isfinite(operand):
+            return None
+        operands.append(operand)
+    return tuple(operands)
+
+
+def _literal_threshold(rule: Any) -> float | None:
+    if getattr(rule, "operator", None) not in {"lessThan", "lessThanOrEqual"}:
+        return None
+    operands = _literal_cell_is_operands(rule)
+    if operands is None or operands[0] > 0.0:
+        return None
+    return operands[0]
+
+
+def _matches_literal_cell_is(value: float, rule: Any) -> bool | None:
+    operands = _literal_cell_is_operands(rule)
+    if operands is None:
+        return None
+    operator = getattr(rule, "operator", None)
+    first = operands[0]
+    if operator == "equal":
+        return value == first
+    if operator == "notEqual":
+        return value != first
+    if operator == "lessThan":
+        return value < first
+    if operator == "lessThanOrEqual":
+        return value <= first
+    if operator == "greaterThan":
+        return value > first
+    if operator == "greaterThanOrEqual":
+        return value >= first
+    second = operands[1]
+    if operator == "between":
+        return first <= value <= second
+    if operator == "notBetween":
+        return not first <= value <= second
+    return None
+
+
+def _success_green_fill(rule: Any) -> str | None:
+    differential = getattr(rule, "dxf", None)
+    fill = getattr(differential, "fill", None)
+    if fill is None or getattr(fill, "fill_type", None) != "solid":
+        return None
+    colors = (getattr(fill, "fgColor", None), getattr(fill, "start_color", None))
+    for color in colors:
+        rgb = getattr(color, "rgb", None)
+        if not isinstance(rgb, str) or len(rgb) not in {6, 8}:
+            continue
+        value = rgb[-6:]
+        try:
+            red, green, blue = (int(value[index : index + 2], 16) for index in (0, 2, 4))
+        except ValueError:
+            continue
+        if green >= 128 and green >= red + 48 and green >= blue + 24:
+            return value.upper()
+    return None
 
 
 def _semantic_groups(value: Any) -> set[str]:
@@ -727,6 +853,147 @@ class SignConstrainedMeasureRule(WorkbookRule):
                                     "Verify the source value, sign, and unit; WorkbookLens reports the "
                                     "violation but does not replace semantic values automatically."
                                 ),
+                            )
+                        )
+        return result
+
+
+class ConditionalFormatSemanticConflictRule(WorkbookRule):
+    rule_id = "WL051_CONDITIONAL_FORMAT_SEMANTIC_CONFLICT"
+    title = "Conditional format conflicts with constrained-value semantics"
+
+    def run(self, context: RuleContext) -> RuleResult:
+        result = RuleResult()
+        seen_semantics: set[tuple[Any, ...]] = set()
+        for worksheet in context.workbook.worksheets:
+            conditional_rules = _conditional_rule_entries(worksheet)
+            for profile in _table_profiles(context, worksheet):
+                for column, header in profile.headers.items():
+                    domain = _sign_domain(header)
+                    if domain is None:
+                        continue
+                    pairs = [
+                        (cell, numeric)
+                        for row in profile.body_rows
+                        if isinstance((cell := _cell_at(worksheet, row, column)), Cell)
+                        and not _is_formula(cell)
+                        and not _is_error(cell)
+                        and (numeric := _numeric_value(cell.value)) is not None
+                    ]
+                    if len(pairs) < MIN_PROFILE_ROWS:
+                        continue
+                    satisfying = sum(_satisfies_sign_domain(value, domain) for _, value in pairs)
+                    ratio = satisfying / len(pairs)
+                    if ratio < 0.85:
+                        continue
+                    violating_pairs = [
+                        (cell, value)
+                        for cell, value in pairs
+                        if not _satisfies_sign_domain(value, domain)
+                    ]
+                    if not violating_pairs:
+                        continue
+                    for candidate_index, entry in enumerate(conditional_rules):
+                        target_range = entry.target
+                        if not (
+                            target_range.min_col <= column <= target_range.max_col
+                            and target_range.min_row <= profile.body_rows[-1]
+                            and target_range.max_row >= profile.body_rows[0]
+                        ):
+                            continue
+                        threshold = _literal_threshold(entry.rule)
+                        green = _success_green_fill(entry.rule)
+                        if threshold is None or green is None:
+                            continue
+                        prior_rules = conditional_rules[:candidate_index]
+                        # Any matching or unknown higher-priority rule can override part of the
+                        # lower-priority fill, so the effective success-green format is not proven.
+                        matched_pairs: list[tuple[Cell, float]] = []
+                        for cell, value in violating_pairs:
+                            if cell.coordinate not in target_range:
+                                continue
+                            if _matches_literal_cell_is(value, entry.rule) is not True:
+                                continue
+                            prior_outcomes = [
+                                _matches_literal_cell_is(value, prior.rule)
+                                for prior in prior_rules
+                                if cell.coordinate in prior.target
+                            ]
+                            if not any(outcome is not False for outcome in prior_outcomes):
+                                matched_pairs.append((cell, value))
+                        if not matched_pairs:
+                            continue
+                        operator = str(getattr(entry.rule, "operator", ""))
+                        semantic_key = (
+                            worksheet.title,
+                            column,
+                            str(target_range),
+                            operator,
+                            threshold,
+                            green,
+                        )
+                        if semantic_key in seen_semantics:
+                            continue
+                        seen_semantics.add(semantic_key)
+                        violating_cells = [cell.coordinate for cell, _ in matched_pairs]
+                        negative_cells = [
+                            cell.coordinate for cell, value in matched_pairs if value < 0.0
+                        ]
+                        zero_cells = [
+                            cell.coordinate for cell, value in matched_pairs if value == 0.0
+                        ]
+                        evidence = Evidence(
+                            summary=(
+                                "Conditional formatting uses a success-green fill for "
+                                "sign-violating constrained values"
+                            ),
+                            observed={
+                                "target": str(target_range),
+                                "operator": operator,
+                                "threshold": threshold,
+                                "fill_rgb": green,
+                                "violating_cells": violating_cells,
+                                "negative_cells": negative_cells,
+                                "zero_cells": zero_cells,
+                            },
+                            expected={"warning_or_neutral_format_for_sign_violations": True},
+                            peers=[
+                                cell.coordinate
+                                for cell, value in pairs
+                                if _satisfies_sign_domain(value, domain)
+                            ][:12],
+                            details={
+                                "header": header,
+                                "domain": domain,
+                                "rule_priority": entry.priority,
+                                "satisfying_peers": satisfying,
+                                "numeric_peers": len(pairs),
+                                "automatic_format_change": False,
+                            },
+                        )
+                        result.findings.append(
+                            _make_finding(
+                                context=context,
+                                rule_id=self.rule_id,
+                                title=self.title,
+                                explanation=(
+                                    "A rule that selects sign-violating values in a strongly positive "
+                                    "or nonnegative field applies an unmistakably green success fill."
+                                ),
+                                severity=Severity.WARNING,
+                                confidence=0.94 if ratio >= 0.95 else 0.9,
+                                worksheet=worksheet,
+                                location=str(target_range),
+                                evidence=evidence,
+                                expected=(
+                                    "Conditional formatting for sign violations uses warning or neutral "
+                                    "semantics unless the exception is documented."
+                                ),
+                                suggested_action=(
+                                    "Review the conditional-format rule and its intended business meaning; "
+                                    "WorkbookLens does not rewrite visual semantics automatically."
+                                ),
+                                discriminator=(column, operator, threshold, green),
                             )
                         )
         return result
@@ -1693,6 +1960,7 @@ DATA_QUALITY_RULES: tuple[type[WorkbookRule], ...] = (
     DeepFreezePaneRule,
     PrintAreaCoverageRule,
     SignConstrainedMeasureRule,
+    ConditionalFormatSemanticConflictRule,
 )
 
 

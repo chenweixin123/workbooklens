@@ -17,7 +17,7 @@ flowchart LR
     Y --> B
     B --> C["Read-only semantic and layout snapshot"]
     C --> D["Semantic index, Formula IR, regions, and layout geometry"]
-    D --> E["50-rule registry"]
+    D --> E["56-rule registry"]
     E --> F["HTML, JSON, SARIF"]
     E --> G["Source-bound patch plan"]
     G --> H["Safe-only or explicitly reviewed layout operations"]
@@ -62,7 +62,9 @@ list positions.
 New semantic rules record their reasoning boundary in evidence details as `PROVEN_STATIC`,
 `STRONG_STRUCTURAL`, or `SEMANTIC_HEURISTIC`. Formula and business-value findings are report-only
 unless a deterministic repair is independently justified; none of the Profile or formula-semantic
-rules invents a replacement value or formula.
+rules invents a replacement value or formula. Visible-sheet layout and KPI block advisories may
+summarize several independently proven cell findings, but they remain `INFO`, carry no patch, and
+explicitly leave evidence-insufficient cells unclassified.
 
 An optional version-2 YAML Workbook Profile adds user-owned semantics such as required fields,
 enumerations, contact roles, fixed-width identifiers, and currency/percentage/date roles. The

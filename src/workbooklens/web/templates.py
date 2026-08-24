@@ -411,7 +411,7 @@ TEMPLATES = {
   {% for finding in findings %}<article class="finding-row {{ finding.severity.value }}">
     <div class="finding-meta"><span class="badge {{ finding.severity.value }}">{{ t("severity." ~ finding.severity.value) }}</span><span class="badge">{{ finding.rule_id }}</span><span>{{ finding.sheet or t("web.results_workbook_scope") }}{% if finding.location %}!{{ finding.location }}{% endif %}</span></div>
     <h3>{{ finding.title }}</h3><p>{{ finding.explanation }}</p>
-    <details><summary>{{ t("web.results_evidence") }}</summary><div class="evidence-grid"><span>{{ finding.evidence.summary }}</span><code>{{ display_value(finding.evidence.observed) }}</code></div></details>
+      <details><summary>{{ t("web.results_evidence") }}</summary><div class="evidence-grid"><span>{{ finding.evidence.summary }}</span><code>{{ display_evidence(finding.evidence.observed) }}</code>{% if finding.evidence.details %}<code>{{ display_evidence(finding.evidence.details) }}</code>{% endif %}</div></details>
   </article>{% endfor %}
   </div>{% else %}<div class="empty-state">{{ t("web.no_findings") }}</div>{% endif %}
 </section>
@@ -439,10 +439,18 @@ TEMPLATES = {
 
   if (selectAllButton) selectAllButton.addEventListener('click', () => {
     patchCheckboxes.forEach((checkbox) => { checkbox.checked = true; });
+    if (document.activeElement === selectAllButton && clearAllButton) {
+      clearAllButton.disabled = false;
+      clearAllButton.focus();
+    }
     updatePatchSelectionControls();
   });
   if (clearAllButton) clearAllButton.addEventListener('click', () => {
     patchCheckboxes.forEach((checkbox) => { checkbox.checked = false; });
+    if (document.activeElement === clearAllButton && selectAllButton) {
+      selectAllButton.disabled = false;
+      selectAllButton.focus();
+    }
     updatePatchSelectionControls();
   });
   patchCheckboxes.forEach((checkbox) => {

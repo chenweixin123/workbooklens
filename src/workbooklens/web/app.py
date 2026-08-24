@@ -30,6 +30,7 @@ from workbooklens.i18n import (
     DEFAULT_LANGUAGE,
     Language,
     UserFacingError,
+    localize_evidence_value,
     localize_exception,
     localize_finding,
     localize_patch,
@@ -222,6 +223,20 @@ def _display_value(value: Any, *, empty_label: str) -> str:
         return str(value)
 
 
+def _display_evidence(
+    value: Any,
+    *,
+    language: Language,
+    empty_label: str,
+) -> str:
+    """Render a localized copy without changing canonical evidence."""
+
+    return _display_value(
+        localize_evidence_value(value, language),
+        empty_label=empty_label,
+    )
+
+
 def _render_page(
     environment: Environment,
     template_name: str,
@@ -242,6 +257,11 @@ def _render_page(
         t=translator,
         display_value=partial(
             _display_value,
+            empty_label=translator("web.value_empty"),
+        ),
+        display_evidence=partial(
+            _display_evidence,
+            language=language,
             empty_label=translator("web.value_empty"),
         ),
         **context,
