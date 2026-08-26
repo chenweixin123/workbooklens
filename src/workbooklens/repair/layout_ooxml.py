@@ -55,6 +55,7 @@ LAYOUT_KINDS = frozenset(
 )
 STYLE_LAYOUT_KINDS = frozenset(
     {
+        PatchKind.COPY_NUMBER_FORMAT,
         PatchKind.SET_WRAP_TEXT,
         PatchKind.SET_SHRINK_TO_FIT,
         PatchKind.SET_TEXT,
@@ -329,6 +330,24 @@ class StylesEditor:
         candidate.set("applyNumberFormat", "1")
         self._assign_xf(cell, candidate)
 
+    def copy_number_format(
+        self,
+        target: etree._Element,
+        source: etree._Element,
+    ) -> None:
+        """Copy only number-format XF attributes and preserve every other style field."""
+
+        candidate = copy.deepcopy(self._xf(target))
+        source_xf = self._xf(source)
+        for attribute in ("numFmtId", "applyNumberFormat"):
+            source_value = source_xf.get(attribute)
+            if source_value is None:
+                if attribute in candidate.attrib:
+                    del candidate.attrib[attribute]
+            else:
+                candidate.set(attribute, source_value)
+        self._assign_xf(target, candidate)
+
     def copy_border_edge(
         self,
         target: etree._Element,
@@ -586,6 +605,8 @@ def patch_target_key(patch: PatchOperation) -> tuple[str, str, str]:
         return patch.sheet, patch.cell, f"border-{target_edge}"
     if patch.kind == PatchKind.COPY_STYLE:
         return patch.sheet, patch.cell, "style-all"
+    if patch.kind == PatchKind.COPY_NUMBER_FORMAT:
+        return patch.sheet, patch.cell, "style-all"
     return patch.sheet, patch.cell, "content"
 
 
@@ -763,7 +784,12 @@ def apply_alignment(
     styles.set_alignment_flag(cell, "shrinkToFit" if shrink else "wrapText", value)
 
 
-def apply_set_text(root: etree._Element, patch: PatchOperation, styles: StylesEditor) -> None:
+def _replace_inline_text(
+    root: etree._Element,
+    patch: PatchOperation,
+    *,
+    operation: str,
+) -> etree._Element:
     coordinate = _validate_coordinate(patch.cell)
     cell = _cell_element(root, coordinate)
     if cell is None:
@@ -772,22 +798,23 @@ def apply_set_text(root: etree._Element, patch: PatchOperation, styles: StylesEd
         raise PatchValidationError(f"Patch {patch.id} text output must be a string")
     child_names = [etree.QName(child).localname for child in cell]
     if "f" in child_names:
-        raise PatchValidationError("SET_TEXT refuses to replace a formula")
+        raise PatchValidationError(f"{operation} refuses to replace a formula")
     unsupported_attributes = {str(name) for name in cell.attrib} - {"r", "s", "t"}
     if unsupported_attributes:
         raise PatchValidationError(
-            "SET_TEXT refuses cell metadata attributes: "
+            f"{operation} refuses cell metadata attributes: "
             + ", ".join(sorted(unsupported_attributes))
         )
     unsupported_children = set(child_names) - {"v", "is", "extLst"}
     if unsupported_children:
         raise PatchValidationError(
-            "SET_TEXT refuses unsupported cell children: " + ", ".join(sorted(unsupported_children))
+            f"{operation} refuses unsupported cell children: "
+            + ", ".join(sorted(unsupported_children))
         )
     if child_names.count("v") > 1 or child_names.count("is") > 1:
-        raise PatchValidationError("SET_TEXT refuses duplicate value children")
+        raise PatchValidationError(f"{operation} refuses duplicate value children")
     if child_names.count("extLst") > 1:
-        raise PatchValidationError("SET_TEXT refuses duplicate extLst children")
+        raise PatchValidationError(f"{operation} refuses duplicate extLst children")
     for child in list(cell):
         if etree.QName(child).localname in {"v", "is"}:
             cell.remove(child)
@@ -803,7 +830,36 @@ def apply_set_text(root: etree._Element, patch: PatchOperation, styles: StylesEd
         cell.append(inline)
     else:
         cell.insert(cell.index(extension), inline)
+    return cell
+
+
+def apply_set_text(root: etree._Element, patch: PatchOperation, styles: StylesEditor) -> None:
+    cell = _replace_inline_text(root, patch, operation="SET_TEXT")
     styles.set_text_number_format(cell)
+
+
+def apply_normalize_text(root: etree._Element, patch: PatchOperation) -> None:
+    """Replace a plain string while preserving its existing number format and style."""
+
+    _replace_inline_text(root, patch, operation="NORMALIZE_TEXT")
+
+
+def apply_copy_number_format(
+    root: etree._Element,
+    patch: PatchOperation,
+    styles: StylesEditor,
+) -> None:
+    """Copy only the source number format onto an existing target cell."""
+
+    coordinate = _validate_coordinate(patch.cell)
+    source_coordinate = _validate_coordinate(patch.source_cell, "source cell coordinate")
+    target = _cell_element(root, coordinate)
+    source = _cell_element(root, source_coordinate)
+    if target is None:
+        raise PatchValidationError(f"Number-format target cell is absent: {coordinate}")
+    if source is None:
+        raise PatchValidationError(f"Number-format source cell is absent: {source_coordinate}")
+    styles.copy_number_format(target, source)
 
 
 def apply_sheet_view(root: etree._Element, patch: PatchOperation) -> None:
@@ -1553,6 +1609,8 @@ __all__ = [
     "apply_clear_formatting_tail",
     "apply_column_width",
     "apply_copy_border",
+    "apply_copy_number_format",
+    "apply_normalize_text",
     "apply_remove_whitespace_tail_cells",
     "apply_row_height",
     "apply_set_text",

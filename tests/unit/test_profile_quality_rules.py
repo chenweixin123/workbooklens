@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from datetime import datetime
+from copy import copy
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
+from openpyxl.utils.datetime import to_excel
 
 from workbooklens.exceptions import UsageError
 from workbooklens.models import PatchKind, PatchRisk
+from workbooklens.repair.ooxml_patch import patch_ooxml_package
+from workbooklens.repair.planning import build_patch_plan
+from workbooklens.rules.builtin import NumericTextRule, TextDisplayRiskRule
 from workbooklens.rules.profile_quality import (
     MAX_PROFILE_RANGE_CELLS,
     PROFILE_QUALITY_RULE_IDS,
@@ -17,6 +23,7 @@ from workbooklens.rules.profile_quality import (
     ContactFormatRule,
     EnumeratedValueRule,
     LeadingZeroIdentifierRule,
+    LosslessValueNormalizationRule,
     NumberFormatRoleConflictRule,
     RequiredFieldRule,
     TrailingWhitespaceRule,
@@ -52,6 +59,18 @@ def _profile(columns: list[dict], **options: object) -> dict:
             ],
         }
     }
+
+
+def _versioned_profile(
+    columns: list[dict],
+    *,
+    version: int,
+    range_ref: str | None = None,
+) -> dict:
+    sheet: dict[str, object] = {"sheet": "Data", "columns": columns}
+    if range_ref is not None:
+        sheet["range"] = range_ref
+    return {"version": version, "profile": {"sheets": [sheet]}}
 
 
 def test_profile_parser_accepts_stable_shape() -> None:
@@ -94,9 +113,46 @@ def test_profile_parser_accepts_stable_shape() -> None:
     assert table.columns[1].column == "B"
     assert table.columns[1].role == "currency"
     assert not table.columns[1].preserve_leading_zeros
+    assert table.columns[1].repair is None
 
     assert parse_workbook_profile({"profile": {}}).tables == ()
     assert parse_workbook_profile(None).tables == ()
+
+
+def test_profile_parser_accepts_v3_column_repair_and_rejects_it_in_v2() -> None:
+    profile = parse_workbook_profile(
+        {
+            "version": 3,
+            "profile": {
+                "sheets": [
+                    {
+                        "sheet": "Data",
+                        "columns": [
+                            {"header": "Amount", "role": "currency", "repair": "auto"},
+                            {"header": "Notes", "role": "text", "repair": "report"},
+                        ],
+                    }
+                ]
+            },
+        }
+    )
+
+    assert profile.version == 3
+    assert [column.repair for column in profile.tables[0].columns] == ["auto", "report"]
+    with pytest.raises(ValueError, match="repair requires configuration version 3"):
+        parse_workbook_profile(
+            {
+                "version": 2,
+                "profile": {
+                    "sheets": [
+                        {
+                            "sheet": "Data",
+                            "columns": [{"header": "Amount", "role": "currency", "repair": "auto"}],
+                        }
+                    ]
+                },
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -190,6 +246,7 @@ def test_profile_rule_exports_are_stable_and_complete() -> None:
         "WL039_CONTACT_FORMAT",
         "WL040_LEADING_ZERO_IDENTIFIER",
         "WL041_NUMBER_FORMAT_ROLE_CONFLICT",
+        "WL058_LOSSLESS_VALUE_NORMALIZATION",
     } == PROFILE_QUALITY_RULE_IDS
     assert {rule_type.rule_id for rule_type in PROFILE_QUALITY_RULES} == PROFILE_QUALITY_RULE_IDS
 
@@ -945,6 +1002,593 @@ def test_number_format_rule_reports_clear_role_conflicts_but_not_general_or_vali
         finding.evidence.details["evidence_level"] == "PROVEN_STATIC" for finding in scan.findings
     )
     assert not scan.patches
+
+
+def test_wl058_strict_literals_produce_safe_native_storage_patches(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Amount", "Rate", "Date", "Quantity", "Notes"])
+    for row in range(2, 6):
+        worksheet.append(
+            [
+                row * 1000,
+                row / 100,
+                date(2026, 8, row),
+                row * 100,
+                f"note {row}",
+            ]
+        )
+        worksheet[f"A{row}"].number_format = "$#,##0.00"
+        worksheet[f"B{row}"].number_format = "0.0%"
+        worksheet[f"C{row}"].number_format = "yyyy-mm-dd"
+        worksheet[f"D{row}"].number_format = "#,##0"
+    worksheet.append(["$1,234.50", "12.5%", "2026-08-25", "1,234  ", "123  "])
+
+    scan = _save_and_scan(
+        workbook,
+        tmp_path / "strict-lossless-literals.xlsx",
+        config=_versioned_profile(
+            [
+                {"header": "Amount", "role": "currency", "repair": "auto"},
+                {"header": "Rate", "role": "percentage", "repair": "auto"},
+                {"header": "Date", "role": "date", "repair": "auto"},
+                {"header": "Quantity", "role": "number", "repair": "auto"},
+                {"header": "Notes", "role": "text", "repair": "auto"},
+            ],
+            version=3,
+            range_ref="A1:E6",
+        ),
+        rules=(LosslessValueNormalizationRule,),
+    )
+
+    value_patches = {
+        patch.cell: patch
+        for patch in scan.patches
+        if patch.kind in {PatchKind.SET_NUMERIC, PatchKind.NORMALIZE_TEXT}
+    }
+    assert set(value_patches) == {"A6", "B6", "C6", "D6", "E6"}
+    assert value_patches["A6"].after == 1234.5
+    assert value_patches["B6"].after == 0.125
+    assert value_patches["C6"].after == int(to_excel(date(2026, 8, 25)))
+    assert value_patches["D6"].after == 1234
+    assert value_patches["E6"].after == "123"
+    assert value_patches["E6"].kind == PatchKind.NORMALIZE_TEXT
+    assert all(patch.safe and patch.risk == PatchRisk.SAFE for patch in scan.patches)
+
+    format_patches = {
+        patch.cell: patch for patch in scan.patches if patch.kind == PatchKind.COPY_NUMBER_FORMAT
+    }
+    assert set(format_patches) == {"A6", "B6", "C6"}
+    for cell in format_patches:
+        assert format_patches[cell].atomic_group == value_patches[cell].atomic_group
+        assert format_patches[cell].atomic_group is not None
+        assert format_patches[cell].source_cell in {
+            f"{cell[0]}2",
+            f"{cell[0]}3",
+            f"{cell[0]}4",
+            f"{cell[0]}5",
+        }
+
+
+def test_wl058_rejects_leading_zero_and_malformed_literals(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Quantity", "Amount", "Rate", "Date"])
+    for row in range(2, 6):
+        worksheet.append([row * 10, row * 1000, row / 100, date(2026, 8, row)])
+        worksheet[f"B{row}"].number_format = "$#,##0.00"
+        worksheet[f"C{row}"].number_format = "0.0%"
+        worksheet[f"D{row}"].number_format = "yyyy-mm-dd"
+    worksheet.append(["00123", "$12,34", "12%%", "2026-02-30"])
+
+    scan = _save_and_scan(
+        workbook,
+        tmp_path / "rejected-lossless-literals.xlsx",
+        config=_versioned_profile(
+            [
+                {"header": "Quantity", "role": "number", "repair": "auto"},
+                {"header": "Amount", "role": "currency", "repair": "auto"},
+                {"header": "Rate", "role": "percentage", "repair": "auto"},
+                {"header": "Date", "role": "date", "repair": "auto"},
+            ],
+            version=3,
+            range_ref="A1:D6",
+        ),
+        rules=(LosslessValueNormalizationRule,),
+    )
+
+    assert not scan.findings
+    assert not scan.patches
+
+
+@pytest.mark.parametrize(
+    ("repair_mode", "expected_risk"),
+    [
+        ("auto", PatchRisk.SAFE),
+        ("review", PatchRisk.SEMANTIC_REVIEW),
+        ("report", None),
+    ],
+)
+def test_profile_v3_repair_modes_gate_wl058_authority(
+    tmp_path: Path,
+    repair_mode: str,
+    expected_risk: PatchRisk | None,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Business Field"])
+    for value in (100, 200, 300, 400):
+        worksheet.append([value])
+    worksheet.append(["1200"])
+
+    scan = _save_and_scan(
+        workbook,
+        tmp_path / f"profile-v3-{repair_mode}.xlsx",
+        config=_versioned_profile(
+            [{"header": "Business Field", "role": "number", "repair": repair_mode}],
+            version=3,
+            range_ref="A1:A6",
+        ),
+        rules=(LosslessValueNormalizationRule,),
+    )
+
+    assert [finding.location for finding in scan.findings] == ["A6"]
+    patches = [
+        patch
+        for patch in scan.patches
+        if patch.cell == "A6" and patch.kind == PatchKind.SET_NUMERIC
+    ]
+    if expected_risk is None:
+        assert not patches
+        assert not scan.findings[0].patch_ids
+        return
+    assert len(patches) == 1
+    assert patches[0].risk == expected_risk
+    assert patches[0].safe is (expected_risk == PatchRisk.SAFE)
+
+
+def test_v1_and_v2_configs_do_not_gain_implicit_profile_repair_authority(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Business Field"])
+    for value in (100, 200, 300, 400):
+        worksheet.append([value])
+    worksheet.append(["1200"])
+
+    v2_scan = _save_and_scan(
+        workbook,
+        tmp_path / "profile-v2-no-repair.xlsx",
+        config=_versioned_profile(
+            [{"header": "Business Field", "role": "number"}],
+            version=2,
+            range_ref="A1:A6",
+        ),
+        rules=(LosslessValueNormalizationRule,),
+    )
+    assert [finding.location for finding in v2_scan.findings] == ["A6"]
+    assert not v2_scan.patches
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Quantity", "Context"])
+    for index, value in enumerate((100, 200, 300, 400), start=1):
+        worksheet.append([value, f"R{index}"])
+    worksheet.append(["1200", "R5"])
+    v1_scan = _save_and_scan(
+        workbook,
+        tmp_path / "profile-v1-inferred.xlsx",
+        config={"version": 1},
+        rules=(LosslessValueNormalizationRule,),
+    )
+    patch = next(
+        patch
+        for patch in v1_scan.patches
+        if patch.cell == "A6" and patch.kind == PatchKind.SET_NUMERIC
+    )
+    assert patch.risk == PatchRisk.SAFE
+    assert patch.safe
+
+
+def test_chinese_number_candidates_are_semantic_review_and_require_recalculation(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Amount", "Hours", "Multiplier"])
+    for row in range(2, 6):
+        worksheet.append([row * 10_000, row * 2, 1 + row / 10])
+        worksheet[f"A{row}"].number_format = "$#,##0.00"
+        worksheet[f"C{row}"].number_format = "0.0x"
+    worksheet.append(["八万九千元", "八小时", "1.5倍"])
+    worksheet["A6"].number_format = "$#,##0.00"
+    worksheet["C6"].number_format = "0.0x"
+
+    scan = _save_and_scan(
+        workbook,
+        tmp_path / "chinese-semantic-review.xlsx",
+        config=_versioned_profile(
+            [
+                {"header": "Amount", "role": "currency", "repair": "auto"},
+                {"header": "Hours", "role": "number", "repair": "auto"},
+                {"header": "Multiplier", "role": "number", "repair": "auto"},
+            ],
+            version=3,
+            range_ref="A1:C6",
+        ),
+        rules=(LosslessValueNormalizationRule,),
+    )
+
+    patches = {patch.cell: patch for patch in scan.patches if patch.kind == PatchKind.SET_NUMERIC}
+    assert patches["A6"].after == 89_000
+    assert patches["B6"].after == 8
+    assert patches["C6"].after == 1.5
+    assert all(patch.risk == PatchRisk.SEMANTIC_REVIEW for patch in patches.values())
+    assert all(not patch.safe for patch in patches.values())
+    assert all(patch.derivation.requires_recalculation for patch in patches.values())
+    assert all(patch.derivation.candidate_count == 1 for patch in patches.values())
+    assert all(
+        patch.derivation.strategy == "semantic_numeric_normalization" for patch in patches.values()
+    )
+    assert all(
+        any(source.startswith("profile_column_role:") for source in patch.derivation.sources)
+        for patch in patches.values()
+    )
+    assert all(
+        "explicit_v3_numeric_role" in patch.derivation.invariants for patch in patches.values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("repair_mode", "expects_patch"),
+    [(None, False), ("report", False), ("review", True), ("auto", True)],
+)
+def test_v3_semantic_number_requires_explicit_repair_authorization(
+    tmp_path: Path,
+    repair_mode: str | None,
+    expects_patch: bool,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Hours"])
+    for value in (2, 4, 6, 10):
+        worksheet.append([value])
+    worksheet.append(["八小时"])
+    column = {"header": "Hours", "role": "number"}
+    if repair_mode is not None:
+        column["repair"] = repair_mode
+
+    scan = _save_and_scan(
+        workbook,
+        tmp_path / f"semantic-repair-{repair_mode or 'omitted'}.xlsx",
+        config=_versioned_profile(
+            [column],
+            version=3,
+            range_ref="A1:A6",
+        ),
+        rules=(LosslessValueNormalizationRule,),
+    )
+
+    assert [finding.location for finding in scan.findings] == ["A6"]
+    patches = [
+        patch
+        for patch in scan.patches
+        if patch.cell == "A6" and patch.kind == PatchKind.SET_NUMERIC
+    ]
+    assert bool(patches) is expects_patch
+    if expects_patch:
+        assert len(patches) == 1
+        assert patches[0].risk == PatchRisk.SEMANTIC_REVIEW
+        assert patches[0].after == 8
+    else:
+        assert not scan.findings[0].patch_ids
+        assert (
+            "semantic_repair_authorization_required"
+            in scan.findings[0].evidence.details["blocked_reasons"]
+        )
+
+
+def test_same_cell_layout_review_does_not_hide_semantic_review_candidate(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.column_dimensions["A"].width = 2
+    worksheet.append(["Hours", "Context"])
+    for row in range(2, 6):
+        worksheet.append([row * 2, f"R{row}"])
+    worksheet.append(["八小时", "R6"])
+
+    scan = _save_and_scan(
+        workbook,
+        tmp_path / "layout-and-semantic-review.xlsx",
+        config=_versioned_profile(
+            [{"header": "Hours", "role": "number", "repair": "auto"}],
+            version=3,
+            range_ref="A1:B6",
+        ),
+        rules=(TextDisplayRiskRule, LosslessValueNormalizationRule),
+    )
+
+    same_cell = [patch for patch in scan.patches if patch.cell == "A6"]
+    assert any(patch.risk == PatchRisk.LAYOUT_REVIEW for patch in same_cell)
+    semantic = next(
+        patch
+        for patch in same_cell
+        if patch.kind == PatchKind.SET_NUMERIC and patch.risk == PatchRisk.SEMANTIC_REVIEW
+    )
+    assert semantic.after == 8
+    finding = next(
+        finding
+        for finding in scan.findings
+        if finding.rule_id == "WL058_LOSSLESS_VALUE_NORMALIZATION" and finding.location == "A6"
+    )
+    assert finding.patch_ids == [semantic.id]
+
+
+def test_inferred_semantic_numbers_are_reported_without_applicable_patches(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["已支出", "工时", "加班系数"])
+    for row in range(2, 6):
+        worksheet.append([row * 10_000, row * 2, 1 + row / 10])
+        worksheet[f"A{row}"].number_format = "¥#,##0"
+        worksheet[f"C{row}"].number_format = "0.0x"
+    worksheet.append(["八万九千", "八小时", "1.5倍"])
+    worksheet["A6"].number_format = "¥#,##0"
+    worksheet["C6"].number_format = "0.0x"
+
+    scan = _save_and_scan(
+        workbook,
+        tmp_path / "inferred-semantic-review.xlsx",
+        rules=(LosslessValueNormalizationRule,),
+    )
+
+    findings = {finding.location: finding for finding in scan.findings}
+    assert set(findings) == {"A6", "B6", "C6"}
+    assert {
+        location: finding.evidence.expected["value"] for location, finding in findings.items()
+    } == {
+        "A6": 89_000,
+        "B6": 8,
+        "C6": 1.5,
+    }
+    assert all(finding.evidence.details["semantic_candidate"] for finding in findings.values())
+    assert all(
+        "explicit_v3_numeric_profile_required" in finding.evidence.details["blocked_reasons"]
+        for finding in findings.values()
+    )
+    assert scan.patches == []
+    assert not any(patch.risk == PatchRisk.SEMANTIC_REVIEW for patch in scan.patches)
+
+
+@pytest.mark.parametrize("blocked", ["hidden", "merged", "protected", "text_format"])
+def test_semantic_number_patch_requires_a_safe_profile_target(
+    tmp_path: Path,
+    blocked: str,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Multiplier", "Context"])
+    for row in range(2, 6):
+        worksheet.append([1 + row / 10, f"R{row}"])
+        worksheet[f"A{row}"].number_format = "0.0x"
+    worksheet.append(["1.5倍", "R6"])
+    worksheet["A6"].number_format = "0.0x"
+    if blocked == "hidden":
+        worksheet.row_dimensions[6].hidden = True
+    elif blocked == "merged":
+        worksheet.merge_cells("A6:B6")
+    elif blocked == "protected":
+        worksheet.protection.sheet = True
+    else:
+        worksheet["A6"].number_format = "@"
+
+    scan = _save_and_scan(
+        workbook,
+        tmp_path / f"semantic-{blocked}.xlsx",
+        config=_versioned_profile(
+            [{"header": "Multiplier", "role": "number", "repair": "auto"}],
+            version=3,
+            range_ref="A1:B6",
+        ),
+        rules=(LosslessValueNormalizationRule,),
+    )
+
+    assert not any(patch.cell == "A6" for patch in scan.patches)
+
+
+@pytest.mark.parametrize(
+    ("repair_mode", "expected_risk"),
+    [
+        ("auto", PatchRisk.SAFE),
+        ("review", PatchRisk.SEMANTIC_REVIEW),
+        ("report", None),
+    ],
+)
+def test_wl006_defers_to_explicit_v3_wl058_repair_mode(
+    tmp_path: Path,
+    repair_mode: str,
+    expected_risk: PatchRisk | None,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Quantity", "Context"])
+    for row in range(2, 22):
+        worksheet.append([row * 100, f"R{row}"])
+    worksheet["A10"] = "1200"
+
+    scan = _save_and_scan(
+        workbook,
+        tmp_path / f"wl006-v3-{repair_mode}.xlsx",
+        config=_versioned_profile(
+            [{"header": "Quantity", "role": "number", "repair": repair_mode}],
+            version=3,
+            range_ref="A1:B21",
+        ),
+        rules=(NumericTextRule, LosslessValueNormalizationRule),
+    )
+
+    wl006 = next(
+        finding
+        for finding in scan.findings
+        if finding.rule_id == "WL006_NUMERIC_TEXT" and finding.location == "A10"
+    )
+    assert not wl006.patch_ids
+    numeric_patches = [
+        patch
+        for patch in scan.patches
+        if patch.cell == "A10" and patch.kind == PatchKind.SET_NUMERIC
+    ]
+    if expected_risk is None:
+        assert not numeric_patches
+        return
+    assert len(numeric_patches) == 1
+    assert numeric_patches[0].risk == expected_risk
+
+
+def test_wl006_keeps_legacy_v2_authority_without_duplicate_wl058_patch(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Quantity", "Context"])
+    for row in range(2, 22):
+        worksheet.append([row * 100, f"R{row}"])
+    worksheet["A10"] = "1200"
+
+    scan = _save_and_scan(
+        workbook,
+        tmp_path / "wl006-v2-compatibility.xlsx",
+        config=_versioned_profile(
+            [{"header": "Quantity", "role": "number"}],
+            version=2,
+            range_ref="A1:B21",
+        ),
+        rules=(NumericTextRule, LosslessValueNormalizationRule),
+    )
+
+    wl006 = next(
+        finding
+        for finding in scan.findings
+        if finding.rule_id == "WL006_NUMERIC_TEXT" and finding.location == "A10"
+    )
+    numeric_patches = [
+        patch
+        for patch in scan.patches
+        if patch.cell == "A10" and patch.kind == PatchKind.SET_NUMERIC
+    ]
+    assert len(numeric_patches) == 1
+    assert wl006.patch_ids == [numeric_patches[0].id]
+    assert numeric_patches[0].kind == PatchKind.SET_NUMERIC
+    assert not any(
+        finding.rule_id == "WL058_LOSSLESS_VALUE_NORMALIZATION" and finding.location == "A10"
+        for finding in scan.findings
+    )
+
+
+def test_copy_number_format_preserves_all_other_target_style_fields(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Amount", "Context"])
+    for row in range(2, 6):
+        worksheet.append([row * 1000, f"R{row}"])
+        worksheet[f"A{row}"].number_format = "$#,##0.00"
+    worksheet.append(["$1,234.50", "R6"])
+    target = worksheet["A6"]
+    target.font = Font(name="Arial", size=13, bold=True, color="FF112233")
+    target.fill = PatternFill(fill_type="solid", fgColor="FFABCDEF")
+    target.border = Border(
+        left=Side(style="thick", color="FF010203"),
+        right=Side(style="double", color="FF040506"),
+    )
+    target.alignment = Alignment(horizontal="center", vertical="top", wrap_text=True)
+    target.protection = Protection(locked=False, hidden=True)
+    source = tmp_path / "copy-number-format-source.xlsx"
+    scan = _save_and_scan(
+        workbook,
+        source,
+        config=_versioned_profile(
+            [{"header": "Amount", "role": "currency", "repair": "auto"}],
+            version=3,
+            range_ref="A1:B6",
+        ),
+        rules=(LosslessValueNormalizationRule,),
+    )
+    value_patch = next(
+        patch
+        for patch in scan.patches
+        if patch.cell == "A6" and patch.kind == PatchKind.SET_NUMERIC
+    )
+    format_patch = next(
+        patch
+        for patch in scan.patches
+        if patch.cell == "A6" and patch.kind == PatchKind.COPY_NUMBER_FORMAT
+    )
+    assert value_patch.atomic_group == format_patch.atomic_group
+    assert value_patch.atomic_group is not None
+
+    original = load_workbook(source)
+    original_target = original["Data"]["A6"]
+    expected_font = copy(original_target.font)
+    expected_fill = copy(original_target.fill)
+    expected_border = copy(original_target.border)
+    expected_alignment = copy(original_target.alignment)
+    expected_protection = copy(original_target.protection)
+    original.close()
+
+    plan = build_patch_plan(scan)
+    output = tmp_path / "copy-number-format-output.xlsx"
+    low_level, applied = patch_ooxml_package(
+        source,
+        plan,
+        output,
+        selected_ids={value_patch.id, format_patch.id},
+        canonical_plan=plan,
+    )
+    assert {patch.id for patch in applied} == {value_patch.id, format_patch.id}
+    assert not low_level.formula_changed
+
+    repaired = load_workbook(output)
+    repaired_target = repaired["Data"]["A6"]
+    repaired_format_source = repaired["Data"][format_patch.source_cell]
+    assert repaired_target.value == 1234.5
+    assert repaired_target.number_format == repaired_format_source.number_format
+    assert copy(repaired_target.font) == expected_font
+    assert copy(repaired_target.fill) == expected_fill
+    assert copy(repaired_target.border) == expected_border
+    assert copy(repaired_target.alignment) == expected_alignment
+    assert copy(repaired_target.protection) == expected_protection
+    repaired.close()
 
 
 def test_profile_rules_reject_hidden_sheets_when_explicitly_configured(tmp_path: Path) -> None:

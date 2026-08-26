@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -18,11 +19,18 @@ from lxml import etree
 from openpyxl import load_workbook
 from openpyxl.cell.cell import Cell
 from openpyxl.utils.cell import coordinate_to_tuple, get_column_letter
+from openpyxl.utils.datetime import to_excel
 from openpyxl.worksheet.cell_range import CellRange
 
 from workbooklens.exceptions import PatchValidationError, StalePlanError, UsageError
 from workbooklens.formulas import analyze_formula
-from workbooklens.models import PackageChange, PatchKind, PatchOperation, PatchPlan
+from workbooklens.models import (
+    FORMULA_PATCH_KINDS,
+    PackageChange,
+    PatchKind,
+    PatchOperation,
+    PatchPlan,
+)
 from workbooklens.ooxml.safety import PackageLimits, inspect_package, parse_xml_part
 from workbooklens.repair.layout_ooxml import (
     StylesEditor,
@@ -30,6 +38,8 @@ from workbooklens.repair.layout_ooxml import (
     apply_clear_formatting_tail,
     apply_column_width,
     apply_copy_border,
+    apply_copy_number_format,
+    apply_normalize_text,
     apply_remove_whitespace_tail_cells,
     apply_row_height,
     apply_set_text,
@@ -62,8 +72,49 @@ CANONICAL_PLAN_MISMATCH = (
     "Patch plan does not match the canonical scan: an operation intersects an unsupported "
     "shared formula range, uses an unsupported array or unsupported dataTable formula, or "
     "contains edited structured or ordinary formula, safe, confidence, kind, source-cell, "
-    "description, or precondition fields"
+    "description, derivation, risk, or precondition fields"
 )
+
+DATA_NORMALIZATION_KINDS = frozenset(
+    {
+        PatchKind.NORMALIZE_TEXT,
+        PatchKind.SET_NUMERIC,
+        PatchKind.COPY_NUMBER_FORMAT,
+    }
+)
+FORMULA_REPAIR_KINDS = frozenset(
+    {
+        PatchKind.SET_FORMULA,
+        PatchKind.EXTEND_SUM,
+        PatchKind.CREATE_FORMULA,
+    }
+)
+
+
+def _patch_application_sort_key(patch: PatchOperation) -> tuple[int, str, str, str, str]:
+    if patch.kind in DATA_NORMALIZATION_KINDS:
+        priority = 0
+    elif patch.kind in FORMULA_REPAIR_KINDS:
+        priority = 1
+    elif is_layout_kind(patch.kind):
+        priority = 3
+    else:
+        priority = 2
+    return priority, patch.sheet, patch.cell, patch.kind.value, patch.id
+
+
+def _is_unverified_legacy_formula(patch: PatchOperation) -> bool:
+    return (
+        patch.kind in FORMULA_PATCH_KINDS
+        and patch.derivation.strategy == "legacy_schema_v2_unverified_formula"
+    )
+
+
+def _validated_temporary_path(path: str | Path, parent: Path) -> Path:
+    temporary = Path(path).resolve()
+    if temporary.parent != parent.resolve():
+        raise PatchValidationError("OOXML patch workspace escaped its intended parent directory")
+    return temporary
 
 
 def _qname(namespace: str, local_name: str) -> str:
@@ -519,6 +570,40 @@ def _verify_preconditions(
                     raise PatchValidationError(
                         f"Style patch {patch.id} would change pivot-button semantics"
                     )
+            elif patch.kind == PatchKind.COPY_NUMBER_FORMAT:
+                if not patch.source_cell:
+                    raise PatchValidationError(f"Number-format patch {patch.id} has no source cell")
+                source_cell = worksheet[patch.source_cell]
+                if not isinstance(source_cell, Cell):
+                    raise PatchValidationError(
+                        "Number-format patch source is not a writable cell: "
+                        f"{patch.sheet}!{patch.source_cell}"
+                    )
+                if patch.cell == patch.source_cell:
+                    raise PatchValidationError(
+                        f"Number-format patch {patch.id} cannot copy from its target"
+                    )
+                if patch.before != cell.number_format:
+                    raise PatchValidationError(
+                        f"Number-format patch {patch.id} has a stale before value"
+                    )
+                if patch.after != source_cell.number_format:
+                    raise PatchValidationError(
+                        f"Number-format patch {patch.id} does not match its source"
+                    )
+                if cell.number_format == source_cell.number_format:
+                    raise PatchValidationError(f"Number-format patch {patch.id} would be a no-op")
+                source_row = worksheet.row_dimensions.get(source_cell.row)
+                if source_row is not None and source_row.hidden:
+                    raise PatchValidationError(
+                        "Number-format patch source is on a hidden row: "
+                        f"{patch.sheet}!{source_cell.row}"
+                    )
+                if is_column_hidden(worksheet, source_cell.column):
+                    raise PatchValidationError(
+                        "Number-format patch source is in a hidden column: "
+                        f"{patch.sheet}!{patch.source_cell}"
+                    )
             elif patch.kind == PatchKind.COPY_BORDER:
                 if not patch.source_cell:
                     raise PatchValidationError(f"Border patch {patch.id} has no source cell")
@@ -549,6 +634,8 @@ def _select_patches(
     *,
     enforce_safety: bool = True,
     accept_layout_risk: bool = False,
+    accept_formula_derived: bool = False,
+    accept_semantic_risk: bool = False,
 ) -> list[PatchOperation]:
     by_id = {patch.id: patch for patch in plan.patches}
     if len(by_id) != len(plan.patches):
@@ -580,12 +667,28 @@ def _select_patches(
         selected = [by_id[patch_id] for patch_id in sorted(selected_ids)]
     if not selected:
         raise UsageError("No eligible patches were selected")
+    legacy_formula_ids = sorted(
+        patch.id for patch in selected if _is_unverified_legacy_formula(patch)
+    )
+    if legacy_formula_ids:
+        raise UsageError(
+            "Legacy schema v2 formula patches are unverified and cannot be applied; "
+            "regenerate the plan with WorkbookLens schema v3: " + ", ".join(legacy_formula_ids)
+        )
     if enforce_safety:
         rejected: list[str] = []
         for patch in selected:
             risk = str(getattr(patch.risk, "value", patch.risk))
             if risk == "layout_review":
                 if safe_only or not accept_layout_risk or float(patch.confidence) < 0.95:
+                    rejected.append(patch.id)
+                continue
+            if risk == "formula_derived":
+                if safe_only or not accept_formula_derived or float(patch.confidence) < 0.99:
+                    rejected.append(patch.id)
+                continue
+            if risk == "semantic_review":
+                if safe_only or not accept_semantic_risk or float(patch.confidence) < 0.95:
                     rejected.append(patch.id)
                 continue
             if not patch.safe or float(patch.confidence) < 0.95:
@@ -596,6 +699,18 @@ def _select_patches(
                 + ", ".join(rejected)
             )
     selected_set = {patch.id for patch in selected}
+    incomplete_dependencies = sorted(
+        {
+            prerequisite_id
+            for patch in selected
+            for prerequisite_id in patch.prerequisite_patch_ids
+            if prerequisite_id not in selected_set
+        }
+    )
+    if incomplete_dependencies:
+        raise UsageError(
+            "Patch prerequisites must be selected in full: " + ", ".join(incomplete_dependencies)
+        )
     incomplete_groups = sorted(
         {
             patch.atomic_group
@@ -640,7 +755,7 @@ def _select_patches(
                 continue
             if patch.cell in cells:
                 raise UsageError(f"Patch {patch.id} intersects whitespace-tail cleanup {tail.id}")
-    return selected
+    return sorted(selected, key=_patch_application_sort_key)
 
 
 def _validate_canonical_plan(plan: PatchPlan, canonical_plan: PatchPlan) -> None:
@@ -725,6 +840,9 @@ def _apply_to_parts(
                 apply_set_text(root, patch, styles)
                 formula_changed = True
                 continue
+            if patch.kind == PatchKind.NORMALIZE_TEXT:
+                apply_normalize_text(root, patch)
+                continue
             if patch.kind == PatchKind.COPY_BORDER:
                 if styles is None:
                     raise PatchValidationError("Styles editor was not initialized")
@@ -732,6 +850,14 @@ def _apply_to_parts(
                     _assert_not_in_advanced_formula_range(root, patch.source_cell)
                     _assert_not_in_merged_range(root, patch.source_cell)
                 apply_copy_border(root, patch, styles)
+                continue
+            if patch.kind == PatchKind.COPY_NUMBER_FORMAT:
+                if styles is None:
+                    raise PatchValidationError("Styles editor was not initialized")
+                if patch.source_cell:
+                    _assert_not_in_advanced_formula_range(root, patch.source_cell)
+                    _assert_not_in_merged_range(root, patch.source_cell)
+                apply_copy_number_format(root, patch, styles)
                 continue
             target = _find_or_create_cell(root, patch.cell)
             _assert_simple_formula_cell(target, f"target {patch.sheet}!{patch.cell}")
@@ -867,6 +993,16 @@ def _publish_without_overwrite(temporary: Path, output: Path, expected_hash: str
     temporary.unlink(missing_ok=True)
 
 
+def _numeric_values_equal(actual: Any, expected: Any, epoch: datetime) -> bool:
+    if isinstance(actual, (datetime, date)):
+        actual = float(to_excel(actual, epoch))  # type: ignore[no-untyped-call]
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return bool(actual == expected)
+    if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+        return math.isclose(float(actual), float(expected), rel_tol=0.0, abs_tol=1e-9)
+    return bool(actual == expected)
+
+
 def _validate_semantics(output: Path, selected: list[PatchOperation]) -> None:
     workbook = load_workbook(output, read_only=False, data_only=False, keep_links=False)
     try:
@@ -891,7 +1027,17 @@ def _validate_semantics(output: Path, selected: list[PatchOperation]) -> None:
                 and cell.value != patch.after
             ):
                 raise PatchValidationError(f"Formula verification failed for patch {patch.id}")
-            if patch.kind == PatchKind.SET_NUMERIC and cell.value != patch.after:
+            if patch.kind == PatchKind.NORMALIZE_TEXT and (
+                cell.value != patch.after or cell.data_type != "s"
+            ):
+                raise PatchValidationError(
+                    f"Text normalization verification failed for patch {patch.id}"
+                )
+            if patch.kind == PatchKind.SET_NUMERIC and not _numeric_values_equal(
+                cell.value,
+                patch.after,
+                workbook.epoch,
+            ):
                 raise PatchValidationError(f"Numeric verification failed for patch {patch.id}")
             if patch.kind == PatchKind.COPY_STYLE:
                 if not patch.source_cell:
@@ -910,6 +1056,14 @@ def _validate_semantics(output: Path, selected: list[PatchOperation]) -> None:
                     )
                 if cast(Any, cell)._style != cast(Any, source_cell)._style:
                     raise PatchValidationError(f"Style verification failed for patch {patch.id}")
+            if patch.kind == PatchKind.COPY_NUMBER_FORMAT:
+                if not patch.source_cell:
+                    raise PatchValidationError(f"Number-format patch {patch.id} has no source cell")
+                source_cell = worksheet[patch.source_cell]
+                if cell.number_format != source_cell.number_format:
+                    raise PatchValidationError(
+                        f"Number-format verification failed for patch {patch.id}"
+                    )
     finally:
         workbook.close()
     read_only = load_workbook(output, read_only=True, data_only=False, keep_links=False)
@@ -924,6 +1078,8 @@ def patch_ooxml_package(
     selected_ids: set[str] | None = None,
     safe_only: bool = False,
     accept_layout_risk: bool = False,
+    accept_formula_derived: bool = False,
+    accept_semantic_risk: bool = False,
     limits: PackageLimits | None = None,
     canonical_plan: PatchPlan,
 ) -> tuple[OoxmlPatchOutput, list[PatchOperation]]:
@@ -950,6 +1106,8 @@ def patch_ooxml_package(
         safe_only,
         enforce_safety=False,
         accept_layout_risk=accept_layout_risk,
+        accept_formula_derived=accept_formula_derived,
+        accept_semantic_risk=accept_semantic_risk,
     )
     _verify_preconditions(source, plan, selected, limits)
     _validate_canonical_plan(plan, canonical_plan)
@@ -958,13 +1116,15 @@ def patch_ooxml_package(
         selected_ids,
         safe_only,
         accept_layout_risk=accept_layout_risk,
+        accept_formula_derived=accept_formula_derived,
+        accept_semantic_risk=accept_semantic_risk,
     )
     source_hash = sha256_file(source)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{output.stem}.", suffix=".xlsx", dir=output.parent
     )
     os.close(descriptor)
-    temporary = Path(temporary_name)
+    temporary = _validated_temporary_path(temporary_name, output.parent)
     try:
         with zipfile.ZipFile(source, "r") as archive:
             modified, formula_changed = _apply_to_parts(archive, selected)

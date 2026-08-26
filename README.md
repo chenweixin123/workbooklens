@@ -3,14 +3,15 @@
 **Deterministic linting, regression testing, semantic diffing, and conservative repair for
 Excel workbooks.**
 
-WorkbookLens 2.4 core scan, test, diff, and repair workflows work locally without Microsoft Excel,
-LibreOffice, an AI key, or a cloud service. Those normal OOXML workflows do not calculate formulas,
-execute VBA, open embedded objects, or fetch external links. .xlsx files support scan, test, diff,
-and safe-copy repair; .xlsm files remain read-only. The optional local `.xls` conversion button is a
-separate trust boundary and should be used only with trusted files: Microsoft Excel (preferred) or
-LibreOffice opens the workbook locally and may recalculate formulas or process workbook-defined
-behavior supported by that application. Conversion never uses a cloud service and does not claim
-that every legacy workbook feature can be preserved.
+WorkbookLens 2.4 core scan, test, diff, and direct OOXML repair workflows work locally without
+Microsoft Excel, LibreOffice, an AI key, or a cloud service. Those normal workflows do not calculate
+formulas, execute VBA, open embedded objects, or fetch external links. `.xlsx` files support scan,
+test, diff, and conservative repair; `.xlsm` files remain read-only. Formula-derived auto-repair can
+optionally validate isolated temporary copies with Microsoft Excel (preferred) or LibreOffice, but
+only after the user explicitly marks the workbook as trusted. The installed application may evaluate
+`WEBSERVICE`, data connections, or other workbook-defined behavior, so leave that authorization off
+for untrusted files; lossless normalization still works and formula candidates are skipped. Local
+`.xls` conversion is the same kind of trusted-file-only boundary. Neither path uses a cloud service.
 
 > **Release status:** GitHub Releases are authoritative for source archives and attached artifacts.
 > Version 2.4.0 may not be published to [PyPI](https://pypi.org/project/workbooklens/); use the
@@ -26,6 +27,10 @@ that every legacy workbook feature can be preserved.
   lower-confidence evidence and may be stale. Multiple anomalies remain findings-only; automatic
   formula replacement is limited to a single high-confidence anomaly with stable detail-row
   evidence.
+- Patch Plan schema v3 records candidate uniqueness, derivation evidence, preserved invariants, and
+  recalculation requirements. One-click safe repair combines lossless normalization with uniquely
+  derived formula candidates, but Office-backed validation is opt-in for trusted workbooks and any
+  failed recalculation, rescan, dependency, or idempotency check rolls the candidate back.
 - New report-only data-quality rules infer likely identifier columns, mixed numeric storage, robust
   numeric outliers, percentage-scale mistakes, date-storage anomalies, and sign-domain violations
   (negative values under nonnegative headers, or zero/negative values under positive headers). They
@@ -280,6 +285,10 @@ workbooklens plan INPUT.xlsx --config workbooklens.yml --out repair-plan.json
 workbooklens apply INPUT.xlsx repair-plan.json --patch-id patch-0123456789abcdef --out INPUT.fixed.xlsx
 workbooklens apply INPUT.xlsx repair-plan.json --safe-only --out INPUT.fixed.xlsx
 
+# Apply lossless repairs and validate unique formula candidates from a trusted workbook
+workbooklens apply INPUT.xlsx repair-plan.json --auto-repair --recalc-provider auto \
+  --trust-workbook --out INPUT.auto-fixed.xlsx
+
 # Apply an explicitly reviewed layout patch or atomic layout group
 workbooklens apply INPUT.xlsx repair-plan.json --patch-id patch-fedcba9876543210 --accept-layout-risk --out INPUT.layout-fixed.xlsx
 
@@ -306,11 +315,12 @@ were already known. Reusing a --new-only report preserves both its new and previ
 
 ### Optional Workbook Profile
 
-Some spreadsheet mistakes cannot be proved from layout alone. An optional version-2 YAML
-`profile` lets a user declare field roles and constraints without sending the workbook anywhere:
+Some spreadsheet mistakes cannot be proved from layout alone. An optional version-3 YAML
+`profile` lets a user declare field roles, constraints, and repair policy without sending the
+workbook anywhere:
 
 ~~~yaml
-version: 2
+version: 3
 profile:
   infer_semantics: true
   report_trailing_whitespace: true
@@ -322,6 +332,7 @@ profile:
       columns:
         - header: Invoice ID
           role: identifier
+          repair: report
           required: true
           identifier_width: 8
           preserve_leading_zeros: true
@@ -333,22 +344,25 @@ profile:
           role: email
         - header: Amount
           role: currency
+          repair: auto
         - header: Tax Rate
           role: percentage
+          repair: review
 ~~~
 
 Supported roles are `identifier`, `category`, `email`, `phone`, `currency`, `percentage`,
-`date`, `number`, and `text`. Select a field by `header` or bounded Excel `column`. Profile rules
-report missing required values, invalid enumerations or contact formats, possible lost leading
-zeros, trailing whitespace, and number-format role conflicts. They never invent business values.
-Trailing ASCII-space cleanup is available only when explicitly requested and remains a reviewed
-layout-risk patch, so `--safe-only` never selects it.
+`date`, `number`, and `text`. Select a field by `header` or bounded Excel `column`. Version 3 adds
+`repair: auto | review | report`: `auto` still requires a unique parse, stable native peers, no
+leading-zero risk, and all postconditions; `review` emits a semantic-review candidate; `report`
+never emits a patch. Profile rules report missing required values, invalid enumerations or contact
+formats, possible lost leading zeros, trailing whitespace, and number-format role conflicts. They
+never invent business values. Versions 1 and 2 remain readable and retain their earlier behavior.
 
 Profile contracts fail closed instead of silently disabling checks: each worksheet may appear once,
 each column must use exactly one header or column selector, and resolved headers/columns must be
 unique and inside the configured table. If range is present and header_row is omitted, its first
-row is used. Missing or hidden worksheets, ambiguous headers, invalid types, and version-1 Profile
-configuration produce a clear configuration error before findings are evaluated.
+row is used. Missing or hidden worksheets, ambiguous headers, invalid types, and unsupported Profile
+versions produce a clear configuration error before findings are evaluated.
 
 For a repository containing several workbooks, use an aggregate manifest keyed by repository-
 relative POSIX paths:
@@ -441,9 +455,12 @@ For formula and style operations, the target row must also agree with stable pee
 patterns. A secondary adjustment label, a unique note, a whole-row highlight, or only free-form labels
 without a dominant template causes automatic repair to be withheld.
 
-The engine writes a new OOXML package directly, verifies the exact changed-part allowlist, reopens
-the result, rescans it, and removes partial output after validation failure. Formula edits remove
-stale caches and request Excel recalculation; WorkbookLens never claims to have calculated the result.
+The engine writes a private candidate OOXML package directly, verifies the exact changed-part
+allowlist, reopens and rescans it, and publishes the output only after validation succeeds. Formula
+edits remove stale caches. With explicit trusted-workbook authorization, Excel or LibreOffice
+recalculates separate temporary source and candidate copies using the same provider; the provider is
+never used to write the final file. Without authorization or a provider, formula-derived candidates
+are skipped and WorkbookLens does not claim that they were validated.
 Layout repairs additionally verify row, column, view, or exact-tail fingerprints. Formatting-tail
 cleanup fails closed when an authorized cell or row intersects formulas, names, table or validation
 ranges, comments, links, page breaks, drawing anchors, or other guarded worksheet structures.
@@ -464,14 +481,21 @@ the workbook. Only the resulting macro-free `.xlsx` package enters the normal sa
 Temporary conversion files are deleted after the download response completes and again on normal
 server shutdown.
 
+Formula-repair validation is also an explicit trust boundary. `--trust-workbook`
+or the matching local-UI checkbox is required before Excel or LibreOffice can open isolated copies.
+Disabling macros, events, prompts, and link updates reduces risk but cannot guarantee that every
+calculation-time feature, data connection, or application behavior is inert. Do not authorize this
+path for a workbook from an unknown or untrusted source.
+
 See [SECURITY.md](SECURITY.md) for private reporting. Never attach a confidential production
 workbook to a public issue.
 
 ## Honest limitations
 
-- Normal OOXML scan, test, diff, and repair have no Excel calculation engine, VBA execution,
-  external-link fetching, or embedded-object opening. This guarantee does not describe the optional
-  local `.xls` conversion path.
+- Normal OOXML scan, test, diff, and direct repair do not use an Excel calculation engine, execute
+  VBA, fetch external links, or open embedded objects. This guarantee does not describe explicitly
+  authorized formula recalculation or local `.xls` conversion, both of which open trusted temporary
+  copies in an installed spreadsheet application.
 - No automatic repair for shared, array, data-table, spilled, or dynamic-array formulas.
 - Suspicious SUM boundaries are findings-only; the expected formula is evidence for human review,
   not proof that the adjacent row belongs in the aggregate.

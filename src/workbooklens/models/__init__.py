@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -118,6 +119,8 @@ class PatchKind(StrEnum):
 
     SET_FORMULA = "set_formula"
     SET_NUMERIC = "set_numeric"
+    NORMALIZE_TEXT = "normalize_text"
+    COPY_NUMBER_FORMAT = "copy_number_format"
     COPY_STYLE = "copy_style"
     EXTEND_SUM = "extend_sum"
     CREATE_FORMULA = "create_formula"
@@ -137,6 +140,25 @@ class PatchRisk(StrEnum):
 
     SAFE = "safe"
     LAYOUT_REVIEW = "layout_review"
+    FORMULA_DERIVED = "formula_derived"
+    SEMANTIC_REVIEW = "semantic_review"
+
+
+class RecalculationProvider(StrEnum):
+    """Local application used to recalculate isolated validation copies."""
+
+    NONE = "none"
+    EXCEL = "excel"
+    LIBREOFFICE = "libreoffice"
+
+
+class ValidationStatus(StrEnum):
+    """Overall validation outcome recorded for an apply operation."""
+
+    NOT_RUN = "not_run"
+    PASSED = "passed"
+    DEGRADED = "degraded"
+    FAILED = "failed"
 
 
 LAYOUT_REVIEW_PATCH_KINDS = frozenset(
@@ -152,6 +174,63 @@ LAYOUT_REVIEW_PATCH_KINDS = frozenset(
         PatchKind.REMOVE_WHITESPACE_TAIL_CELLS,
     }
 )
+
+FORMULA_PATCH_KINDS = frozenset(
+    {
+        PatchKind.SET_FORMULA,
+        PatchKind.EXTEND_SUM,
+        PatchKind.CREATE_FORMULA,
+    }
+)
+
+
+class PatchDerivation(StrictModel):
+    """Machine-readable proof obligations behind one proposed patch."""
+
+    strategy: str = "deterministic_rule"
+    sources: list[str] = Field(default_factory=lambda: ["finding_evidence"], min_length=1)
+    candidate_count: int = Field(default=1, ge=1)
+    invariants: list[str] = Field(
+        default_factory=lambda: ["source_precondition"],
+        min_length=1,
+    )
+    requires_recalculation: bool = False
+
+    @field_validator("strategy")
+    @classmethod
+    def require_nonblank_strategy(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("derivation strategy must not be blank")
+        return normalized
+
+    @field_validator("sources", "invariants")
+    @classmethod
+    def require_distinct_nonblank_entries(cls, value: list[str]) -> list[str]:
+        normalized = [entry.strip() for entry in value]
+        if any(not entry for entry in normalized):
+            raise ValueError("derivation evidence entries must not be blank")
+        folded = [entry.casefold() for entry in normalized]
+        if len(folded) != len(set(folded)):
+            raise ValueError("derivation evidence entries must be distinct")
+        return normalized
+
+    @property
+    def source_families(self) -> tuple[str, ...]:
+        """Return validated evidence-family prefixes, or an empty tuple if unstructured."""
+
+        families: list[str] = []
+        for source in self.sources:
+            family, separator, detail = source.partition(":")
+            if (
+                not separator
+                or not detail.strip()
+                or not any(character.isalnum() for character in detail)
+                or re.fullmatch(r"[a-z][a-z0-9_]*", family) is None
+            ):
+                return ()
+            families.append(family)
+        return tuple(families)
 
 
 class PatchPrecondition(StrictModel):
@@ -180,6 +259,8 @@ class PatchOperation(StrictModel):
     description: str
     precondition: PatchPrecondition
     atomic_group: str | None = None
+    prerequisite_patch_ids: list[str] = Field(default_factory=list)
+    derivation: PatchDerivation = Field(default_factory=PatchDerivation)
 
     @model_validator(mode="before")
     @classmethod
@@ -205,13 +286,48 @@ class PatchOperation(StrictModel):
         return normalized
 
     @model_validator(mode="after")
-    def require_layout_review(self) -> PatchOperation:
-        """Prevent callers from marking layout-changing operations safe-only eligible."""
+    def require_risk_invariants(self) -> PatchOperation:
+        """Prevent callers from bypassing a patch risk boundary."""
 
+        if len(self.prerequisite_patch_ids) != len(set(self.prerequisite_patch_ids)):
+            raise ValueError("prerequisite patch IDs must be distinct")
+        if self.id in self.prerequisite_patch_ids:
+            raise ValueError("a patch cannot depend on itself")
         if self.kind in LAYOUT_REVIEW_PATCH_KINDS and self.risk != PatchRisk.LAYOUT_REVIEW:
             raise ValueError(f"{self.kind.value} patches require risk='layout_review'")
         if self.risk == PatchRisk.LAYOUT_REVIEW and self.safe:
             raise ValueError("layout_review patches require safe=false")
+        if self.risk == PatchRisk.SEMANTIC_REVIEW and self.safe:
+            raise ValueError("semantic_review patches require safe=false")
+        if self.kind == PatchKind.COPY_NUMBER_FORMAT:
+            if not self.source_cell:
+                raise ValueError("copy_number_format patches require source_cell")
+            if not isinstance(self.before, str) or not isinstance(self.after, str):
+                raise ValueError("copy_number_format patches require string formats")
+        if self.risk == PatchRisk.FORMULA_DERIVED:
+            if self.kind not in FORMULA_PATCH_KINDS:
+                raise ValueError("formula_derived risk requires a formula patch kind")
+            if self.safe:
+                raise ValueError("formula_derived patches require safe=false before validation")
+            if float(self.confidence) < 0.99:
+                raise ValueError("formula_derived patches require confidence >= 0.99")
+            if self.derivation.candidate_count != 1:
+                raise ValueError("formula_derived patches require exactly one candidate")
+            if len(self.derivation.sources) < 2:
+                raise ValueError(
+                    "formula_derived patches require at least two independent evidence sources"
+                )
+            source_families = self.derivation.source_families
+            if len(source_families) != len(self.derivation.sources):
+                raise ValueError(
+                    "formula_derived evidence sources require structured family:detail labels"
+                )
+            if len(set(source_families)) < 2:
+                raise ValueError(
+                    "formula_derived patches require at least two independent evidence families"
+                )
+            if not self.derivation.requires_recalculation:
+                raise ValueError("formula_derived patches require recalculation validation")
         return self
 
     @property
@@ -244,13 +360,82 @@ class Finding(StrictModel):
 class PatchPlan(StrictModel):
     """A source-bound collection of proposed patches for explicit review."""
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     tool_version: str
     source_name: str
     source_sha256: str
     patches: list[PatchOperation]
     finding_ids: list[str] = Field(default_factory=list)
     findings: list[Finding] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_schema_two(cls, value: Any) -> Any:
+        """Read legacy v2 plans as v3 models without ever serializing v2 again."""
+
+        if not isinstance(value, dict) or value.get("schema_version", 3) != 2:
+            return value
+        migrated = dict(value)
+        migrated["schema_version"] = 3
+        patches = value.get("patches")
+        if isinstance(patches, list):
+            migrated_patches: list[Any] = []
+            formula_kinds = {member.value for member in FORMULA_PATCH_KINDS}
+            for patch in patches:
+                if not isinstance(patch, dict):
+                    migrated_patches.append(patch)
+                    continue
+                migrated_patch = dict(patch)
+                kind = migrated_patch.get("kind")
+                kind_value = kind.value if isinstance(kind, PatchKind) else kind
+                if kind_value in formula_kinds:
+                    migrated_patch.update(
+                        safe=False,
+                        risk=PatchRisk.SEMANTIC_REVIEW,
+                        derivation={
+                            "strategy": "legacy_schema_v2_unverified_formula",
+                            "sources": ["legacy_plan:schema_v2"],
+                            "candidate_count": 1,
+                            "invariants": ["manual_review_required"],
+                            "requires_recalculation": True,
+                        },
+                    )
+                migrated_patches.append(migrated_patch)
+            migrated["patches"] = migrated_patches
+        return migrated
+
+    @model_validator(mode="after")
+    def validate_patch_dependencies(self) -> PatchPlan:
+        """Reject missing or cyclic patch dependencies before any selection is resolved."""
+
+        by_id = {patch.id: patch for patch in self.patches}
+        if len(by_id) != len(self.patches):
+            raise ValueError("patch plan contains duplicate patch IDs")
+        for patch in self.patches:
+            missing = sorted(set(patch.prerequisite_patch_ids) - by_id.keys())
+            if missing:
+                raise ValueError(
+                    f"patch {patch.id} references missing prerequisite patches: "
+                    + ", ".join(missing)
+                )
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(patch_id: str) -> None:
+            if patch_id in visiting:
+                raise ValueError("patch prerequisite graph contains a cycle")
+            if patch_id in visited:
+                return
+            visiting.add(patch_id)
+            for prerequisite_id in by_id[patch_id].prerequisite_patch_ids:
+                visit(prerequisite_id)
+            visiting.remove(patch_id)
+            visited.add(patch_id)
+
+        for patch_id in by_id:
+            visit(patch_id)
+        return self
 
 
 class PackageChange(StrictModel):
@@ -274,6 +459,14 @@ class PatchResult(StrictModel):
     remaining_finding_ids: list[str] = Field(default_factory=list)
     new_finding_ids: list[str] = Field(default_factory=list)
     validation_messages: list[str] = Field(default_factory=list)
+    recalculation_provider: RecalculationProvider = RecalculationProvider.NONE
+    formula_errors_before: list[str] = Field(default_factory=list)
+    formula_errors_after: list[str] = Field(default_factory=list)
+    downgraded_patch_ids: list[str] = Field(default_factory=list)
+    skipped_patch_ids: list[str] = Field(default_factory=list)
+    validation_status: ValidationStatus = ValidationStatus.NOT_RUN
+    rollback_performed: bool = False
+    failure_report_path: str | None = None
 
 
 class CellChange(StrictModel):
@@ -351,16 +544,19 @@ __all__ = [
     "Evidence",
     "Finding",
     "PackageChange",
+    "PatchDerivation",
     "PatchKind",
     "PatchOperation",
     "PatchPlan",
     "PatchPrecondition",
     "PatchResult",
     "PatchRisk",
+    "RecalculationProvider",
     "Region",
     "Severity",
     "SheetSnapshot",
     "StructuralChange",
+    "ValidationStatus",
     "WorkbookAssertion",
     "WorkbookDiff",
     "WorkbookSnapshot",

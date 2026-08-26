@@ -43,6 +43,7 @@ from workbooklens.rules.inferred_semantics import INFERRED_SEMANTIC_RULES
 from workbooklens.rules.layout_geometry import LAYOUT_GEOMETRY_RULES
 from workbooklens.rules.print_quality import PRINT_QUALITY_RULES
 from workbooklens.rules.profile_quality import PROFILE_QUALITY_RULES
+from workbooklens.rules.relational_semantics import RELATIONAL_SEMANTIC_RULES
 from workbooklens.scanner import scan_workbook
 
 runner = CliRunner()
@@ -103,6 +104,15 @@ def test_catalogs_are_complete_and_locale_normalization_is_bounded() -> None:
     assert normalize_language("en-US") == "en"
     assert normalize_language("fr") == "en"
     assert translate("severity.error", "zh-CN") == "错误"
+    assert translate("risk.formula_derived", "zh-CN") == "公式推导"
+    assert translate("risk.semantic_review", "zh-CN") == "需确认语义"
+    assert translate("patch_kind.normalize_text", "zh-CN") == "规范化数值"
+    assert translate("web.results_auto_repair", "zh-CN") == "一键安全修复"
+    assert translate("web.profile_label", "zh-CN") == "工作簿 Profile（可选 .yml 或 .yaml）"
+    assert translate("web.patch_derivation_evidence", "zh-CN") == "推导证据"
+    assert translate("web.patch_candidate_count", "zh-CN") == "候选数量"
+    assert translate("web.patch_requires_recalculation", "zh-CN") == "是否需要重算"
+    assert translate("validation_status.degraded", "zh-CN") == "已安全降级"
 
 
 def test_every_builtin_rule_has_exact_bilingual_title_coverage() -> None:
@@ -114,6 +124,7 @@ def test_every_builtin_rule_has_exact_bilingual_title_coverage() -> None:
         *FORMULA_SEMANTIC_RULES,
         *LAYOUT_GEOMETRY_RULES,
         *PRINT_QUALITY_RULES,
+        *RELATIONAL_SEMANTIC_RULES,
     )
     emitted = {rule.rule_id: rule.title for rule in all_rule_types}
     assert set(emitted) == set(BUILTIN_RULE_TITLES)
@@ -138,6 +149,7 @@ def test_all_static_builtin_finding_patch_and_evidence_templates_are_translated(
     import workbooklens.rules.layout_geometry as layout_geometry
     import workbooklens.rules.print_quality as print_quality
     import workbooklens.rules.profile_quality as profile_quality
+    import workbooklens.rules.relational_semantics as relational_semantics
 
     fields = {"description", "explanation", "expected", "suggested_action", "summary"}
     texts: set[str] = set()
@@ -149,6 +161,7 @@ def test_all_static_builtin_finding_patch_and_evidence_templates_are_translated(
         layout_geometry,
         print_quality,
         profile_quality,
+        relational_semantics,
     ):
         source = Path(module.__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)

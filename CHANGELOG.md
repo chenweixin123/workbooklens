@@ -4,7 +4,7 @@ All notable changes are documented here. WorkbookLens follows Semantic Versionin
 
 ## [Unreleased]
 
-## [2.4.0] - 2026-08-24
+## [2.4.0] - 2026-08-27
 
 ### Added
 
@@ -12,6 +12,15 @@ All notable changes are documented here. WorkbookLens follows Semantic Versionin
   fields, enumerations and near-match evidence, email and phone structure, fixed-width identifiers,
   trailing whitespace, and currency/percentage/date role conflicts. Business values remain
   report-only; an explicitly requested ASCII-space cleanup is always `layout_review`.
+- Add Patch Plan schema v3 with `formula_derived` and `semantic_review` risks, candidate uniqueness,
+  derivation sources, preserved invariants, and recalculation requirements. Schema-v2 plans remain
+  readable through a fail-closed in-memory migration, while newly written plans always use v3.
+- Add evidence-constrained lossless normalization for strict currency, numeric, percentage, date,
+  and trailing-space cases. Ambiguous business values remain report-only; uniquely parsed Chinese
+  numbers and multiplier text require an explicit version-3 Profile and semantic confirmation.
+- Add Excel-first, LibreOffice-fallback recalculation of isolated source and candidate copies for
+  trusted workbooks. The final workbook remains the direct OOXML result, and failed dependency,
+  formula-error, rescan, or idempotency validation removes or rolls back the affected patch group.
 - Add a conservative Formula IR and report-only rules for truncated aggregate ranges, invalid or
   structurally blank cross-sheet targets, isolated formulas in notes columns, algebraically
   degenerate top-level formulas, and formula-label/number-format role conflicts.
@@ -34,13 +43,17 @@ All notable changes are documented here. WorkbookLens follows Semantic Versionin
   range/union/intersection syntax inside pure-operator expressions remain excluded, as do
   arrays, dynamic-array syntax, and external references.
   Saved OOXML formula-error caches are reported separately as advisory evidence and may be stale.
-- Add six conservative report-only checks: WL051 detects success-green conditional formatting that
+- Add seven conservative report-only checks: WL051 detects success-green conditional formatting that
   selects sign violations; WL052 identifies aggregates outside the labelled summary block; WL053
   infers rare categorical near-spellings and explicit placeholder values; WL054 reports isolated
   blanks in highly complete fields; and WL055 cross-checks manual page breaks, literal footer page
   totals, print areas, and fit-to-width settings against independently inferred layout evidence.
   WL056 flags only a unique, isolated, unusually tiny vivid label immediately beside a wide inferred
   title, as an INFO-level manual-review advisory with no repair patch.
+  WL057 conservatively infers repeated cross-sheet foreign-key columns from matching identifier
+  headers, parent-column uniqueness, and strong value overlap; it reports only unsupported child
+  identifiers and never invents a replacement. WL022 skips only columns reliably inferred as foreign
+  keys, while retaining duplicate checks for parent and unrelated identifier columns.
   WL053 and WL054 also run without a Profile only when conservative structural thresholds are met;
   they never invent or replace semantic values.
 
@@ -68,17 +81,21 @@ All notable changes are documented here. WorkbookLens follows Semantic Versionin
 - Make Profile configuration fail closed for boolean-to-integer coercion, out-of-range header rows,
   duplicate worksheet/table definitions, ambiguous or missing headers, out-of-range columns, and
   multiple selectors resolving to the same physical column. A bounded range now defaults its
-  header row to the range's first row, and Profiles require configuration version 2.
+  header row to the range's first row. Version 3 adds per-column `repair: auto | review | report`;
+  version-1 and version-2 Profiles remain readable and retain their earlier repair behavior.
 - Resolve chart source worksheet names plus global and worksheet-local defined names
   case-insensitively, matching Excel semantics. Suppress overlap findings only for exact chart
   source cells, preserving covered non-source columns for WL047 detection.
 - Interpret zero-offset TwoCellAnchor end markers at the leading edge of the marker cell, avoiding
   false print-area truncation findings while retaining real row or column overflow findings.
-- Expand the built-in deterministic registry from 35 to 56 rules and require exact Chinese/English
+- Expand the built-in deterministic registry from 35 to 57 rules and require exact Chinese/English
   title, explanation, evidence-summary, expectation, and suggested-action coverage for every
   built-in module.
-- Extend version-2 YAML validation with a strict, bounded `profile.sheets[].columns[]` schema while
-  preserving direct scanner calls that omit a Profile.
+- Extend version-3 YAML validation with a strict, bounded `profile.sheets[].columns[]` schema and
+  repair policy while preserving direct scanner calls and legacy Profiles that omit the new policy.
+- Extend one-click safe repair to combine lossless normalization with uniquely derived formula
+  candidates that pass local recalculation. Semantic and layout candidates remain unselected until
+  the user explicitly chooses them and grants the matching risk authorization.
 - Bound Hatchling below 1.32 because 1.32 emits Core Metadata 2.5, which current Twine 6.2 rejects;
   the compatible build emits Core Metadata 2.4 and passes strict distribution checks.
 - Build copied-formula consensus across inferred data-body columns so several anomalies no longer
@@ -205,6 +222,9 @@ All notable changes are documented here. WorkbookLens follows Semantic Versionin
 - Scope the non-execution guarantee to normal OOXML scan, test, diff, and repair workflows. Optional
   `.xls` conversion invokes an installed spreadsheet application and is explicitly documented as a
   trusted-file-only boundary.
+- Require a separate trusted-workbook authorization before Excel or LibreOffice can open isolated
+  copies for formula-repair validation. Without authorization, one-click repair continues with
+  lossless normalization and clearly skips formula-derived candidates.
 - The local server reserves its `127.0.0.1` socket before Uvicorn starts, removing the port-probe
   race. Browser launch waits for `/health` and bypasses system HTTP proxies.
 

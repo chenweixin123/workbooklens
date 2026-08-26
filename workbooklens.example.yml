@@ -1,4 +1,4 @@
-version: 2
+version: 3
 workbook:
   max_critical_findings: 0
   max_error_findings: 0
@@ -17,18 +17,23 @@ profile:
       columns:
         - column: A
           role: identifier
+          repair: report
           required: true
         - column: B
           role: text
+          repair: auto
           trim_trailing_whitespace: true
         - column: C
           role: email
         - column: D
           role: date
+          repair: auto
         - column: F
           role: currency
+          repair: auto
         - column: G
           role: category
+          repair: report
           required: true
           allowed_values: [Open, Paid, Void]
 suppressions:

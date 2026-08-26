@@ -1,9 +1,8 @@
-"""Conservative, profile-aware validation for workbook record fields.
+"""Conservative, profile-aware validation and evidence-bound normalization.
 
-The rules in this module never infer replacement business values.  A profile can
-opt in to a review-only trailing-whitespace patch, while every other finding is
-report-only and carries the configured or structurally inferred expectation in
-its evidence.
+Profile rules never invent missing business values. Version 3 may authorize uniquely parsed,
+peer-supported normalization or emit an explicit semantic-review candidate; ambiguous values remain
+report-only with the configured or structurally inferred expectation in their evidence.
 """
 
 from __future__ import annotations
@@ -14,12 +13,15 @@ import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from typing import Any, Literal, cast
 
 from openpyxl.cell.cell import Cell, MergedCell
 from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils.cell import column_index_from_string, get_column_letter, range_boundaries
+from openpyxl.utils.datetime import to_excel
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.xml.constants import MAX_COLUMN, MAX_ROW
 
@@ -27,6 +29,7 @@ from workbooklens.models import (
     Confidence,
     Evidence,
     Finding,
+    PatchDerivation,
     PatchKind,
     PatchOperation,
     PatchPrecondition,
@@ -37,6 +40,7 @@ from workbooklens.models import (
 from workbooklens.rules.base import RuleContext, RuleResult, WorkbookRule
 from workbooklens.snapshot import cell_fingerprint
 from workbooklens.utils import stable_id
+from workbooklens.worksheet_state import is_column_hidden
 
 ProfileRole = Literal[
     "identifier",
@@ -49,6 +53,7 @@ ProfileRole = Literal[
     "number",
     "text",
 ]
+RepairMode = Literal["auto", "review", "report"]
 
 _VALID_ROLES = frozenset(
     {
@@ -109,11 +114,93 @@ _AMOUNT_TOKENS = {
     "turnover",
     "wage",
 }
-_AMOUNT_MARKERS = ("金额", "成本", "工资", "价格", "单价", "收入", "营收", "销售额", "薪资")
+_AMOUNT_MARKERS = (
+    "金额",
+    "成本",
+    "工资",
+    "价格",
+    "单价",
+    "收入",
+    "营收",
+    "销售额",
+    "薪资",
+    "支出",
+)
 _PERCENTAGE_TOKENS = {"discount", "margin", "percent", "percentage", "rate", "ratio", "tax"}
 _PERCENTAGE_MARKERS = ("百分比", "比例", "折扣", "税率", "率")
 _DATE_TOKENS = {"date", "datetime", "day", "time", "timestamp"}
 _DATE_MARKERS = ("日期", "时间", "年月日")
+_NUMBER_TOKENS = {"duration", "hours", "qty", "quantity", "score", "weight"}
+_NUMBER_MARKERS = ("数量", "工时", "时长", "得分", "分数", "重量")
+_MULTIPLIER_MARKERS = ("系数", "倍率", "倍数")
+_SUMMARY_MARKERS = (
+    "grand total",
+    "subtotal",
+    "summary",
+    "total",
+    "合计",
+    "小计",
+    "总计",
+    "汇总",
+)
+_STRICT_DECIMAL_RE = re.compile(
+    r"[+-]?(?:(?:0|[1-9]\d*)(?:\.\d+)?|(?:0|[1-9]\d{0,2})(?:,\d{3})+(?:\.\d+)?|\.\d+)"
+)
+_DATE_TEXT_RE = re.compile(
+    r"(?P<year>\d{4})(?P<sep>[-/.])(?P<month>\d{1,2})(?P=sep)(?P<day>\d{1,2})"
+)
+_ZH_DATE_TEXT_RE = re.compile(r"(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日")
+_CURRENCY_PREFIX_RE = re.compile(
+    r"(?P<marker>[$€£¥₹₩₽]|USD|EUR|GBP|CNY|RMB|JPY)\s*(?P<body>.+)",
+    re.I,
+)
+_CURRENCY_SUFFIX_RE = re.compile(
+    r"(?P<body>.+?)\s*(?P<marker>[$€£¥₹₩₽]|USD|EUR|GBP|CNY|RMB|JPY|元)",
+    re.I,
+)
+_CHINESE_DIGITS = {
+    "零": 0,
+    "〇": 0,  # noqa: RUF001 - ideographic zero is an intentional accepted numeral
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CHINESE_SMALL_UNITS = {"十": 10, "百": 100, "千": 1000}
+_CHINESE_LARGE_UNITS = {"万": 10_000, "亿": 100_000_000}
+_CHINESE_NUMERAL_CHARS = "零〇一二两三四五六七八九十百千万亿"
+_CHINESE_SUFFIX_MULTIPLIERS = {
+    "": 1,
+    "个": 1,
+    "人": 1,
+    "件": 1,
+    "元": 1,
+    "块": 1,
+    "小时": 1,
+    "天": 1,
+    "次": 1,
+    "公斤": 1,
+    "千克": 1,
+    "米": 1,
+    "万元": 10_000,
+}
+_VALUE_MUTATING_PATCH_KINDS = frozenset(
+    {
+        PatchKind.SET_FORMULA,
+        PatchKind.SET_NUMERIC,
+        PatchKind.NORMALIZE_TEXT,
+        PatchKind.EXTEND_SUM,
+        PatchKind.CREATE_FORMULA,
+        PatchKind.SET_TEXT,
+        PatchKind.REMOVE_WHITESPACE_TAIL_CELLS,
+    }
+)
 MAX_PROFILE_RANGE_CELLS = 1_000_000
 
 
@@ -133,6 +220,7 @@ class ColumnProfile:
     identifier_width: int | None = None
     preserve_leading_zeros: bool = False
     trim_trailing_whitespace: bool = False
+    repair: RepairMode | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +241,7 @@ class WorkbookProfile:
     infer_semantics: bool = True
     report_trailing_whitespace: bool = True
     review_trailing_whitespace_patches: bool = False
+    version: Literal[2, 3] = 2
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any] | None) -> WorkbookProfile:
@@ -169,9 +258,9 @@ class WorkbookProfile:
         if configured_version is not None and (
             not isinstance(configured_version, int)
             or isinstance(configured_version, bool)
-            or configured_version not in {1, 2}
+            or configured_version not in {1, 2, 3}
         ):
-            raise ValueError("configuration version must be the integer 1 or 2")
+            raise ValueError("configuration version must be the integer 1, 2, or 3")
         profile_present = "profile" in config
         legacy_profile_present = "workbook_profile" in config
         if profile_present and legacy_profile_present:
@@ -179,7 +268,7 @@ class WorkbookProfile:
         if configured_version == 1 and (
             config.get("profile") is not None or config.get("workbook_profile") is not None
         ):
-            raise ValueError("workbook profiles require configuration version 2")
+            raise ValueError("workbook profiles require configuration version 2 or 3")
         table_key = "sheets"
         if profile_present:
             raw = config.get("profile")
@@ -204,7 +293,8 @@ class WorkbookProfile:
             },
             location="workbook profile",
         )
-        tables = _parse_table_profiles(raw.get(table_key))
+        profile_version: Literal[2, 3] = 3 if configured_version == 3 else 2
+        tables = _parse_table_profiles(raw.get(table_key), profile_version=profile_version)
         return cls(
             tables=tables,
             infer_semantics=_configured_bool(raw.get("infer_semantics"), True),
@@ -214,6 +304,7 @@ class WorkbookProfile:
             review_trailing_whitespace_patches=_configured_bool(
                 raw.get("review_trailing_whitespace_patches"), False
             ),
+            version=profile_version,
         )
 
 
@@ -237,6 +328,35 @@ class _NumberFormatTraits:
     date: bool
     currency: bool
     text: bool
+
+
+NormalizationKind = Literal[
+    "currency",
+    "date",
+    "number",
+    "percentage",
+    "trailing_whitespace",
+    "chinese_number",
+    "semantic_number",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalizationCandidate:
+    after: int | float | str
+    kind: NormalizationKind
+    display_value: str
+    semantic: bool = False
+    unit: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PeerEvidence:
+    native_cells: tuple[Cell, ...]
+    populated_count: int
+    native_ratio: float
+    format_source: Cell | None
+    format_candidate_count: int
 
 
 def parse_workbook_profile(config: Mapping[str, Any] | None) -> WorkbookProfile:
@@ -359,7 +479,9 @@ def normalize_profile_range(value: Any) -> str:
     return normalized
 
 
-def _parse_table_profiles(raw_tables: Any) -> tuple[TableProfile, ...]:
+def _parse_table_profiles(
+    raw_tables: Any, *, profile_version: Literal[2, 3]
+) -> tuple[TableProfile, ...]:
     if raw_tables is None:
         return ()
     if not isinstance(raw_tables, list):
@@ -402,13 +524,17 @@ def _parse_table_profiles(raw_tables: Any) -> tuple[TableProfile, ...]:
                 sheet=sheet.strip(),
                 range_ref=None if range_ref is None else range_ref.strip(),
                 header_row=header_row,
-                columns=_parse_column_profiles(raw_table.get("columns")),
+                columns=_parse_column_profiles(
+                    raw_table.get("columns"), profile_version=profile_version
+                ),
             )
         )
     return tuple(parsed)
 
 
-def _parse_column_profiles(raw_columns: Any) -> tuple[ColumnProfile, ...]:
+def _parse_column_profiles(
+    raw_columns: Any, *, profile_version: Literal[2, 3]
+) -> tuple[ColumnProfile, ...]:
     entries: list[tuple[str | None, Any]] = []
     if raw_columns is None:
         return ()
@@ -442,6 +568,7 @@ def _parse_column_profiles(raw_columns: Any) -> tuple[ColumnProfile, ...]:
                 "width",
                 "preserve_leading_zeros",
                 "trim_trailing_whitespace",
+                "repair",
             },
             location=f"profile column entry {index}",
         )
@@ -487,6 +614,9 @@ def _parse_column_profiles(raw_columns: Any) -> tuple[ColumnProfile, ...]:
         preserve_leading_zeros = _configured_bool(
             raw.get("preserve_leading_zeros"), identifier_width is not None
         )
+        repair = _parse_repair_mode(raw.get("repair"))
+        if repair is not None and profile_version != 3:
+            raise ValueError("profile column repair requires configuration version 3")
         if role is None and preserve_leading_zeros:
             role = "identifier"
         parsed.append(
@@ -501,6 +631,7 @@ def _parse_column_profiles(raw_columns: Any) -> tuple[ColumnProfile, ...]:
                 trim_trailing_whitespace=_configured_bool(
                     raw.get("trim_trailing_whitespace"), False
                 ),
+                repair=repair,
             )
         )
     return tuple(parsed)
@@ -516,6 +647,363 @@ def _parse_role(value: Any) -> ProfileRole | None:
     if normalized not in _VALID_ROLES:
         raise ValueError(f"unsupported profile role: {value!r}")
     return cast(ProfileRole, normalized)
+
+
+def _parse_repair_mode(value: Any) -> RepairMode | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("profile repair mode must be a string")
+    normalized = value.strip().casefold()
+    if normalized not in {"auto", "review", "report"}:
+        raise ValueError(f"unsupported profile repair mode: {value!r}")
+    return cast(RepairMode, normalized)
+
+
+def _decimal_number(value: Decimal) -> int | float | None:
+    if not value.is_finite() or value.adjusted() > 307:
+        return None
+    if value == value.to_integral_value():
+        integer = int(value)
+        return integer if len(str(abs(integer))) <= 15 else None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) else None
+
+
+def _parse_decimal_text(value: str) -> int | float | None:
+    if _STRICT_DECIMAL_RE.fullmatch(value) is None:
+        return None
+    unsigned = value.lstrip("+-")
+    integer_part = unsigned.split(".", 1)[0].replace(",", "")
+    if len(integer_part) > 1 and integer_part.startswith("0"):
+        return None
+    digits = re.sub(r"\D", "", value)
+    if len(digits) > 15:
+        return None
+    try:
+        return _decimal_number(Decimal(value.replace(",", "")))
+    except InvalidOperation:
+        return None
+
+
+def _parse_currency_text(value: str) -> int | float | None:
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    if not normalized:
+        return None
+    parenthesized = normalized.startswith("(") and normalized.endswith(")")
+    if parenthesized:
+        normalized = normalized[1:-1].strip()
+    elif normalized.startswith("(") or normalized.endswith(")"):
+        return None
+    sign = -1 if parenthesized else 1
+    if normalized[:1] in {"+", "-"}:
+        if parenthesized:
+            return None
+        sign = -1 if normalized[0] == "-" else 1
+        normalized = normalized[1:].strip()
+    match = _CURRENCY_PREFIX_RE.fullmatch(normalized)
+    if match is None:
+        match = _CURRENCY_SUFFIX_RE.fullmatch(normalized)
+    if match is None:
+        return None
+    body = match.group("body").strip()
+    if body[:1] in {"+", "-"}:
+        if parenthesized or sign == -1:
+            return None
+        sign = -1 if body[0] == "-" else 1
+        body = body[1:].strip()
+    parsed = _parse_decimal_text(body)
+    if parsed is None:
+        return None
+    return parsed * sign
+
+
+def _parse_percentage_text(value: str) -> int | float | None:
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    if not normalized.endswith("%") or normalized.count("%") != 1:
+        return None
+    parsed = _parse_decimal_text(normalized[:-1].strip())
+    if parsed is None:
+        return None
+    return _decimal_number(Decimal(str(parsed)) / Decimal(100))
+
+
+def _parse_semantic_number(value: str) -> tuple[int | float, str] | None:
+    """Parse a strict Arabic numeric literal carrying one reviewed semantic unit."""
+
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    for suffix in ("倍",):
+        if not normalized.endswith(suffix) or len(normalized) <= len(suffix):
+            continue
+        parsed = _parse_decimal_text(normalized[: -len(suffix)].strip())
+        return (parsed, suffix) if parsed is not None else None
+    return None
+
+
+def _parse_date_text(value: str, epoch: datetime) -> int | float | None:
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    match = _DATE_TEXT_RE.fullmatch(normalized) or _ZH_DATE_TEXT_RE.fullmatch(normalized)
+    if match is None:
+        return None
+    try:
+        parsed = date(
+            int(match.group("year")),
+            int(match.group("month")),
+            int(match.group("day")),
+        )
+    except ValueError:
+        return None
+    serial = float(to_excel(parsed, epoch))  # type: ignore[no-untyped-call]
+    if not math.isfinite(serial) or serial < 0:
+        return None
+    return int(serial) if serial.is_integer() else serial
+
+
+def _parse_chinese_section(value: str) -> int | None:
+    if not value or any(
+        character not in _CHINESE_DIGITS and character not in _CHINESE_SMALL_UNITS
+        for character in value
+    ):
+        return None
+    if not any(character in _CHINESE_SMALL_UNITS for character in value):
+        return int("".join(str(_CHINESE_DIGITS[character]) for character in value))
+    total = 0
+    digit = 0
+    for character in value:
+        if character in _CHINESE_DIGITS:
+            digit = _CHINESE_DIGITS[character]
+        else:
+            total += (digit or 1) * _CHINESE_SMALL_UNITS[character]
+            digit = 0
+    return total + digit
+
+
+def _parse_chinese_below_yi(value: str) -> int | None:
+    if not value or "亿" in value or value.count("万") > 1:
+        return None
+    high_text, separator, low_text = value.partition("万")
+    if not separator:
+        section_text = value[1:] if value.startswith("零") else value
+        if not section_text:
+            return None
+        section = _parse_chinese_section(section_text)
+        return section if section is not None and 0 <= section < 10_000 else None
+    high = _parse_chinese_section(high_text)
+    if high is None or not 0 < high < 10_000:
+        return None
+    parsed = high * 10_000
+    if not low_text:
+        return parsed
+    section_text = low_text[1:] if low_text.startswith("零") else low_text
+    if not section_text:
+        return None
+    low = _parse_chinese_section(section_text)
+    return parsed + low if low is not None and 0 <= low < 10_000 else None
+
+
+def _parse_chinese_integer(value: str) -> int | None:
+    if not value or any(character not in _CHINESE_NUMERAL_CHARS for character in value):
+        return None
+    if value != "两" and any(
+        character == "两" and (index + 1 >= len(value) or value[index + 1] not in "百千万亿")
+        for index, character in enumerate(value)
+    ):
+        return None
+
+    if not any(
+        character in _CHINESE_SMALL_UNITS or character in _CHINESE_LARGE_UNITS
+        for character in value
+    ):
+        if len(value) > 1 and _CHINESE_DIGITS[value[0]] == 0:
+            return None
+        return int("".join(str(_CHINESE_DIGITS[character]) for character in value))
+
+    if value.count("亿") > 1:
+        return None
+    high_text, separator, low_text = value.partition("亿")
+    if separator:
+        high = _parse_chinese_below_yi(high_text)
+        if high is None or not 0 < high < 10_000_000:
+            return None
+        low = 0 if not low_text else _parse_chinese_below_yi(low_text)
+        if low is None:
+            return None
+        parsed = high * 100_000_000 + low
+    else:
+        below_yi = _parse_chinese_below_yi(value)
+        if below_yi is None:
+            return None
+        parsed = below_yi
+    canonical = _format_chinese_integer(parsed)
+    comparable = value.replace("〇", "零").replace("两", "二")  # noqa: RUF001
+    if comparable.startswith("一十"):
+        comparable = comparable[1:]
+    return parsed if canonical == comparable else None
+
+
+def _format_chinese_section(value: int) -> str | None:
+    if not 0 <= value < 10_000:
+        return None
+    if value == 0:
+        return ""
+    digits = "零一二三四五六七八九"
+    parts: list[str] = []
+    pending_zero = False
+    remainder = value
+    for divisor, unit in ((1000, "千"), (100, "百"), (10, "十"), (1, "")):
+        digit, remainder = divmod(remainder, divisor)
+        if digit:
+            if pending_zero and parts:
+                parts.append("零")
+            parts.extend((digits[digit], unit))
+            pending_zero = False
+        elif parts and remainder:
+            pending_zero = True
+    return "".join(parts)
+
+
+def _format_chinese_below_yi(value: int) -> str | None:
+    if not 0 <= value < 100_000_000:
+        return None
+    if value < 10_000:
+        rendered = _format_chinese_section(value)
+        if rendered is None:
+            return None
+    else:
+        high, low = divmod(value, 10_000)
+        high_text = _format_chinese_section(high)
+        if high_text is None:
+            return None
+        rendered = f"{high_text}万"
+        if low:
+            if low < 1000:
+                rendered += "零"
+            low_text = _format_chinese_section(low)
+            if low_text is None:
+                return None
+            rendered += low_text
+    return rendered[1:] if rendered.startswith("一十") else rendered
+
+
+def _format_chinese_integer(value: int) -> str | None:
+    """Render the strict unit-based form accepted for semantic Chinese numerals."""
+
+    if not 0 <= value < 10**15:
+        return None
+    if value == 0:
+        return "零"
+    if value < 100_000_000:
+        return _format_chinese_below_yi(value)
+    high, low = divmod(value, 100_000_000)
+    high_text = _format_chinese_below_yi(high)
+    if high_text is None:
+        return None
+    rendered = f"{high_text}亿"
+    if low:
+        if low < 10_000_000:
+            rendered += "零"
+        low_text = _format_chinese_below_yi(low)
+        if low_text is None:
+            return None
+        rendered += low_text
+    return rendered
+
+
+def _parse_chinese_number(value: str) -> tuple[int | float, str] | None:
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    negative = normalized.startswith("负")
+    if negative:
+        normalized = normalized[1:]
+    suffix = ""
+    numeral_text = normalized
+    for known_suffix in sorted(
+        (candidate for candidate in _CHINESE_SUFFIX_MULTIPLIERS if candidate),
+        key=len,
+        reverse=True,
+    ):
+        if normalized.endswith(known_suffix) and len(normalized) > len(known_suffix):
+            suffix = known_suffix
+            numeral_text = normalized[: -len(known_suffix)]
+            break
+    integer_text, separator, fraction_text = numeral_text.partition("点")
+    if (
+        not integer_text
+        or any(character not in _CHINESE_NUMERAL_CHARS for character in integer_text)
+        or (separator and not fraction_text)
+        or (fraction_text and any(character not in _CHINESE_DIGITS for character in fraction_text))
+        or "两" in fraction_text
+        or "点" in fraction_text
+    ):
+        return None
+    multiplier = _CHINESE_SUFFIX_MULTIPLIERS.get(suffix)
+    if multiplier is None:
+        return None
+    integer = _parse_chinese_integer(integer_text)
+    if integer is None:
+        return None
+    parsed = Decimal(integer)
+    if fraction_text:
+        fraction = "".join(str(_CHINESE_DIGITS[character]) for character in fraction_text)
+        parsed += Decimal(f"0.{fraction}")
+    if negative:
+        parsed = -parsed
+    number = _decimal_number(parsed * multiplier)
+    return (number, suffix) if number is not None else None
+
+
+def _normalization_candidates(value: str, epoch: datetime) -> tuple[_NormalizationCandidate, ...]:
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    candidates: list[_NormalizationCandidate] = []
+    percentage = _parse_percentage_text(normalized)
+    if percentage is not None:
+        candidates.append(_NormalizationCandidate(percentage, "percentage", normalized))
+    currency = _parse_currency_text(normalized)
+    if currency is not None:
+        candidates.append(_NormalizationCandidate(currency, "currency", normalized))
+    parsed_date = _parse_date_text(normalized, epoch)
+    if parsed_date is not None:
+        candidates.append(_NormalizationCandidate(parsed_date, "date", normalized))
+    number = _parse_decimal_text(normalized)
+    if number is not None:
+        candidates.append(_NormalizationCandidate(number, "number", normalized))
+    chinese = _parse_chinese_number(normalized)
+    if chinese is not None:
+        candidates.append(
+            _NormalizationCandidate(
+                chinese[0],
+                "chinese_number",
+                normalized,
+                semantic=True,
+                unit=chinese[1] or None,
+            )
+        )
+    semantic_number = _parse_semantic_number(normalized)
+    if semantic_number is not None:
+        candidates.append(
+            _NormalizationCandidate(
+                semantic_number[0],
+                "semantic_number",
+                normalized,
+                semantic=True,
+                unit=semantic_number[1],
+            )
+        )
+    match = _HORIZONTAL_TRAILING_WHITESPACE_RE.search(value)
+    if match is not None and value[: match.start()] and value[: match.start()].strip():
+        candidates.append(
+            _NormalizationCandidate(
+                value[: match.start()],
+                "trailing_whitespace",
+                value,
+            )
+        )
+    unique = {
+        (candidate.kind, type(candidate.after).__name__, repr(candidate.after)): candidate
+        for candidate in candidates
+    }
+    if unique:
+        return tuple(unique.values())
+    return ()
 
 
 def _confidence(value: float) -> Confidence:
@@ -844,6 +1332,8 @@ def _header_role(header: str) -> ProfileRole | None:
         return "phone"
     if words & _DATE_TOKENS or any(marker in header for marker in _DATE_MARKERS):
         return "date"
+    if any(marker in header for marker in _MULTIPLIER_MARKERS):
+        return "number"
     if (
         words & _PERCENTAGE_TOKENS
         or "%" in header
@@ -854,6 +1344,8 @@ def _header_role(header: str) -> ProfileRole | None:
         return "currency"
     if words & _IDENTIFIER_TOKENS or any(marker in header for marker in _IDENTIFIER_MARKERS):
         return "identifier"
+    if words & _NUMBER_TOKENS or any(marker in header for marker in _NUMBER_MARKERS):
+        return "number"
     return None
 
 
@@ -1019,6 +1511,323 @@ def _format_conflicts(role: ProfileRole, traits: _NumberFormatTraits) -> tuple[s
     return tuple(dict.fromkeys(conflicts))
 
 
+def _configured_repair_mode_for_cell(
+    context: RuleContext,
+    worksheet: Worksheet,
+    row: int,
+    column: int,
+) -> RepairMode | None:
+    """Return an explicit v3 repair mode for one bounded configured field."""
+
+    profile = _context_profile(context)
+    if profile.version != 3:
+        return None
+    for table in _resolved_tables(context, profile):
+        if (
+            table.explicit
+            and table.worksheet.title == worksheet.title
+            and table.min_row <= row <= table.max_row
+            and table.min_column <= column <= table.max_column
+        ):
+            configured = table.columns.get(column)
+            return configured.repair if configured is not None else None
+    return None
+
+
+def _candidate_for_role(
+    candidates: tuple[_NormalizationCandidate, ...],
+    role: ProfileRole | None,
+) -> tuple[_NormalizationCandidate, ...]:
+    trailing = tuple(
+        candidate for candidate in candidates if candidate.kind == "trailing_whitespace"
+    )
+    if trailing and role in {None, "text", "identifier", "email", "phone"}:
+        return trailing
+    semantic = tuple(candidate for candidate in candidates if candidate.semantic)
+    if semantic:
+        if len(semantic) != 1 or role not in {"currency", "number"}:
+            return ()
+        candidate = semantic[0]
+        if role == "currency":
+            return semantic if candidate.unit in {None, "元", "块", "万元"} else ()
+        return semantic if candidate.unit not in {"元", "块", "万元"} else ()
+    if role == "date":
+        return tuple(candidate for candidate in candidates if candidate.kind == "date")
+    if role == "currency":
+        currency = tuple(candidate for candidate in candidates if candidate.kind == "currency")
+        return currency or tuple(
+            candidate for candidate in candidates if candidate.kind == "number"
+        )
+    if role == "percentage":
+        percentage = tuple(candidate for candidate in candidates if candidate.kind == "percentage")
+        if percentage:
+            return percentage
+        fractional = tuple(
+            _NormalizationCandidate(
+                candidate.after,
+                "percentage",
+                candidate.display_value,
+            )
+            for candidate in candidates
+            if candidate.kind == "number"
+            and isinstance(candidate.after, (int, float))
+            and not isinstance(candidate.after, bool)
+            and abs(float(candidate.after)) <= 1
+        )
+        return fractional
+    if role == "number":
+        return tuple(candidate for candidate in candidates if candidate.kind == "number")
+    return ()
+
+
+def _row_has_summary_semantics(table: _ResolvedTable, row: int) -> bool:
+    for column in range(table.min_column, table.max_column + 1):
+        value = _value_at(table.worksheet, row, column)
+        if not isinstance(value, str):
+            continue
+        normalized = _normalize_text(value)
+        if any(
+            marker == normalized or normalized.startswith(f"{marker} ")
+            for marker in _SUMMARY_MARKERS
+        ):
+            return True
+        if any(
+            marker in normalized
+            for marker in _SUMMARY_MARKERS
+            if any(ord(char) > 127 for char in marker)
+        ):
+            return True
+    return False
+
+
+def _format_is_compatible(role: ProfileRole, number_format: str) -> bool:
+    traits = _number_format_traits(number_format)
+    if role == "date":
+        return traits.date and not traits.percentage and not traits.currency
+    if role == "currency":
+        return traits.currency and not traits.percentage and not traits.date
+    if role == "percentage":
+        return traits.percentage and not traits.currency and not traits.date
+    if role == "number":
+        return not (traits.text or traits.date or traits.currency or traits.percentage)
+    return True
+
+
+def _peer_evidence(
+    table: _ResolvedTable,
+    cell: Cell,
+    role: ProfileRole | None,
+    candidate: _NormalizationCandidate,
+) -> _PeerEvidence:
+    populated_count = 0
+    native_cells: list[Cell] = []
+    for row in table.body_rows:
+        peer = _cell_at(table.worksheet, row, cell.column)
+        if not isinstance(peer, Cell) or peer.data_type in {"e", "f"}:
+            continue
+        if not _is_nonblank(peer.value):
+            continue
+        populated_count += 1
+        if peer.coordinate == cell.coordinate:
+            continue
+        if candidate.kind == "trailing_whitespace":
+            native = isinstance(peer.value, str)
+        elif role == "date":
+            native = isinstance(peer.value, (date, datetime))
+        else:
+            native = isinstance(peer.value, (int, float)) and not isinstance(peer.value, bool)
+        if native:
+            native_cells.append(peer)
+    ratio = len(native_cells) / populated_count if populated_count else 0.0
+    if candidate.kind == "trailing_whitespace" or role is None:
+        return _PeerEvidence(tuple(native_cells), populated_count, ratio, None, 1)
+    if _format_is_compatible(role, cell.number_format):
+        return _PeerEvidence(tuple(native_cells), populated_count, ratio, None, 1)
+    compatible = [
+        peer
+        for peer in native_cells
+        if _format_is_compatible(role, peer.number_format)
+        and not peer.quotePrefix
+        and not _in_merged_range(table.worksheet, peer.coordinate)
+        and not is_column_hidden(table.worksheet, peer.column)
+        and not (
+            (dimension := table.worksheet.row_dimensions.get(peer.row)) is not None
+            and dimension.hidden
+        )
+    ]
+    counts = Counter(peer.number_format for peer in compatible)
+    if not counts:
+        return _PeerEvidence(tuple(native_cells), populated_count, ratio, None, 0)
+    maximum = max(counts.values())
+    formats = sorted(number_format for number_format, count in counts.items() if count == maximum)
+    if len(formats) != 1:
+        return _PeerEvidence(tuple(native_cells), populated_count, ratio, None, len(formats))
+    chosen_format = formats[0]
+    source = min(
+        (peer for peer in compatible if peer.number_format == chosen_format),
+        key=lambda peer: (abs(peer.row - cell.row), peer.coordinate),
+    )
+    return _PeerEvidence(tuple(native_cells), populated_count, ratio, source, 1)
+
+
+def _normalization_block_reasons(
+    context: RuleContext,
+    table: _ResolvedTable,
+    cell: Cell,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if table.worksheet.protection.sheet:
+        reasons.append("protected_sheet")
+    if _in_merged_range(table.worksheet, cell.coordinate):
+        reasons.append("merged_cell")
+    row_dimension = table.worksheet.row_dimensions.get(cell.row)
+    if row_dimension is not None and row_dimension.hidden:
+        reasons.append("hidden_row")
+    if is_column_hidden(table.worksheet, cell.column):
+        reasons.append("hidden_column")
+    if any(
+        cell.coordinate in cell_range
+        for cell_range in context.unsupported_formula_ranges.get(table.worksheet.title, ())
+    ):
+        reasons.append("advanced_formula_range")
+    if any(
+        patch.sheet == table.worksheet.title
+        and patch.cell == cell.coordinate
+        and patch.kind in _VALUE_MUTATING_PATCH_KINDS
+        for patch in context.prior_patches
+    ):
+        reasons.append("prior_value_patch")
+    return tuple(reasons)
+
+
+def _normalization_patches(
+    *,
+    table: _ResolvedTable,
+    cell: Cell,
+    candidate: _NormalizationCandidate,
+    peer_evidence: _PeerEvidence,
+    risk: PatchRisk,
+    confidence: float,
+    profile_role: ProfileRole | None = None,
+) -> tuple[PatchOperation, ...]:
+    safe = risk == PatchRisk.SAFE and confidence >= 0.95
+    sources = [
+        f"strict_parser:{candidate.kind}",
+        f"native_peer_consensus:{len(peer_evidence.native_cells)}/{peer_evidence.populated_count}",
+    ]
+    if peer_evidence.format_source is not None:
+        sources.append(f"number_format_peer:{peer_evidence.format_source.coordinate}")
+    invariants = [
+        "unique_parse",
+        "no_leading_zero_risk",
+        "source_precondition",
+        "column_role_preserved",
+    ]
+    strategy = "lossless_column_normalization"
+    if candidate.semantic:
+        if profile_role not in {"currency", "number", "percentage"}:
+            raise ValueError("semantic numeric patches require an explicit numeric profile role")
+        sources.append(
+            f"profile_column_role:{table.worksheet.title}!"
+            f"{get_column_letter(cell.column)}:{profile_role}"
+        )
+        invariants.extend(("explicit_v3_numeric_role", "native_peer_consensus"))
+        strategy = "semantic_numeric_normalization"
+    derivation = PatchDerivation(
+        strategy=strategy,
+        sources=sources,
+        candidate_count=1,
+        invariants=invariants,
+        requires_recalculation=candidate.semantic,
+    )
+    atomic_group = (
+        stable_id(
+            "atomic",
+            "lossless-normalization",
+            table.worksheet.title,
+            cell.coordinate,
+            candidate.after,
+            peer_evidence.format_source.coordinate,
+        )
+        if peer_evidence.format_source is not None
+        else None
+    )
+    value_kind = (
+        PatchKind.NORMALIZE_TEXT
+        if candidate.kind == "trailing_whitespace"
+        else PatchKind.SET_NUMERIC
+    )
+    value_patch = PatchOperation(
+        id=stable_id(
+            "patch",
+            value_kind.value,
+            table.worksheet.title,
+            cell.coordinate,
+            cell.value,
+            candidate.after,
+            None,
+        ),
+        kind=value_kind,
+        sheet=table.worksheet.title,
+        cell=cell.coordinate,
+        before=cell.value,
+        after=candidate.after,
+        confidence=_confidence(confidence),
+        safe=safe,
+        risk=risk,
+        description=(
+            "Remove a uniquely identified trailing-whitespace suffix while preserving style."
+            if candidate.kind == "trailing_whitespace"
+            else "Store a uniquely parsed literal as its native OOXML numeric value."
+        ),
+        precondition=PatchPrecondition(
+            cell_fingerprint=cell_fingerprint(cell),
+            expected_value=cell.value,
+            expected_style_id=cell.style_id,
+        ),
+        atomic_group=atomic_group,
+        derivation=derivation,
+    )
+    patches = [value_patch]
+    if peer_evidence.format_source is not None:
+        source = peer_evidence.format_source
+        patches.append(
+            PatchOperation(
+                id=stable_id(
+                    "patch",
+                    PatchKind.COPY_NUMBER_FORMAT.value,
+                    table.worksheet.title,
+                    cell.coordinate,
+                    cell.number_format,
+                    source.number_format,
+                    source.coordinate,
+                ),
+                kind=PatchKind.COPY_NUMBER_FORMAT,
+                sheet=table.worksheet.title,
+                cell=cell.coordinate,
+                before=cell.number_format,
+                after=source.number_format,
+                source_cell=source.coordinate,
+                confidence=_confidence(confidence),
+                safe=safe,
+                risk=risk,
+                description=(
+                    "Copy only the unique peer-consensus number format; preserve all other style fields."
+                ),
+                precondition=PatchPrecondition(
+                    cell_fingerprint=cell_fingerprint(cell),
+                    expected_value=cell.value,
+                    expected_style_id=cell.style_id,
+                ),
+                atomic_group=atomic_group,
+                derivation=derivation.model_copy(
+                    update={"strategy": "peer_number_format_consensus"}
+                ),
+            )
+        )
+    return tuple(patches)
+
+
 class TrailingWhitespaceRule(WorkbookRule):
     rule_id = "WL036_TRAILING_WHITESPACE"
     title = "Trailing whitespace in a record field"
@@ -1045,11 +1854,21 @@ class TrailingWhitespaceRule(WorkbookRule):
                         continue
                     merged = _in_merged_range(table.worksheet, cell.coordinate)
                     configured = table.columns.get(column)
+                    repair_mode = (
+                        configured.repair
+                        if profile.version == 3 and configured is not None
+                        else None
+                    )
                     patch_requested = profile.review_trailing_whitespace_patches or bool(
                         configured and configured.trim_trailing_whitespace
                     )
                     patches: list[PatchOperation] = []
-                    if patch_requested and not merged and set(match.group()) <= {" "}:
+                    if (
+                        patch_requested
+                        and repair_mode is None
+                        and not merged
+                        and set(match.group()) <= {" "}
+                    ):
                         patch = _make_review_text_patch(
                             worksheet=table.worksheet,
                             cell=cell,
@@ -1427,6 +2246,221 @@ class NumberFormatRoleConflictRule(WorkbookRule):
         return result
 
 
+class LosslessValueNormalizationRule(WorkbookRule):
+    rule_id = "WL058_LOSSLESS_VALUE_NORMALIZATION"
+    title = "Lossless value normalization candidate"
+
+    def run(self, context: RuleContext) -> RuleResult:
+        cache_key = "lossless-value-normalization-rule-result-v1"
+        cached = context.analysis_cache.get(cache_key)
+        if isinstance(cached, RuleResult):
+            return cached
+        result = RuleResult()
+        profile = _context_profile(context)
+        for table in _resolved_tables(context, profile):
+            for column in range(table.min_column, table.max_column + 1):
+                configured = table.columns.get(column)
+                repair_mode = (
+                    configured.repair if profile.version == 3 and configured is not None else None
+                )
+                role = _column_role(table, column, profile)
+                configured_role = configured.role if configured is not None else None
+                inferred_role = _header_role(table.headers.get(column, ""))
+                explicit_v3_numeric_role = bool(
+                    profile.version == 3 and configured_role in {"currency", "number", "percentage"}
+                )
+                for row in table.body_rows:
+                    cell = _cell_at(table.worksheet, row, column)
+                    if (
+                        not isinstance(cell, Cell)
+                        or cell.data_type in {"e", "f"}
+                        or not isinstance(cell.value, str)
+                        or not cell.value.strip()
+                    ):
+                        continue
+                    candidates = _candidate_for_role(
+                        _normalization_candidates(cell.value, context.workbook.epoch),
+                        role,
+                    )
+                    if not candidates:
+                        continue
+                    block_reasons = _normalization_block_reasons(context, table, cell)
+                    if "prior_value_patch" in block_reasons:
+                        continue
+                    candidate = candidates[0]
+                    peer_evidence = _peer_evidence(table, cell, role, candidate)
+                    target_text_format = _number_format_traits(cell.number_format).text
+                    summary_row = _row_has_summary_semantics(table, row)
+                    role_conflict = bool(
+                        inferred_role is not None and role is not None and inferred_role != role
+                    )
+                    if candidate.kind == "trailing_whitespace":
+                        semantic_role_clear = bool(
+                            configured_role is not None and profile.version == 3
+                        ) or (
+                            len(peer_evidence.native_cells) >= 3
+                            and peer_evidence.native_ratio >= 0.75
+                        )
+                    else:
+                        semantic_role_clear = bool(
+                            repair_mode == "auto"
+                            and configured_role is not None
+                            and not role_conflict
+                        ) or (inferred_role is not None and inferred_role == role)
+                    unique_candidate = (
+                        len(candidates) == 1 and peer_evidence.format_candidate_count == 1
+                    )
+                    safe_constraints = (
+                        unique_candidate
+                        and semantic_role_clear
+                        and len(peer_evidence.native_cells) >= 3
+                        and peer_evidence.native_ratio >= 0.75
+                        and not block_reasons
+                        and not summary_row
+                        and not cell.quotePrefix
+                        and (candidate.kind == "trailing_whitespace" or not target_text_format)
+                        and not candidate.semantic
+                    )
+                    review_constraints = (
+                        unique_candidate
+                        and not block_reasons
+                        and not summary_row
+                        and not cell.quotePrefix
+                    )
+                    semantic_review_constraints = (
+                        review_constraints
+                        and explicit_v3_numeric_role
+                        and not role_conflict
+                        and len(peer_evidence.native_cells) >= 3
+                        and peer_evidence.native_ratio >= 0.75
+                        and peer_evidence.format_candidate_count == 1
+                        and not target_text_format
+                    )
+                    patches: tuple[PatchOperation, ...] = ()
+                    confidence = 0.99 if configured_role is not None else 0.97
+                    if repair_mode == "report":
+                        pass
+                    elif candidate.semantic:
+                        if repair_mode in {"auto", "review"} and semantic_review_constraints:
+                            patches = _normalization_patches(
+                                table=table,
+                                cell=cell,
+                                candidate=candidate,
+                                peer_evidence=peer_evidence,
+                                risk=PatchRisk.SEMANTIC_REVIEW,
+                                confidence=0.99,
+                                profile_role=configured_role,
+                            )
+                    elif repair_mode == "review":
+                        if configured_role is not None and review_constraints:
+                            patches = _normalization_patches(
+                                table=table,
+                                cell=cell,
+                                candidate=candidate,
+                                peer_evidence=peer_evidence,
+                                risk=PatchRisk.SEMANTIC_REVIEW,
+                                confidence=0.99,
+                            )
+                    elif safe_constraints:
+                        patches = _normalization_patches(
+                            table=table,
+                            cell=cell,
+                            candidate=candidate,
+                            peer_evidence=peer_evidence,
+                            risk=PatchRisk.SAFE,
+                            confidence=confidence,
+                        )
+                    result.patches.extend(patches)
+                    reasons = list(block_reasons)
+                    if not semantic_role_clear:
+                        reasons.append("column_role_not_strongly_supported")
+                    if len(peer_evidence.native_cells) < 3:
+                        reasons.append("fewer_than_three_native_peers")
+                    if peer_evidence.native_ratio < 0.75:
+                        reasons.append("native_peer_ratio_below_0.75")
+                    if peer_evidence.format_candidate_count != 1:
+                        reasons.append("number_format_candidate_not_unique")
+                    if summary_row:
+                        reasons.append("summary_row")
+                    if cell.quotePrefix:
+                        reasons.append("quote_prefix")
+                    if target_text_format:
+                        reasons.append("explicit_text_number_format")
+                    if candidate.semantic and not explicit_v3_numeric_role:
+                        reasons.append("explicit_v3_numeric_profile_required")
+                    if candidate.semantic and repair_mode not in {"auto", "review"}:
+                        reasons.append("semantic_repair_authorization_required")
+                    evidence = Evidence(
+                        summary=(
+                            "A literal cell has a unique normalization candidate supported by its column role and peers"
+                        ),
+                        observed=cell.value,
+                        expected={
+                            "value": candidate.after,
+                            "display_value": candidate.display_value,
+                            "normalization_kind": candidate.kind,
+                        },
+                        peers=[peer.coordinate for peer in peer_evidence.native_cells[:12]],
+                        details={
+                            "evidence_level": (
+                                "PROVEN_STATIC"
+                                if configured_role is not None
+                                else "STRONG_STRUCTURAL"
+                            ),
+                            "header": table.headers.get(column, ""),
+                            "role": role,
+                            "configured_role": configured_role,
+                            "repair_mode": repair_mode,
+                            "candidate_count": len(candidates),
+                            "semantic_candidate": candidate.semantic,
+                            "unit": candidate.unit,
+                            "native_peer_count": len(peer_evidence.native_cells),
+                            "populated_count": peer_evidence.populated_count,
+                            "native_peer_ratio": round(peer_evidence.native_ratio, 3),
+                            "format_candidate_count": peer_evidence.format_candidate_count,
+                            "format_source": (
+                                peer_evidence.format_source.coordinate
+                                if peer_evidence.format_source is not None
+                                else None
+                            ),
+                            "safe_constraints_satisfied": safe_constraints,
+                            "blocked_reasons": list(dict.fromkeys(reasons)),
+                        },
+                    )
+                    result.findings.append(
+                        _make_finding(
+                            context=context,
+                            rule_id=self.rule_id,
+                            title=self.title,
+                            explanation=(
+                                "A literal value can be normalized without inventing a business value; "
+                                "automatic application is allowed only when parsing, role, peer storage, "
+                                "number format, and target safety all have one supported outcome."
+                            ),
+                            severity=Severity.WARNING,
+                            confidence=confidence,
+                            worksheet=table.worksheet,
+                            location=cell.coordinate,
+                            evidence=evidence,
+                            expected=(
+                                "Literal values use native storage while preserving their reviewed semantic role and display format."
+                            ),
+                            suggested_action=(
+                                "Apply the lossless normalization and its number-format companion as one atomic repair."
+                                if patches
+                                and all(patch.risk == PatchRisk.SAFE for patch in patches)
+                                else "Review and explicitly authorize the semantic normalization candidate."
+                                if patches
+                                else "Review the reported candidate; WorkbookLens did not apply it because one or more safety constraints were not proven."
+                            ),
+                            patches=patches,
+                            discriminator=(candidate.kind, repr(candidate.after)),
+                        )
+                    )
+        context.analysis_cache[cache_key] = result
+        return result
+
+
 PROFILE_QUALITY_RULES: tuple[type[WorkbookRule], ...] = (
     TrailingWhitespaceRule,
     RequiredFieldRule,
@@ -1434,6 +2468,7 @@ PROFILE_QUALITY_RULES: tuple[type[WorkbookRule], ...] = (
     ContactFormatRule,
     LeadingZeroIdentifierRule,
     NumberFormatRoleConflictRule,
+    LosslessValueNormalizationRule,
 )
 
 PROFILE_QUALITY_RULE_IDS = frozenset(rule.rule_id for rule in PROFILE_QUALITY_RULES)
@@ -1446,6 +2481,7 @@ __all__ = [
     "ContactFormatRule",
     "EnumeratedValueRule",
     "LeadingZeroIdentifierRule",
+    "LosslessValueNormalizationRule",
     "NumberFormatRoleConflictRule",
     "ProfileConfigurationError",
     "RequiredFieldRule",

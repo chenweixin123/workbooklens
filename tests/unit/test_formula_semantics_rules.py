@@ -12,8 +12,11 @@ from workbooklens.formulas.ir import (
     parse_formula_ir,
     worksheet_content_index,
 )
-from workbooklens.models import Finding, Severity
+from workbooklens.i18n import localize_scan_result
+from workbooklens.models import Finding, PatchKind, PatchRisk, Severity
+from workbooklens.repair.planning import build_patch_plan, resolve_patch_selection
 from workbooklens.rules import RuleRegistry
+from workbooklens.rules.builtin import FormulaPatternOutlierRule, TextFormulaInDataRegionRule
 from workbooklens.rules.formula_semantics import (
     AggregateRangeCoverageRule,
     CrossSheetReferenceValidityRule,
@@ -35,7 +38,8 @@ def _scan(
     path = tmp_path / name
     workbook.save(path)
     workbook.close()
-    return scan_workbook(path, registry=RuleRegistry([rule]))  # type: ignore[list-item]
+    registry = rule if isinstance(rule, RuleRegistry) else RuleRegistry([rule])
+    return scan_workbook(path, registry=registry)  # type: ignore[arg-type, list-item]
 
 
 def _amount_table(workbook: Workbook) -> None:
@@ -113,7 +117,148 @@ def test_aggregate_range_reports_omitted_tail_rows(tmp_path: Path) -> None:
     ]
     assert scan.findings[0].evidence.details["excluded_cells"] == ["B7", "B8"]
     assert scan.findings[0].evidence.expected == {"reviewed_reference": "B2:B8"}
-    assert scan.patches == []
+    assert len(scan.patches) == 1
+    patch = scan.patches[0]
+    assert patch.kind == PatchKind.SET_FORMULA
+    assert patch.after == "=SUM(B2:B8)"
+    assert patch.risk == PatchRisk.FORMULA_DERIVED
+    assert not patch.safe
+    assert patch.atomic_group is not None
+    assert float(patch.confidence) == 0.99
+    assert patch.derivation.strategy == "unique_complete_aggregate_range"
+    assert patch.derivation.candidate_count == 1
+    assert len(patch.derivation.sources) == 2
+    assert patch.derivation.requires_recalculation
+    assert scan.findings[0].patch_ids == [patch.id]
+    localized = localize_scan_result(scan, "zh-CN", strict=True)
+    assert localized.patches[0].description == "将聚合范围扩展到唯一确定的完整推断表格主体。"
+
+
+def test_aggregate_range_can_depend_on_unique_safe_numeric_normalization(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    _amount_table(workbook)
+    worksheet = workbook.active
+    assert worksheet is not None
+    for row in range(2, 8):
+        worksheet.cell(row, 2).number_format = "$#,##0"
+    worksheet["B8"] = "800"
+    worksheet["B8"].number_format = "$#,##0"
+    worksheet["A9"] = "Total"
+    worksheet["B9"] = "=SUM(B2:B6)"
+
+    scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
+
+    normalization = next(patch for patch in scan.patches if patch.kind == PatchKind.SET_NUMERIC)
+    formula = next(patch for patch in scan.patches if patch.kind == PatchKind.SET_FORMULA)
+    assert normalization.cell == "B8"
+    assert normalization.safe_only_eligible
+    assert formula.after == "=SUM(B2:B8)"
+    assert formula.prerequisite_patch_ids == [normalization.id]
+    assert any(
+        source.startswith("safe_normalization_prerequisite:")
+        for source in formula.derivation.sources
+    )
+
+    plan = build_patch_plan(scan)
+    assert resolve_patch_selection(plan, safe_only=True) == {normalization.id}
+    assert resolve_patch_selection(plan, auto_repair=True) == {
+        normalization.id,
+        formula.id,
+    }
+
+
+def _formula_amount_book() -> Workbook:
+    workbook = Workbook()
+    source = workbook.active
+    assert source is not None
+    source.title = "Source Data"
+    source.append(["ID", "Hours", "Rate", "Amount"])
+    for row in range(2, 30):
+        source.append([row - 1, row, row + 0.5, f"=B{row}*C{row}"])
+    dashboard = workbook.create_sheet("Dashboard")
+    dashboard["A2"] = "Total amount"
+    dashboard["B2"] = "=SUM('Source Data'!D2:D24)"
+    return workbook
+
+
+def test_sum_formula_column_uses_verified_formula_repairs_as_prerequisites(
+    tmp_path: Path,
+) -> None:
+    workbook = _formula_amount_book()
+    source = workbook["Source Data"]
+    source["D5"] = "=B5+C5"
+    source["D6"] = "=B7*C6"
+    source["D7"] = "'=B7*C7"
+
+    scan = _scan(
+        tmp_path,
+        workbook,
+        RuleRegistry(
+            [
+                FormulaPatternOutlierRule(),
+                TextFormulaInDataRegionRule(),
+                AggregateRangeCoverageRule(),
+            ]
+        ),
+        name="formula-column-prerequisites.xlsx",
+    )
+
+    source_repairs = {
+        patch.cell: patch
+        for patch in scan.patches
+        if patch.sheet == "Source Data"
+        and patch.kind == PatchKind.SET_FORMULA
+        and patch.cell in {"D5", "D6", "D7"}
+    }
+    assert set(source_repairs) == {"D5", "D6", "D7"}
+    aggregate = next(
+        patch for patch in scan.patches if patch.sheet == "Dashboard" and patch.cell == "B2"
+    )
+    assert aggregate.after == "=SUM('Source Data'!D2:D29)"
+    assert set(aggregate.prerequisite_patch_ids) == {patch.id for patch in source_repairs.values()}
+    assert any(
+        source.startswith("formula_repair_prerequisite:") for source in aggregate.derivation.sources
+    )
+    assert not any(
+        source.startswith("safe_normalization_prerequisite:")
+        for source in aggregate.derivation.sources
+    )
+
+    plan = build_patch_plan(scan)
+    selected = resolve_patch_selection(plan, auto_repair=True)
+    assert aggregate.id in selected
+    assert set(aggregate.prerequisite_patch_ids) <= selected
+
+
+@pytest.mark.parametrize("blocked", ["mixed_tail_signature", "leading_omission"])
+def test_sum_formula_column_requires_unique_signature_and_tail_only_extension(
+    tmp_path: Path,
+    blocked: str,
+) -> None:
+    workbook = _formula_amount_book()
+    source = workbook["Source Data"]
+    dashboard = workbook["Dashboard"]
+    if blocked == "mixed_tail_signature":
+        source["D28"] = "=B28+C28"
+    else:
+        dashboard["B2"] = "=SUM('Source Data'!D4:D29)"
+
+    scan = _scan(
+        tmp_path,
+        workbook,
+        AggregateRangeCoverageRule(),
+        name=f"formula-column-{blocked}.xlsx",
+    )
+
+    assert any(
+        finding.rule_id == "WL042_AGGREGATE_RANGE_COVERAGE"
+        and finding.sheet == "Dashboard"
+        and finding.location == "B2"
+        for finding in scan.findings
+    )
+    assert not any(patch.sheet == "Dashboard" and patch.cell == "B2" for patch in scan.patches)
 
 
 def test_aggregate_range_accepts_complete_table_body(tmp_path: Path) -> None:
@@ -156,6 +301,87 @@ def test_aggregate_range_catches_one_omitted_leading_row(tmp_path: Path) -> None
     assert scan.findings[0].evidence.details["excluded_cells"] == ["B2"]
 
 
+def test_aggregate_range_patch_preserves_absolute_anchors(tmp_path: Path) -> None:
+    workbook = Workbook()
+    _amount_table(workbook)
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet["A9"] = "Total"
+    worksheet["B9"] = "=SUM($B$2:$B$6)"
+
+    scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
+
+    assert len(scan.patches) == 1
+    assert scan.patches[0].after == "=SUM($B$2:$B$8)"
+
+
+def test_aggregate_range_mismatched_function_label_remains_review_only(tmp_path: Path) -> None:
+    workbook = Workbook()
+    _amount_table(workbook)
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet["A9"] = "Total"
+    worksheet["B9"] = "=AVERAGE(B2:B6)"
+
+    scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
+
+    assert len(scan.findings) == 1
+    assert scan.patches == []
+
+
+def test_aggregate_range_candidate_that_creates_cycle_is_withheld(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Cycle Data"
+    worksheet.append(["Item", "Amount", "Input"])
+    worksheet["C2"] = 10
+    for row in range(2, 8):
+        worksheet.cell(row, 1, f"Item {row}")
+        worksheet.cell(row, 2, "=$C$2")
+    worksheet["A8"] = "Item 8"
+    worksheet["B8"] = "=B9"
+    worksheet["A9"] = "Total"
+    worksheet["B9"] = "=SUM(B2:B6)"
+
+    scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
+
+    assert len(scan.findings) == 1
+    assert scan.findings[0].location == "B9"
+    assert scan.patches == []
+
+
+@pytest.mark.parametrize("blocked", ["protected", "merged", "hidden_row", "hidden_column"])
+def test_aggregate_range_high_risk_target_remains_review_only(
+    tmp_path: Path,
+    blocked: str,
+) -> None:
+    workbook = Workbook()
+    _amount_table(workbook)
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet["A9"] = "Total"
+    worksheet["B9"] = "=SUM(B2:B6)"
+    if blocked == "protected":
+        worksheet.protection.sheet = True
+    elif blocked == "merged":
+        worksheet.merge_cells("B9:C9")
+    elif blocked == "hidden_row":
+        worksheet.row_dimensions[9].hidden = True
+    else:
+        worksheet.column_dimensions["B"].hidden = True
+
+    scan = _scan(
+        tmp_path,
+        workbook,
+        AggregateRangeCoverageRule(),
+        name=f"aggregate-{blocked}.xlsx",
+    )
+
+    assert len(scan.findings) == 1
+    assert scan.patches == []
+
+
 def test_cross_sheet_metric_label_reports_truncated_aggregate(tmp_path: Path) -> None:
     workbook = _cross_sheet_book()
     dashboard = workbook["Dashboard"]
@@ -168,6 +394,114 @@ def test_cross_sheet_metric_label_reports_truncated_aggregate(tmp_path: Path) ->
         ("B2", "WL042_AGGREGATE_RANGE_COVERAGE")
     ]
     assert scan.findings[0].evidence.details["excluded_cells"] == ["B6", "B7", "B8"]
+
+
+@pytest.mark.parametrize(
+    ("label", "function"),
+    [
+        ("项目总预算", "SUM"),
+        ("项目总支出", "SUM"),
+        ("总人工成本", "SUM"),
+        ("平均人工成本", "AVERAGE"),
+    ],
+)
+def test_cross_sheet_chinese_amount_metric_reports_truncated_aggregate(
+    tmp_path: Path,
+    label: str,
+    function: str,
+) -> None:
+    workbook = _cross_sheet_book()
+    dashboard = workbook["Dashboard"]
+    dashboard["A2"] = label
+    dashboard["B2"] = f"={function}('Source Data'!B2:B5)"
+
+    scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
+
+    assert [(finding.location, finding.rule_id) for finding in scan.findings] == [
+        ("B2", "WL042_AGGREGATE_RANGE_COVERAGE")
+    ]
+    assert scan.findings[0].evidence.details["excluded_cells"] == ["B6", "B7", "B8"]
+    assert len(scan.patches) == 1
+    patch = scan.patches[0]
+    assert patch.risk == PatchRisk.FORMULA_DERIVED
+    assert patch.after == f"={function}('Source Data'!B2:B8)"
+
+
+def _conditional_aggregate_book() -> Workbook:
+    workbook = Workbook()
+    source = workbook.active
+    assert source is not None
+    source.title = "报销明细"
+    source.append(["ID", "含税金额", "审批状态", "费用类别"])
+    for row in range(2, 9):
+        source.append(
+            [
+                row - 1,
+                row * 100,
+                "已批准" if row % 2 else "待审批",
+                "差旅",
+            ]
+        )
+    dashboard = workbook.create_sheet("看板")
+    dashboard["A2"] = "已批准报销额"
+    return workbook
+
+
+def test_sumif_reviews_synchronized_cross_sheet_boundaries(tmp_path: Path) -> None:
+    workbook = _conditional_aggregate_book()
+    workbook["看板"]["B2"] = '=SUMIF(报销明细!C2:C5,"已批准",报销明细!B2:B5)'
+
+    scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
+
+    assert len(scan.findings) == 1
+    finding = scan.findings[0]
+    assert finding.location == "B2"
+    assert finding.evidence.details["function"] == "SUMIF"
+    assert finding.evidence.details["excluded_rows"] == [6, 7, 8]
+    assert finding.evidence.expected == {
+        "reviewed_references": {
+            "criteria_range": "'报销明细'!C2:C8",
+            "sum_range": "'报销明细'!B2:B8",
+        }
+    }
+    assert len(scan.patches) == 1
+    patch = scan.patches[0]
+    assert patch.after == ("=SUMIF('报销明细'!C2:C8,\"已批准\",'报销明细'!B2:B8)")
+    assert patch.risk == PatchRisk.FORMULA_DERIVED
+    assert patch.derivation.strategy == "unique_synchronized_conditional_aggregate_ranges"
+    assert "criteria_and_sum_ranges_share_identical_row_bounds" in patch.derivation.invariants
+
+
+def test_sumifs_reviews_all_synchronized_cross_sheet_boundaries(tmp_path: Path) -> None:
+    workbook = _conditional_aggregate_book()
+    workbook["看板"]["B2"] = '=SUMIFS(报销明细!B2:B5,报销明细!C2:C5,"已批准",报销明细!D2:D5,"差旅")'
+
+    scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
+
+    assert len(scan.findings) == 1
+    finding = scan.findings[0]
+    assert finding.evidence.details["function"] == "SUMIFS"
+    assert finding.evidence.details["excluded_rows"] == [6, 7, 8]
+    assert [item["role"] for item in finding.evidence.details["ranges"]] == [
+        "sum_range",
+        "criteria_range_1",
+        "criteria_range_2",
+    ]
+    assert len(scan.patches) == 1
+    patch = scan.patches[0]
+    assert patch.after == (
+        "=SUMIFS('报销明细'!B2:B8,'报销明细'!C2:C8,\"已批准\",'报销明细'!D2:D8,\"差旅\")"
+    )
+    assert patch.risk == PatchRisk.FORMULA_DERIVED
+
+
+def test_sumif_requires_synchronized_observed_boundaries(tmp_path: Path) -> None:
+    workbook = _conditional_aggregate_book()
+    workbook["看板"]["B2"] = '=SUMIF(报销明细!C2:C5,"已批准",报销明细!B2:B8)'
+
+    scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
+
+    assert scan.findings == []
 
 
 def _kpi_block_book(*, proven_count: int = 3, all_proven: bool = False) -> Workbook:
@@ -267,6 +601,21 @@ def test_aggregate_range_does_not_add_block_advisory_for_hidden_dashboard(
     scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
 
     assert not _aggregate_block_advisories(scan)
+
+
+@pytest.mark.parametrize("label", ["最近项目总预算", "项目预算执行率"])
+def test_scoped_or_rate_chinese_metric_does_not_imply_full_range(
+    tmp_path: Path,
+    label: str,
+) -> None:
+    workbook = _cross_sheet_book()
+    dashboard = workbook["Dashboard"]
+    dashboard["A2"] = label
+    dashboard["B2"] = "=SUM('Source Data'!B2:B5)"
+
+    scan = _scan(tmp_path, workbook, AggregateRangeCoverageRule())
+
+    assert scan.findings == []
 
 
 @pytest.mark.parametrize("label", ["Q1 Sales", "Rolling Sales", "Last period revenue"])
@@ -713,6 +1062,66 @@ def test_degenerate_formula_rule_ignores_guarded_inner_identity(tmp_path: Path) 
     worksheet["B1"] = "=IF(A1=0,0,A1/A1)"
 
     scan = _scan(tmp_path, workbook, DegenerateFormulaRule())
+
+    assert scan.findings == []
+
+
+def _countif_denominator_book(
+    *,
+    matching_value: bool = False,
+    formula_input: bool = False,
+) -> Workbook:
+    workbook = Workbook()
+    source = workbook.active
+    assert source is not None
+    source.title = "Source"
+    source.append(["Amount"])
+    for row in range(2, 9):
+        value = 200_000_000 if matching_value and row == 8 else row * 100
+        source.cell(row, 1, value)
+    if formula_input:
+        source["A5"] = "=1+1"
+    dashboard = workbook.create_sheet("Dashboard")
+    dashboard["B2"] = '=SUM(Source!A2:A8)/COUNTIF(Source!A2:A8,">100000000")'
+    return workbook
+
+
+def test_countif_denominator_reports_proven_zero_from_literals(tmp_path: Path) -> None:
+    scan = _scan(
+        tmp_path,
+        _countif_denominator_book(),
+        DegenerateFormulaRule(),
+        name="proven-zero-countif-denominator.xlsx",
+    )
+
+    assert len(scan.findings) == 1
+    finding = scan.findings[0]
+    assert finding.location == "B2"
+    assert finding.severity == Severity.ERROR
+    assert finding.evidence.details["kind"] == "provable_zero_countif_denominator"
+    assert finding.evidence.details["literal_value_count"] == 7
+    assert float(finding.confidence) == 1.0
+    assert scan.patches == []
+    localized = localize_scan_result(scan, "zh-CN", strict=True)
+    assert localized.findings[0].title == "公式退化为代数恒等式或常量"
+
+
+@pytest.mark.parametrize("case", ["matching_value", "formula_input"])
+def test_countif_denominator_requires_zero_proof_and_literal_inputs(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    workbook = _countif_denominator_book(
+        matching_value=case == "matching_value",
+        formula_input=case == "formula_input",
+    )
+
+    scan = _scan(
+        tmp_path,
+        workbook,
+        DegenerateFormulaRule(),
+        name=f"countif-denominator-{case}.xlsx",
+    )
 
     assert scan.findings == []
 

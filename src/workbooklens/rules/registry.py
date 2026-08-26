@@ -50,6 +50,7 @@ def default_registry() -> RuleRegistry:
     from workbooklens.rules.layout_geometry import LAYOUT_GEOMETRY_RULES
     from workbooklens.rules.print_quality import PRINT_QUALITY_RULES
     from workbooklens.rules.profile_quality import PROFILE_QUALITY_RULES
+    from workbooklens.rules.relational_semantics import RELATIONAL_SEMANTIC_RULES
 
     return RuleRegistry(
         rule_type()
@@ -61,5 +62,6 @@ def default_registry() -> RuleRegistry:
             *FORMULA_SEMANTIC_RULES,
             *LAYOUT_GEOMETRY_RULES,
             *PRINT_QUALITY_RULES,
+            *RELATIONAL_SEMANTIC_RULES,
         )
     )

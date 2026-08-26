@@ -53,6 +53,34 @@ profile:
     assert sheet["columns"][1]["allowed_values"] == ["North", "South", "East", "West"]
 
 
+def test_yaml_profile_v3_accepts_column_repair_modes(tmp_path: Path) -> None:
+    path = tmp_path / "workbooklens-v3.yml"
+    path.write_text(
+        "version: 3\nprofile:\n  sheets:\n    - sheet: Data\n      columns:\n"
+        "        - header: Amount\n          role: currency\n          repair: auto\n"
+        "        - header: Notes\n          role: text\n          repair: review\n",
+        encoding="utf-8",
+    )
+
+    config = load_test_config(path)
+
+    assert config.version == 3
+    assert config.profile is not None
+    assert [column.repair for column in config.profile.sheets[0].columns] == ["auto", "review"]
+
+
+def test_yaml_profile_v2_rejects_column_repair_mode(tmp_path: Path) -> None:
+    path = tmp_path / "workbooklens-v2-repair.yml"
+    path.write_text(
+        "version: 2\nprofile:\n  sheets:\n    - sheet: Data\n      columns:\n"
+        "        - header: Amount\n          role: currency\n          repair: auto\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UsageError, match="repair requires configuration version 3"):
+        load_test_config(path)
+
+
 @pytest.mark.parametrize(
     "column_block",
     [

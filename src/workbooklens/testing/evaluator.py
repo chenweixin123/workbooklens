@@ -89,6 +89,7 @@ class ProfileColumnConfig(BaseModel):
     identifier_width: int | None = Field(default=None, ge=1, le=64)
     preserve_leading_zeros: bool = False
     trim_trailing_whitespace: bool = False
+    repair: Literal["auto", "review", "report"] | None = None
 
     @field_validator("header")
     @classmethod
@@ -175,7 +176,7 @@ class TestConfig(BaseModel):
     """Validated workbook policy configuration."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
-    version: Literal[1, 2]
+    version: Literal[1, 2, 3]
     workbook: WorkbookThresholds = Field(default_factory=WorkbookThresholds)
     assertions: list[WorkbookAssertion] = Field(default_factory=list)
     keys: list[ConfiguredKey] = Field(default_factory=list)
@@ -186,7 +187,7 @@ class TestConfig(BaseModel):
     @classmethod
     def validate_version_type(cls, value: Any) -> Any:
         if not isinstance(value, int) or isinstance(value, bool):
-            raise ValueError("configuration version must be the integer 1 or 2")
+            raise ValueError("configuration version must be the integer 1, 2, or 3")
         return value
 
     @model_validator(mode="after")
@@ -195,6 +196,16 @@ class TestConfig(BaseModel):
             raise ValueError("workbook profiles require configuration version 2")
         if self.version == 1 and self.suppressions:
             raise ValueError("finding suppressions require configuration version 2")
+        if (
+            self.version != 3
+            and self.profile is not None
+            and any(
+                column.repair is not None
+                for sheet in self.profile.sheets
+                for column in sheet.columns
+            )
+        ):
+            raise ValueError("profile column repair requires configuration version 3")
         identifiers = [suppression.id for suppression in self.suppressions]
         if len(set(identifiers)) != len(identifiers):
             raise ValueError("suppression IDs must be unique")

@@ -16,7 +16,9 @@
 - [ ] Source hashes remain unchanged and only expected OOXML parts change.
 - [ ] Charts, drawings, images, relationships, themes, and unknown fixtures remain byte-identical.
 - [ ] Shared, array, data-table, dynamic-array, stale-plan, and malformed inputs fail closed.
-- [ ] Formula edits remove caches and request recalculation without claiming it occurred.
+- [ ] Formula edits remove caches; recalculation-required patches are validated only after explicit
+  trusted-workbook authorization, use one provider for isolated before/after copies, and never let
+  that provider write the final file.
 - [ ] `--safe-only` excludes every `layout_review` patch; explicit layout selection requires
   `--accept-layout-risk`, confidence at least 0.95, and complete atomic groups.
 - [ ] Row heights, column widths, wrapping, width-only identifier display, saved views, edge-only borders, and
@@ -27,6 +29,9 @@
 ## Security and supply chain
 
 - [ ] Adversarial ZIP/XML/relationship and web-limit tests pass.
+- [ ] Untrusted-workbook tests prove that CLI and Web defaults never launch Excel or LibreOffice,
+  while authorized recalculation enforces time/cell budgets, process cleanup, structural equivalence,
+  no new formula errors, and rollback reports in both languages.
 - [ ] CodeQL, dependency review, and locked-runtime vulnerability audit pass.
 - [ ] GitHub Actions and dependencies have reviewed updates.
 - [ ] Windows CI and release jobs compile an `Output=no` probe and accept only the ISCC compiler

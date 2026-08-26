@@ -65,6 +65,24 @@ def test_formula_features_retain_real_token_detection() -> None:
     assert features.unsupported_reason == "structured reference"
 
 
+@pytest.mark.parametrize(
+    "formula",
+    ["=A1(", "=SUM(A1:A2", "=(A1+1", "=A1)", "==A1", "=A1+", "=IF(A1,"],
+)
+def test_formula_features_fail_closed_for_malformed_structure(formula: str) -> None:
+    features = analyze_formula(formula)
+
+    assert features.unsupported_reason in {
+        "formula tokenizer rejected expression",
+        "malformed formula structure",
+    }
+
+
+@pytest.mark.parametrize("formula", ["=SUM(A1:A2)", "=-(A1+1)", "=NOW()", "=A1%"])
+def test_formula_features_accept_complete_ordinary_structure(formula: str) -> None:
+    assert analyze_formula(formula).unsupported_reason is None
+
+
 def test_string_only_structured_reference_can_be_translated() -> None:
     assert translate_formula('="Table1[Amount]"', "A1", "B2") == '="Table1[Amount]"'
 
@@ -72,3 +90,9 @@ def test_string_only_structured_reference_can_be_translated() -> None:
 def test_normalize_rejects_non_formula() -> None:
     with pytest.raises(ValueError, match="beginning"):
         normalize_formula("A1", "B2")
+
+
+@pytest.mark.parametrize("formula", ["=A1(", "=SUM(A1:A2", "=(A1+1", "=A1+", "=A1)"])
+def test_normalize_rejects_malformed_formula_structure(formula: str) -> None:
+    with pytest.raises(UnsupportedFormulaError, match=r"token structure|tokenizer rejected"):
+        normalize_formula(formula, "B2")

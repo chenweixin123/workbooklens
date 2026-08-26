@@ -88,6 +88,17 @@ STRICT_POSITIVE_MARKERS = ("年龄", "单价", "价格", "工资", "薪资")
 NONNEGATIVE_TOKENS = {"inventory", "outbound", "inbound", "qty", "quantity", "stock", "units"}
 NONNEGATIVE_MARKERS = ("数量", "库存", "入库", "出库")
 SEMANTIC_GROUPS: dict[str, tuple[str, ...]] = {
+    "budget": ("budget", "budgeted", "预算"),
+    "spent": (
+        "expenditure",
+        "expense",
+        "spend",
+        "spending",
+        "spent",
+        "已支出",
+        "实际支出",
+        "支出",
+    ),
     "amount": (
         "amount",
         "gross",
@@ -105,6 +116,7 @@ SEMANTIC_GROUPS: dict[str, tuple[str, ...]] = {
     "rate": ("discount", "margin", "percent", "rate", "ratio", "折扣", "比例", "率"),
     "salary": ("payroll", "salary", "wage", "工资", "薪资"),
 }
+TREND_RE = re.compile(r"(?<![a-z0-9])trends?(?![a-z0-9])|趋势", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,6 +509,8 @@ def _semantic_groups(value: Any) -> set[str]:
             marker in normalized if not marker.isascii() else marker in words for marker in markers
         ):
             groups.add(group)
+    if groups & {"budget", "spent"}:
+        groups.difference_update({"amount", "cost"})
     return groups
 
 
@@ -506,11 +520,20 @@ class InferredDuplicateIdentifierRule(WorkbookRule):
 
     def run(self, context: RuleContext) -> RuleResult:
         result = RuleResult()
+        # Local import avoids an import-time cycle: relational_semantics reuses the
+        # bounded table-profile helpers in this module.
+        from workbooklens.rules.relational_semantics import inferred_foreign_key_columns
+
+        foreign_key_columns = inferred_foreign_key_columns(context)
         for worksheet in context.workbook.worksheets:
             configured_columns = _configured_key_columns(context, worksheet)
             for profile in _table_profiles(context, worksheet):
                 for column, header in profile.headers.items():
-                    if column in configured_columns or not _looks_like_identifier_header(header):
+                    if (
+                        column in configured_columns
+                        or (worksheet.title, profile.header_row, column) in foreign_key_columns
+                        or not _looks_like_identifier_header(header)
+                    ):
                         continue
                     groups: dict[tuple[str, str], list[Cell]] = {}
                     for row in profile.body_rows:
@@ -1452,6 +1475,68 @@ def _direct_lineage_header(
     return None
 
 
+def _profiles_containing_source_range(
+    context: RuleContext,
+    worksheet: Worksheet,
+    cell_range: CellRange,
+) -> tuple[_TableProfile, ...]:
+    if cell_range.min_col != cell_range.max_col:
+        return ()
+    column = cell_range.min_col
+    matches = [
+        profile
+        for profile in _table_profiles(context, worksheet)
+        if column in profile.headers
+        and profile.header_row < cell_range.min_row
+        and cell_range.max_row <= profile.region.max_row
+    ]
+    return tuple(
+        sorted(
+            matches,
+            key=lambda profile: (
+                profile.region.max_row - profile.region.min_row,
+                profile.region.max_column - profile.region.min_column,
+                profile.header_row,
+            ),
+        )
+    )
+
+
+def _chart_source_header(
+    context: RuleContext,
+    worksheet: Worksheet,
+    cell_range: CellRange,
+) -> tuple[str, str] | None:
+    lineage = _direct_lineage_header(context, worksheet, cell_range)
+    if lineage is not None:
+        return lineage
+    profiles = _profiles_containing_source_range(context, worksheet, cell_range)
+    if profiles:
+        header = profiles[0].headers.get(cell_range.min_col)
+        if isinstance(header, str) and header.strip():
+            return worksheet.title, header
+    if cell_range.min_col == cell_range.max_col and cell_range.min_row > 1:
+        header = _value_at(worksheet, cell_range.min_row - 1, cell_range.min_col)
+        if isinstance(header, str) and header.strip():
+            return worksheet.title, header
+    return None
+
+
+def _date_headers_in_source_table(
+    context: RuleContext,
+    worksheet: Worksheet,
+    cell_range: CellRange,
+) -> list[dict[str, Any]]:
+    profiles = _profiles_containing_source_range(context, worksheet, cell_range)
+    if not profiles:
+        return []
+    return [
+        {"column": get_column_letter(column), "header": header}
+        for column, header in profiles[0].headers.items()
+        if column != cell_range.min_col and _looks_like_date_header(header)
+    ]
+
+
 class ChartSourceStructureRule(WorkbookRule):
     rule_id = "WL031_CHART_SOURCE_STRUCTURE"
     title = "Chart source range is structurally inconsistent"
@@ -1566,7 +1651,7 @@ class ChartSourceStructureRule(WorkbookRule):
                                         "reference": title_formula,
                                     }
                                 )
-                    lineage = _direct_lineage_header(context, value_sheet, value_range)
+                    lineage = _chart_source_header(context, value_sheet, value_range)
                     if lineage is not None and len(declared_groups) == 1:
                         source_sheet_name, source_header = lineage
                         source_groups = _semantic_groups(source_header)
@@ -1578,6 +1663,29 @@ class ChartSourceStructureRule(WorkbookRule):
                                     "chart_title": chart_title,
                                     "source_sheet": source_sheet_name,
                                     "source_header": source_header,
+                                }
+                            )
+                    if category_ref is not None and TREND_RE.search(chart_title):
+                        category_sheet, category_range = category_ref
+                        category_source = _chart_source_header(
+                            context, category_sheet, category_range
+                        )
+                        date_headers = _date_headers_in_source_table(
+                            context, category_sheet, category_range
+                        )
+                        if (
+                            category_source is not None
+                            and _looks_like_identifier_header(category_source[1])
+                            and date_headers
+                        ):
+                            issues.append(
+                                {
+                                    "series": series_index,
+                                    "kind": "category_source_semantic_mismatch",
+                                    "chart_title": chart_title,
+                                    "source_sheet": category_source[0],
+                                    "category_header": category_source[1],
+                                    "available_date_headers": date_headers,
                                 }
                             )
                 if not issues:
@@ -1787,6 +1895,67 @@ def _column_width_pixels(worksheet: Worksheet, column: int) -> float:
     return math.floor(((256.0 * width + math.floor(128.0 / 7.0)) / 256.0) * 7.0)
 
 
+def _chart_occupied_range(worksheet: Worksheet, chart: Any) -> CellRange | None:
+    anchor = getattr(chart, "anchor", None)
+    if isinstance(anchor, str):
+        try:
+            return CellRange(anchor.replace("$", ""))
+        except ValueError:
+            return None
+    start = getattr(anchor, "_from", None)
+    if start is None:
+        return None
+    start_column = int(start.col) + 1
+    start_row = int(start.row) + 1
+    end = getattr(anchor, "to", None)
+    if end is not None:
+        return CellRange(
+            min_col=start_column,
+            min_row=start_row,
+            max_col=max(start_column, int(end.col) + int(bool(int(end.colOff)))),
+            max_row=max(start_row, int(end.row) + int(bool(int(end.rowOff)))),
+        )
+    extent = getattr(anchor, "ext", None)
+    width_emu = getattr(extent, "cx", None)
+    height_emu = getattr(extent, "cy", None)
+    if not isinstance(width_emu, int) or not isinstance(height_emu, int):
+        return None
+
+    remaining_width = max(0.0, width_emu / 9525.0)
+    end_column = start_column
+    first_column_offset = max(0.0, int(getattr(start, "colOff", 0)) / 9525.0)
+    while end_column < MAX_COLUMN:
+        available = max(
+            0.0,
+            _column_width_pixels(worksheet, end_column) - first_column_offset,
+        )
+        if remaining_width <= available:
+            break
+        remaining_width -= available
+        end_column += 1
+        first_column_offset = 0.0
+
+    remaining_height = max(0.0, height_emu / 9525.0)
+    end_row = start_row
+    first_row_offset = max(0.0, int(getattr(start, "rowOff", 0)) / 9525.0)
+    while end_row < MAX_ROW:
+        available = max(
+            0.0,
+            row_height(worksheet, end_row) * 96.0 / 72.0 - first_row_offset,
+        )
+        if remaining_height <= available:
+            break
+        remaining_height -= available
+        end_row += 1
+        first_row_offset = 0.0
+    return CellRange(
+        min_col=start_column,
+        min_row=start_row,
+        max_col=end_column,
+        max_row=end_row,
+    )
+
+
 def _chart_is_clipped_by_print_range(
     worksheet: Worksheet,
     chart: Any,
@@ -1898,6 +2067,19 @@ class PrintAreaCoverageRule(WorkbookRule):
                     max_col=int(start.col) + 1,
                     max_row=int(start.row) + 1,
                 )
+                occupied_range = _chart_occupied_range(worksheet, chart)
+                if occupied_range is not None and not any(
+                    _ranges_intersect(item, occupied_range) for item in print_ranges
+                ):
+                    issues.append(
+                        {
+                            "kind": "chart_anchor_excluded_by_print_area",
+                            "chart": chart_index,
+                            "anchor_range": str(occupied_range),
+                            "print_ranges": [str(item) for item in print_ranges],
+                        }
+                    )
+                    continue
                 containing_range = next(
                     (item for item in print_ranges if _contains_range(item, anchor_cell)),
                     None,

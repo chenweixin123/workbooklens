@@ -45,6 +45,7 @@ from workbooklens.repair import apply_patch_plan, build_patch_plan
 from workbooklens.repair.planning import write_patch_plan
 from workbooklens.reports import write_scan_report
 from workbooklens.scanner import ScanResult, scan_workbook
+from workbooklens.testing import load_test_config
 from workbooklens.utils import write_json
 from workbooklens.web.templates import template_loader
 
@@ -53,6 +54,7 @@ CSRF_COOKIE_NAME = "workbooklens_csrf"
 LANGUAGE_COOKIE_NAME = "workbooklens_language"
 LANGUAGE_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
 MAX_MULTIPART_OVERHEAD_BYTES = 16 * 1024
+MAX_PROFILE_BYTES = 1024 * 1024
 MAX_FORM_BODY_BYTES = 1024 * 1024
 UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 SECURITY_HEADERS = {
@@ -142,11 +144,15 @@ class WebSession:
     findings: list[Finding]
     language: Language
     reports: dict[Language, Path]
+    config_path: Path | None = None
+    config: dict[str, Any] | None = None
     fixed: Path | None = None
     result: PatchResult | None = None
     semantic_diff: WorkbookDiff | None = None
     diff_reports: dict[Language, Path] | None = None
     apply_report: Path | None = None
+    failure_result: PatchResult | None = None
+    failure_report: Path | None = None
 
 
 @dataclass(slots=True)
@@ -362,7 +368,9 @@ def _content_length(scope: Scope) -> int | None:
 
 
 def _request_body_limit(path: str, max_file_bytes: int) -> int:
-    if path in {"/convert", "/scan"}:
+    if path == "/scan":
+        return max_file_bytes + MAX_PROFILE_BYTES + MAX_MULTIPART_OVERHEAD_BYTES
+    if path == "/convert":
         return max_file_bytes + MAX_MULTIPART_OVERHEAD_BYTES
     return MAX_FORM_BODY_BYTES
 
@@ -534,6 +542,19 @@ def create_app(
             error.key,
             type(exc).__name__,
         )
+        failure_result: PatchResult | None = None
+        failure_report_url: str | None = None
+        path_parts = request.url.path.strip("/").split("/")
+        if len(path_parts) >= 3 and path_parts[0] == "sessions":
+            session = sessions.get(path_parts[1])
+            if session is not None:
+                failure_result = session.failure_result
+                if session.failure_report is not None:
+                    failure_report_url = f"/sessions/{session.session_id}/failure-report"
+        if failure_result is None:
+            attached_result = getattr(exc, "patch_result", None)
+            if isinstance(attached_result, PatchResult):
+                failure_result = attached_result
         html = _render_page(
             environment,
             "error.html",
@@ -542,6 +563,8 @@ def create_app(
             language_action="/",
             view="error",
             error=error,
+            failure_result=failure_result,
+            failure_report_url=failure_report_url,
         )
         return _language_response(html, language, status_code=status_code)
 
@@ -658,6 +681,7 @@ def create_app(
     async def scan_upload(
         request: Request,
         workbook: UploadFile,
+        profile: UploadFile | None = None,
         csrf_token: str = Form(default=""),
         language: str = Form(default=""),
     ) -> RedirectResponse:
@@ -681,10 +705,29 @@ def create_app(
         session_root = request.app.state.root / session_id
         session_root.mkdir(parents=True)
         source = session_root / f"input{suffix}"
+        config_path: Path | None = None
+        config: dict[str, Any] | None = None
         try:
             await _store_upload(workbook, source, max_file_bytes)
+            if profile is not None and profile.filename:
+                profile_suffix = Path(Path(profile.filename).name).suffix.lower()
+                if profile_suffix not in {".yml", ".yaml"}:
+                    raise _http_error(
+                        400,
+                        "Workbook Profile must be .yml or .yaml",
+                        "upload.invalid_type",
+                    )
+                config_path = session_root / "profile.yml"
+                await _store_upload(profile, config_path, MAX_PROFILE_BYTES)
+                configuration = await run_in_threadpool(load_test_config, config_path)
+                config = configuration.model_dump(mode="python")
             limits = PackageLimits(max_file_bytes=max_file_bytes)
-            scan = await run_in_threadpool(scan_workbook, source, limits=limits)
+            scan = await run_in_threadpool(
+                scan_workbook,
+                source,
+                config=config,
+                limits=limits,
+            )
             plan = build_patch_plan(scan)
             plan_path = session_root / "repair-plan.json"
             write_patch_plan(plan_path, plan)
@@ -701,6 +744,8 @@ def create_app(
             findings=scan.findings,
             language=selected_language,
             reports={},
+            config_path=config_path,
+            config=config,
             diff_reports={},
         )
         response = RedirectResponse(
@@ -726,7 +771,13 @@ def create_app(
         return [
             patch
             for patch in session.plan.patches
-            if patch.safe_only_eligible or patch.risk == PatchRisk.LAYOUT_REVIEW
+            if patch.safe_only_eligible
+            or patch.risk
+            in {
+                PatchRisk.FORMULA_DERIVED,
+                PatchRisk.SEMANTIC_REVIEW,
+                PatchRisk.LAYOUT_REVIEW,
+            }
         ]
 
     @app.get("/sessions/{session_id}", response_class=HTMLResponse)
@@ -740,6 +791,9 @@ def create_app(
         session.language = language
         findings = [localize_finding(finding, language) for finding in session.findings]
         patches = [localize_patch(patch, language) for patch in reviewable_patches(session)]
+        patch_groups = {
+            risk.value: [patch for patch in patches if patch.risk == risk] for risk in PatchRisk
+        }
         severity_counts = {"info": 0, "warning": 0, "error": 0, "critical": 0}
         for finding in findings:
             severity_counts[finding.severity.value] += 1
@@ -755,9 +809,11 @@ def create_app(
             filename=session.filename,
             findings=findings,
             patches=patches,
+            patch_groups=patch_groups,
             severity_counts=severity_counts,
             csrf_token=app.state.csrf_token,
             has_layout_review=any(patch.risk == PatchRisk.LAYOUT_REVIEW for patch in patches),
+            has_semantic_review=any(patch.risk == PatchRisk.SEMANTIC_REVIEW for patch in patches),
         )
         return _language_response(html, language)
 
@@ -810,27 +866,62 @@ def create_app(
         csrf_token: str = Form(default=""),
         language: str = Form(default=""),
         patch_id: list[str] = Form(default=[]),
+        auto_repair: bool = Form(default=False),
+        trust_workbook_for_recalculation: bool = Form(default=False),
         accept_layout_risk: bool = Form(default=False),
+        accept_semantic_risk: bool = Form(default=False),
     ) -> RedirectResponse:
         _validate_post_request(request, csrf_token)
         session = session_or_404(session_id)
         selected_language = _request_language(request, language, fallback=session.language)
-        if not patch_id:
+        if not patch_id and not auto_repair:
             raise _http_error(
                 400,
                 "Select at least one reviewed patch",
                 "repair.selection_required",
             )
+        selected_id_set = set(patch_id)
+        plan_patch_by_id = {patch.id: patch for patch in session.plan.patches}
+        semantic_extra_ids = {
+            patch_id
+            for patch_id in selected_id_set
+            if (patch := plan_patch_by_id.get(patch_id)) is not None
+            and patch.risk == PatchRisk.SEMANTIC_REVIEW
+        }
         fixed = session.source.parent / "fixed.xlsx"
         fixed.unlink(missing_ok=True)
-        result = await run_in_threadpool(
-            apply_patch_plan,
-            session.source,
-            session.plan,
-            fixed,
-            selected_ids=set(patch_id),
-            accept_layout_risk=accept_layout_risk,
-        )
+        session.failure_result = None
+        session.failure_report = None
+        try:
+            result = await run_in_threadpool(
+                apply_patch_plan,
+                session.source,
+                session.plan,
+                fixed,
+                selected_ids=(semantic_extra_ids or None)
+                if auto_repair
+                else (selected_id_set or None),
+                auto_repair=auto_repair,
+                recalc_provider="auto",
+                trust_workbook_for_recalculation=trust_workbook_for_recalculation,
+                accept_layout_risk=False if auto_repair else accept_layout_risk,
+                accept_semantic_risk=(
+                    accept_semantic_risk and bool(semantic_extra_ids)
+                    if auto_repair
+                    else accept_semantic_risk
+                ),
+                config=session.config,
+            )
+        except Exception as exc:
+            attached_result = getattr(exc, "patch_result", None)
+            if isinstance(attached_result, PatchResult):
+                session.failure_result = attached_result
+            attached_report = getattr(exc, "failure_report_path", None)
+            if attached_report is not None:
+                report_path = Path(attached_report).resolve()
+                if report_path.parent == session.source.parent.resolve() and report_path.is_file():
+                    session.failure_report = report_path
+            raise
         apply_report = session.source.parent / "apply-report.json"
         write_json(apply_report, result.model_dump(mode="json"))
         semantic_diff = await run_in_threadpool(compare_workbooks, session.source, fixed)
@@ -863,6 +954,15 @@ def create_app(
         language = _request_language(request, lang, fallback=session.language)
         session.language = language
         translator = partial(translate, language=language)
+        applied_ids = set(session.result.applied_patch_ids)
+        applied_patches = [
+            localize_patch(patch, language)
+            for patch in session.plan.patches
+            if patch.id in applied_ids
+        ]
+        modified_locations = list(
+            dict.fromkeys(f"{patch.sheet}!{patch.cell}" for patch in applied_patches)
+        )
         html = _render_page(
             environment,
             "applied.html",
@@ -872,6 +972,8 @@ def create_app(
             view="completed",
             session_id=session_id,
             result=session.result,
+            applied_patches=applied_patches,
+            modified_locations=modified_locations,
         )
         return _language_response(html, language)
 
@@ -949,6 +1051,30 @@ def create_app(
             session.apply_report,
             media_type="application/json",
             filename="apply-report.json",
+        )
+
+    @app.get("/sessions/{session_id}/failure-report")
+    async def failure_report(session_id: str) -> FileResponse:
+        session = session_or_404(session_id)
+        report_path = session.failure_report
+        if report_path is None:
+            raise _http_error(
+                404,
+                "No repair failure report has been created",
+                "download.not_ready",
+            )
+        resolved = report_path.resolve()
+        if resolved.parent != session.source.parent.resolve() or not resolved.is_file():
+            session.failure_report = None
+            raise _http_error(
+                404,
+                "Repair failure report is no longer available",
+                "download.not_ready",
+            )
+        return FileResponse(
+            resolved,
+            media_type="text/plain; charset=utf-8",
+            filename="workbooklens-repair-failure.txt",
         )
 
     return app

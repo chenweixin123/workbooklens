@@ -343,6 +343,127 @@ def test_chart_rule_resolves_sheet_names_case_insensitively(tmp_path: Path) -> N
     assert not any(finding.rule_id == "WL031_CHART_SOURCE_STRUCTURE" for finding in scan.findings)
 
 
+def test_chart_rule_reads_direct_headers_for_budget_and_trend_semantics(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+
+    def add_semantic_charts(
+        sheet_name: str,
+        headers: list[str],
+        *,
+        budget_title: str,
+        trend_title: str,
+    ) -> None:
+        worksheet = workbook.create_sheet(sheet_name)
+        worksheet.append(headers)
+        for index in range(1, 18):
+            worksheet.append(
+                [
+                    f"P-{index:03d}",
+                    datetime(2026, 1, index),
+                    10_000 + index * 100,
+                    8_000 + index * 90,
+                ]
+            )
+
+        budget_chart = BarChart()
+        budget_chart.title = budget_title
+        budget_chart.add_data(
+            Reference(worksheet, min_col=4, min_row=1, max_row=12),
+            titles_from_data=True,
+        )
+        budget_chart.set_categories(Reference(worksheet, min_col=1, min_row=2, max_row=12))
+        worksheet.add_chart(budget_chart, "F2")
+
+        trend_chart = BarChart()
+        trend_chart.title = trend_title
+        trend_chart.add_data(
+            Reference(worksheet, min_col=4, min_row=1, max_row=15),
+            titles_from_data=True,
+        )
+        trend_chart.set_categories(Reference(worksheet, min_col=1, min_row=2, max_row=15))
+        worksheet.add_chart(trend_chart, "N2")
+
+    add_semantic_charts(
+        "English",
+        ["Project ID", "Date", "Budget Amount", "Amount Spent"],
+        budget_title="Budget by project",
+        trend_title="Project trend",
+    )
+    add_semantic_charts(
+        "Chinese",
+        ["项目编号", "日期", "预算金额", "已支出"],
+        budget_title="预算金额",
+        trend_title="项目趋势",
+    )
+
+    scan = _save_and_scan(workbook, tmp_path / "chart-direct-header-semantics.xlsx")
+    findings = [
+        finding for finding in scan.findings if finding.rule_id == "WL031_CHART_SOURCE_STRUCTURE"
+    ]
+    issues_by_title = {
+        finding.evidence.observed["title"]: finding.evidence.observed["issues"]
+        for finding in findings
+    }
+
+    assert set(issues_by_title) == {
+        "Budget by project",
+        "Project trend",
+        "预算金额",
+        "项目趋势",
+    }
+    for title in ("Budget by project", "预算金额"):
+        assert [item["kind"] for item in issues_by_title[title]] == [
+            "title_source_semantic_mismatch"
+        ]
+    for title in ("Project trend", "项目趋势"):
+        assert [item["kind"] for item in issues_by_title[title]] == [
+            "category_source_semantic_mismatch"
+        ]
+        assert issues_by_title[title][0]["available_date_headers"]
+
+
+def test_chart_rule_does_not_treat_shorter_valid_source_ranges_as_truncation(
+    tmp_path: Path,
+) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.append(["Project ID", "Date", "Budget", "Amount Spent"])
+    for index in range(1, 18):
+        worksheet.append(
+            [
+                f"P-{index:03d}",
+                datetime(2026, 1, index),
+                10_000 + index * 100,
+                8_000 + index * 90,
+            ]
+        )
+
+    budget = BarChart()
+    budget.title = "Budget"
+    budget.add_data(
+        Reference(worksheet, min_col=3, min_row=1, max_row=12),
+        titles_from_data=True,
+    )
+    budget.set_categories(Reference(worksheet, min_col=1, min_row=2, max_row=12))
+    worksheet.add_chart(budget, "F2")
+
+    trend = BarChart()
+    trend.title = "Project trend"
+    trend.add_data(
+        Reference(worksheet, min_col=4, min_row=1, max_row=15),
+        titles_from_data=True,
+    )
+    trend.set_categories(Reference(worksheet, min_col=2, min_row=2, max_row=15))
+    worksheet.add_chart(trend, "N2")
+
+    scan = _save_and_scan(workbook, tmp_path / "valid-short-chart-ranges.xlsx")
+    assert not any(finding.rule_id == "WL031_CHART_SOURCE_STRUCTURE" for finding in scan.findings)
+
+
 def test_deep_freeze_panes_are_reported_without_flagging_moderate_navigation(
     tmp_path: Path,
 ) -> None:
@@ -466,6 +587,43 @@ def test_print_area_respects_two_cell_anchor_end_offsets(tmp_path: Path) -> None
     ]
 
     assert {finding.sheet for finding in findings} == {"ColumnOverflow", "RowOverflow"}
+
+
+def test_print_area_reports_charts_entirely_outside_print_area(tmp_path: Path) -> None:
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Dashboard"
+    worksheet.append(["Group", "Qty"])
+    for index in range(1, 10):
+        worksheet.append([f"G{index}", index])
+
+    for anchor in ("A13", "D5"):
+        chart = BarChart()
+        chart.title = "Quantity by group"
+        chart.add_data(
+            Reference(worksheet, min_col=2, min_row=1, max_row=10),
+            titles_from_data=True,
+        )
+        chart.set_categories(Reference(worksheet, min_col=1, min_row=2, max_row=10))
+        worksheet.add_chart(chart, anchor)
+    worksheet.print_area = "A1:C11"
+
+    scan = _save_and_scan(workbook, tmp_path / "excluded-charts-print-area.xlsx")
+    findings = [
+        finding for finding in scan.findings if finding.rule_id == "WL033_PRINT_AREA_COVERAGE"
+    ]
+
+    assert len(findings) == 1
+    issues = findings[0].evidence.observed["issues"]
+    assert [issue["kind"] for issue in issues] == [
+        "chart_anchor_excluded_by_print_area",
+        "chart_anchor_excluded_by_print_area",
+    ]
+    assert {issue["anchor_range"].split(":", 1)[0] for issue in issues} == {
+        "A13",
+        "D5",
+    }
 
 
 def test_chart_rule_accepts_comma_sheet_names_and_named_ranges(tmp_path: Path) -> None:

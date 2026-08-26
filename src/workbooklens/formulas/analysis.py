@@ -90,9 +90,11 @@ def normalize_formula(formula: str, origin: str) -> str:
     if not isinstance(formula, str) or not formula.startswith("="):
         raise ValueError("formula must be a string beginning with '='")
     try:
-        tokens = Tokenizer(formula).items
+        tokens = tuple(Tokenizer(formula).items)
     except (ValueError, IndexError, TokenizerError) as exc:
         raise UnsupportedFormulaError(f"formula tokenizer rejected the expression: {exc}") from exc
+    if not _has_complete_token_structure(tokens):
+        raise UnsupportedFormulaError("formula has malformed or incomplete token structure")
     result: list[str] = []
     for token in tokens:
         if token.type == "WHITE-SPACE":
@@ -111,6 +113,54 @@ def _tokens(formula: str) -> tuple[Token, ...] | None:
         return tuple(Tokenizer(formula).items)
     except (ValueError, IndexError, TokenizerError):
         return None
+
+
+def _has_complete_token_structure(tokens: tuple[Token, ...]) -> bool:
+    """Reject incomplete tokenizer output without claiming full Excel grammar support."""
+
+    significant = tuple(token for token in tokens if token.type != "WHITE-SPACE")
+    if not significant:
+        return False
+
+    stack: list[str] = []
+    expects_operand = True
+    for token in significant:
+        if token.type in {"FUNC", "PAREN", "ARRAY"}:
+            if token.subtype == "OPEN":
+                if not expects_operand:
+                    return False
+                stack.append(token.type)
+                expects_operand = True
+                continue
+            if token.subtype == "CLOSE":
+                if not stack or stack[-1] != token.type:
+                    return False
+                stack.pop()
+                expects_operand = False
+                continue
+
+        if token.type == "OPERAND":
+            if not expects_operand:
+                return False
+            expects_operand = False
+        elif token.type == "OPERATOR-PREFIX":
+            if not expects_operand:
+                return False
+        elif token.type == "OPERATOR-INFIX":
+            if expects_operand:
+                return False
+            expects_operand = True
+        elif token.type == "OPERATOR-POSTFIX":
+            if expects_operand:
+                return False
+        elif token.type == "SEP":
+            if not stack:
+                return False
+            expects_operand = True
+        else:
+            return False
+
+    return not stack and not expects_operand
 
 
 def _range_operands(tokens: tuple[Token, ...]) -> list[str]:
@@ -149,6 +199,7 @@ def analyze_formula(formula: str) -> FormulaFeatures:
     """Extract references and risky constructs while making no compatibility claims."""
 
     tokens = _tokens(formula)
+    unsupported_reason: str | None
     if tokens is None:
         # openpyxl currently rejects some valid newer syntax (for example spill references).
         # Remove string literals before conservative fallback matching so display text is inert.
@@ -180,7 +231,7 @@ def analyze_formula(formula: str) -> FormulaFeatures:
             if structured
             else "dynamic or advanced formula"
             if advanced
-            else None
+            else "formula tokenizer rejected expression"
         )
         return FormulaFeatures(
             references=(),
@@ -221,6 +272,8 @@ def analyze_formula(formula: str) -> FormulaFeatures:
         unsupported_reason = "structured reference"
     elif advanced:
         unsupported_reason = "dynamic or advanced formula"
+    elif not _has_complete_token_structure(tokens):
+        unsupported_reason = "malformed formula structure"
     return FormulaFeatures(
         references=tuple(operands),
         external_references=external,

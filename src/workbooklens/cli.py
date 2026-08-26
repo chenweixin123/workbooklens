@@ -64,7 +64,7 @@ def main(
         help="Output language: en or zh-CN.",
     ),
 ) -> None:
-    """Deterministic workbook quality tooling with no cloud or Excel dependency."""
+    """Deterministic local workbook tooling with optional trusted-file recalculation."""
 
     global _current_language
     _current_language = normalize_language(language)
@@ -220,6 +220,12 @@ def plan(
         patch_plan = build_patch_plan(result)
         write_patch_plan(out, patch_plan)
         safe_count = sum(patch.safe_only_eligible for patch in patch_plan.patches)
+        formula_derived_count = sum(
+            patch.risk == PatchRisk.FORMULA_DERIVED for patch in patch_plan.patches
+        )
+        semantic_review_count = sum(
+            patch.risk == PatchRisk.SEMANTIC_REVIEW for patch in patch_plan.patches
+        )
         layout_review_count = sum(
             patch.risk == PatchRisk.LAYOUT_REVIEW for patch in patch_plan.patches
         )
@@ -230,6 +236,8 @@ def plan(
                 _current_language,
                 patches=len(patch_plan.patches),
                 safe=safe_count,
+                formula=formula_derived_count,
+                semantic=semantic_review_count,
                 layout=layout_review_count,
                 output=out,
             )
@@ -255,12 +263,52 @@ def apply(
     safe_only: bool = typer.Option(
         False,
         "--safe-only",
-        help="Apply every safe patch at confidence ≥0.95; excludes layout-review patches.",
+        help=(
+            "Apply every safe patch at confidence ≥0.95; excludes formula-derived, semantic, "
+            "and layout-review patches."
+        ),
+    ),
+    auto_repair: bool = typer.Option(
+        False,
+        "--auto-repair",
+        help=(
+            "Apply lossless safe patches plus uniquely derived formula patches that pass local "
+            "recalculation. Explicit semantic-review --patch-id values also require "
+            "--accept-semantic-risk; layout risk is never accepted."
+        ),
+    ),
+    recalc_provider: Literal["auto", "excel", "libreoffice", "none"] = typer.Option(
+        "auto",
+        "--recalc-provider",
+        case_sensitive=False,
+        metavar="PROVIDER",
+        help=(
+            "Formula recalculation provider: auto, excel, libreoffice, or none. With none, "
+            "explicit formula-derived selections are rejected and auto-repair safely skips them."
+        ),
+    ),
+    trust_workbook_for_recalculation: bool = typer.Option(
+        False,
+        "--trust-workbook",
+        "--trust-workbook-for-recalculation",
+        help=(
+            "Trust this workbook before isolated Excel or LibreOffice recalculation; otherwise "
+            "formula-derived repairs are skipped."
+        ),
+        rich_help_panel="Trusted workbook recalculation",
     ),
     accept_layout_risk: bool = typer.Option(
         False,
         "--accept-layout-risk",
         help="Allow explicitly selected layout-review patches; never enables other unsafe patches.",
+    ),
+    accept_semantic_risk: bool = typer.Option(
+        False,
+        "--accept-semantic-risk",
+        help=(
+            "Allow explicitly selected semantic-review patches; unique-candidate and validation "
+            "requirements still apply."
+        ),
     ),
     config: Path | None = typer.Option(
         None, "--config", help="Optional workbooklens YAML configuration."
@@ -277,7 +325,11 @@ def apply(
             out,
             selected_ids=patch_id,
             safe_only=safe_only,
+            auto_repair=auto_repair,
+            recalc_provider=recalc_provider,
+            trust_workbook_for_recalculation=trust_workbook_for_recalculation,
             accept_layout_risk=accept_layout_risk,
+            accept_semantic_risk=accept_semantic_risk,
             config=_optional_config(config),
             limits=_limits(max_file_mb),
         )
@@ -290,6 +342,24 @@ def apply(
                 _current_language,
                 patches=len(result.applied_patch_ids),
                 output=out,
+            )
+        )
+        console.print(
+            translate(
+                "cli.apply_validation_summary",
+                _current_language,
+                provider=translate(
+                    f"recalc_provider.{result.recalculation_provider.value}",
+                    _current_language,
+                ),
+                before=len(result.formula_errors_before),
+                after=len(result.formula_errors_after),
+                status=translate(
+                    f"validation_status.{result.validation_status.value}",
+                    _current_language,
+                ),
+                downgraded=len(result.downgraded_patch_ids),
+                skipped=len(result.skipped_patch_ids),
             )
         )
         console.print(f"{translate('cli.apply_report', _current_language)}: {report_path}")

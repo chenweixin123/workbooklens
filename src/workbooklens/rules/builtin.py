@@ -64,6 +64,7 @@ from workbooklens.models import (
     Confidence,
     Evidence,
     Finding,
+    PatchDerivation,
     PatchKind,
     PatchOperation,
     PatchPrecondition,
@@ -138,6 +139,10 @@ AGGREGATE_FUNCTION_RE = re.compile(
     r"(?<![A-Z0-9_])(?:(?:_XLFN|_XLWS)\.)*(?:SUM|SUBTOTAL|AGGREGATE)\s*\(",
     re.IGNORECASE,
 )
+SUMMARY_ADDITIVE_FORMULA_RE = re.compile(
+    r"^\s*=\s*(?P<function>SUM|SUBTOTAL|AGGREGATE)\s*\(.*\)\s*$",
+    re.IGNORECASE,
+)
 SUMMARY_LABEL_RE = re.compile(
     r"(?<![A-Z0-9_])(?:(?:grand|sub)[\s-]+total|subtotal|total|average|avg|mean|"
     r"minimum|maximum|min|max|median|summary|ending[\s-]+balance|closing[\s-]+balance|"
@@ -196,6 +201,30 @@ MEASURE_HEADER_MARKERS = (
     "容量",
     "体积",
 )
+NONADDITIVE_RATE_HEADER_TOKENS = {
+    "percent",
+    "percentage",
+    "ratio",
+    "rate",
+    "share",
+}
+NONADDITIVE_RATE_HEADER_MARKERS = (
+    "百分比",
+    "比率",
+    "比例",
+    "占比",
+    "增长率",
+    "转换率",
+    "转化率",
+    "执行率",
+    "完成率",
+    "成功率",
+    "利润率",
+    "税率",
+    "折扣率",
+)
+MIN_RATE_BODY_EVIDENCE = 6
+RATE_BODY_EVIDENCE_RATIO = 0.8
 DIRECT_IDENTIFIER_HEADER_TOKENS = {
     "code",
     "id",
@@ -314,8 +343,14 @@ def _make_patch(
     source_cell: str | None = None,
     layout_fingerprint: str | None = None,
     atomic_group: str | None = None,
+    risk: PatchRisk | None = None,
+    derivation: PatchDerivation | None = None,
 ) -> PatchOperation:
-    risk = PatchRisk.LAYOUT_REVIEW if kind in LAYOUT_REVIEW_PATCH_KINDS else PatchRisk.SAFE
+    risk = risk or (
+        PatchRisk.LAYOUT_REVIEW if kind in LAYOUT_REVIEW_PATCH_KINDS else PatchRisk.SAFE
+    )
+    if risk == PatchRisk.FORMULA_DERIVED and atomic_group is None:
+        atomic_group = stable_id("atomic", "formula-derived", worksheet.title, cell.coordinate)
     safe = confidence >= 0.95 and risk == PatchRisk.SAFE
     expected_formula = cell.value if cell.data_type == "f" and isinstance(cell.value, str) else None
     patch_id = stable_id(
@@ -341,6 +376,7 @@ def _make_patch(
             layout_fingerprint=layout_fingerprint,
         ),
         atomic_group=atomic_group,
+        derivation=derivation or PatchDerivation(),
     )
 
 
@@ -511,6 +547,64 @@ def _is_boundary_aggregate(cell: Cell, band: Region) -> bool:
     return expected is not None and expected in references
 
 
+def _row_is_blank_in_region(worksheet: Worksheet, row: int, region: Region) -> bool:
+    for column in range(region.min_column, region.max_column + 1):
+        candidate = worksheet._cells.get((row, column))
+        if not isinstance(candidate, Cell):
+            continue
+        value = candidate.value
+        if value is not None and not (isinstance(value, str) and not value.strip()):
+            return False
+    return True
+
+
+def _row_has_explicit_summary_label(worksheet: Worksheet, row: int) -> bool:
+    return any(
+        isinstance(candidate, Cell)
+        and candidate.row == row
+        and candidate.data_type != "f"
+        and isinstance(candidate.value, str)
+        and SUMMARY_LABEL_RE.search(candidate.value.strip()) is not None
+        for candidate in worksheet._cells.values()
+    )
+
+
+def _is_complete_same_column_sum(
+    context: RuleContext,
+    worksheet: Worksheet,
+    cell: Cell,
+) -> bool:
+    """Accept only an exact same-column SUM over a complete inferred table body."""
+
+    if not isinstance(cell.value, str) or not _row_has_explicit_summary_label(worksheet, cell.row):
+        return False
+    match = SIMPLE_SUM_RE.fullmatch(cell.value)
+    if match is None or match.group("sheet"):
+        return False
+    first_column = match.group("col1").replace("$", "").upper()
+    second_column = match.group("col2").replace("$", "").upper()
+    if first_column != second_column or first_column != cell.column_letter:
+        return False
+    start_row = int(match.group("start").replace("$", ""))
+    end_row = int(match.group("end").replace("$", ""))
+    for region in context.data_regions.get(worksheet.title, ()):
+        if not region.min_column <= cell.column <= region.max_column:
+            continue
+        if start_row != region.min_row + 1:
+            continue
+        if cell.row == region.max_row:
+            expected_end = cell.row - 1
+        elif cell.row == region.max_row + 2 and _row_is_blank_in_region(
+            worksheet, region.max_row + 1, region
+        ):
+            expected_end = region.max_row
+        else:
+            continue
+        if end_row == expected_end and start_row <= end_row:
+            return True
+    return False
+
+
 def _is_merged_non_anchor(worksheet: Worksheet, coordinate: str) -> bool:
     for merged in worksheet.merged_cells.ranges:
         if coordinate not in merged:
@@ -566,6 +660,18 @@ def _looks_like_measure_header(value: Any) -> bool:
         return True
     tokens = [token for token in re.split(r"[^a-z0-9]+", lowered) if token]
     return any(token in DIRECT_MEASURE_HEADER_TOKENS for token in tokens)
+
+
+def _looks_like_nonadditive_rate_header(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    lowered = unicodedata.normalize("NFKC", value).strip().casefold()
+    if not lowered:
+        return False
+    if any(marker in lowered for marker in NONADDITIVE_RATE_HEADER_MARKERS):
+        return True
+    tokens = [token for token in re.split(r"[^a-z0-9]+", lowered) if token]
+    return any(token in NONADDITIVE_RATE_HEADER_TOKENS for token in tokens)
 
 
 def _band_position(cell: Cell, band: Region) -> int:
@@ -1784,6 +1890,131 @@ def _blank_formula_is_structural_separator(worksheet: Worksheet, cell: Cell) -> 
     )
 
 
+def _summary_additive_shape(
+    formula: Any,
+    *,
+    column: int,
+    summary_row: int,
+) -> tuple[str, int, int] | None:
+    if not isinstance(formula, str):
+        return None
+    function_match = SUMMARY_ADDITIVE_FORMULA_RE.fullmatch(formula)
+    if function_match is None:
+        return None
+    try:
+        features = analyze_formula(formula)
+    except (TokenizerError, ValueError):
+        return None
+    if features.unsupported_reason is not None or len(features.references) != 1:
+        return None
+    reference = features.references[0]
+    if "!" in reference:
+        return None
+    compact_formula = re.sub(r"\s+", "", formula).upper()
+    compact_reference = re.sub(r"\s+", "", reference).upper()
+    function = function_match.group("function").upper()
+    if function == "SUM":
+        if compact_formula != f"=SUM({compact_reference})":
+            return None
+    elif function == "SUBTOTAL":
+        if compact_formula not in {
+            f"=SUBTOTAL(9,{compact_reference})",
+            f"=SUBTOTAL(109,{compact_reference})",
+        }:
+            return None
+    elif (
+        re.fullmatch(rf"=AGGREGATE\(9,[0-7],{re.escape(compact_reference)}\)", compact_formula)
+        is None
+    ):
+        return None
+    try:
+        boundaries = range_boundaries(reference.replace("$", ""))
+    except ValueError:
+        return None
+    if not all(isinstance(boundary, int) for boundary in boundaries):
+        return None
+    min_column, min_row, max_column, max_row = cast(tuple[int, int, int, int], boundaries)
+    if min_column != column or max_column != column or min_row > max_row or max_row >= summary_row:
+        return None
+    return function, min_row, max_row
+
+
+def _summary_rate_blank_is_intentional(
+    context: RuleContext,
+    worksheet: Worksheet,
+    cell: Cell,
+    band: Region | None,
+    expected_formula: str | None,
+    consensus_cells: Sequence[Cell],
+) -> bool:
+    if (
+        band is None
+        or band.kind != "formula_row"
+        or not _row_has_summary_semantics(worksheet, cell.row)
+    ):
+        return False
+    expected_shape = _summary_additive_shape(
+        expected_formula,
+        column=cell.column,
+        summary_row=cell.row,
+    )
+    if expected_shape is None or not consensus_cells:
+        return False
+    peer_shapes = [
+        _summary_additive_shape(
+            peer.value,
+            column=peer.column,
+            summary_row=cell.row,
+        )
+        for peer in consensus_cells
+    ]
+    if any(shape != expected_shape for shape in peer_shapes):
+        return False
+    _, first_body_row, last_body_row = expected_shape
+    region = min(
+        (
+            candidate
+            for candidate in context.data_regions.get(worksheet.title, ())
+            if candidate.min_column <= cell.column <= candidate.max_column
+            and candidate.min_row + 1 == first_body_row
+            and candidate.max_row == last_body_row
+            and 1 <= cell.row - candidate.max_row <= 2
+        ),
+        key=lambda candidate: (
+            candidate.max_column - candidate.min_column,
+            candidate.min_column,
+        ),
+        default=None,
+    )
+    if region is None:
+        return False
+    header = _cell(worksheet, region.min_row, cell.column)
+    if not _looks_like_nonadditive_rate_header(header.value):
+        return False
+    body = [_cell(worksheet, row, cell.column) for row in range(first_body_row, last_body_row + 1)]
+    populated = [body_cell for body_cell in body if body_cell.value is not None]
+    numeric: list[tuple[Cell, float]] = []
+    for body_cell in populated:
+        value = body_cell.value
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+            continue
+        numeric_value = float(value)
+        if math.isfinite(numeric_value):
+            numeric.append((body_cell, numeric_value))
+    if len(numeric) < MIN_RATE_BODY_EVIDENCE or not populated:
+        return False
+    percentage_format_ratio = sum("%" in body_cell.number_format for body_cell in populated) / len(
+        populated
+    )
+    numeric_ratio = len(numeric) / len(populated)
+    fractional_ratio = sum(-1.0 <= value <= 1.0 for _, value in numeric) / len(numeric)
+    return (
+        percentage_format_ratio >= RATE_BODY_EVIDENCE_RATIO
+        and numeric_ratio >= RATE_BODY_EVIDENCE_RATIO
+        and fractional_ratio >= RATE_BODY_EVIDENCE_RATIO
+    )
+
+
 def _translated_consensus(
     target: Cell, peers: Iterable[Cell], required_signature: str | None = None
 ) -> tuple[str, str] | None:
@@ -1922,6 +2153,18 @@ def _static_formula_dependency_graph(
     return graph
 
 
+def _static_formula_dependency_graph_for_context(
+    context: RuleContext,
+) -> dict[_FormulaNode, set[_FormulaNode]]:
+    cache_key = "builtin.static_formula_dependency_graph"
+    cached = context.analysis_cache.get(cache_key)
+    if isinstance(cached, dict):
+        return cast(dict[_FormulaNode, set[_FormulaNode]], cached)
+    graph = _static_formula_dependency_graph(context.workbook)
+    context.analysis_cache[cache_key] = graph
+    return graph
+
+
 def _circular_formula_components(
     context: RuleContext,
 ) -> tuple[tuple[_FormulaNode, ...], ...]:
@@ -1930,7 +2173,7 @@ def _circular_formula_components(
     if cached is not None:
         return cast(tuple[tuple[_FormulaNode, ...], ...], cached)
 
-    graph = _static_formula_dependency_graph(context.workbook)
+    graph = _static_formula_dependency_graph_for_context(context)
     reverse_graph: dict[_FormulaNode, set[_FormulaNode]] = {node: set() for node in graph}
     for node, dependencies in graph.items():
         for dependency in dependencies:
@@ -1976,6 +2219,270 @@ def _circular_formula_components(
     result = tuple(sorted(components, key=lambda component: component[0]))
     context.analysis_cache[cache_key] = result
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class _DerivedFormulaProposal:
+    formula: str
+    source_cell: str
+    supporting_cells: tuple[str, ...]
+    derivation: PatchDerivation
+
+
+def _formula_is_ordinary_derived_candidate(
+    context: RuleContext,
+    worksheet: Worksheet,
+    formula: str,
+) -> bool:
+    try:
+        features = analyze_formula(formula)
+    except (TypeError, ValueError):
+        return False
+    if (
+        not features.references
+        or features.external_references
+        or features.broken_references
+        or features.volatile_functions
+        or features.unsupported_reason
+        or features.has_whole_column_reference
+    ):
+        return False
+    sheet_names = {sheet.title.casefold(): sheet.title for sheet in context.workbook.worksheets}
+    return all(
+        _formula_reference_bounds(reference, worksheet.title, sheet_names) is not None
+        for reference in features.references
+    )
+
+
+def _formula_has_high_risk_features(formula: str) -> bool:
+    try:
+        features = analyze_formula(formula)
+    except (TypeError, ValueError):
+        return True
+    return bool(
+        features.external_references
+        or features.broken_references
+        or features.volatile_functions
+        or features.unsupported_reason
+        or features.has_whole_column_reference
+    )
+
+
+def _formula_candidate_creates_cycle(
+    context: RuleContext,
+    worksheet: Worksheet,
+    target: Cell,
+    formula: str,
+) -> bool:
+    """Conservatively reject a candidate whose direct-reference graph reaches itself."""
+
+    target_node = (worksheet.title, target.coordinate)
+    graph = {
+        node: set(dependencies)
+        for node, dependencies in _static_formula_dependency_graph_for_context(context).items()
+    }
+    graph.setdefault(target_node, set())
+    sheet_names = {sheet.title.casefold(): sheet.title for sheet in context.workbook.worksheets}
+    nodes_by_sheet: dict[str, dict[tuple[int, int], _FormulaNode]] = defaultdict(dict)
+    for node in graph:
+        sheet_name, coordinate = node
+        row, column = coordinate_to_tuple(coordinate)
+        nodes_by_sheet[sheet_name][(row, column)] = node
+
+    def dependencies_for(candidate: str, current_sheet: str) -> set[_FormulaNode] | None:
+        try:
+            features = analyze_formula(candidate)
+        except (TypeError, ValueError):
+            return None
+        dependencies: set[_FormulaNode] = set()
+        for reference in features.references:
+            parsed = _formula_reference_bounds(reference, current_sheet, sheet_names)
+            if parsed is None:
+                return None
+            target_sheet, (min_column, min_row, max_column, max_row) = parsed
+            for (row, column), node in nodes_by_sheet.get(target_sheet, {}).items():
+                if min_row <= row <= max_row and min_column <= column <= max_column:
+                    dependencies.add(node)
+            if (
+                target_sheet == worksheet.title
+                and min_row <= target.row <= max_row
+                and min_column <= target.column <= max_column
+            ):
+                dependencies.add(target_node)
+        return dependencies
+
+    candidate_dependencies = dependencies_for(formula, worksheet.title)
+    if candidate_dependencies is None:
+        return True
+    graph[target_node] = candidate_dependencies
+
+    # A literal/text target is absent from the original formula graph. Materialize incoming
+    # edges that would become active after converting it to a formula.
+    for node in tuple(graph):
+        if node == target_node:
+            continue
+        sheet_name, coordinate = node
+        existing_cell = context.workbook[sheet_name][coordinate]
+        if existing_cell.data_type != "f" or not isinstance(existing_cell.value, str):
+            continue
+        try:
+            features = analyze_formula(existing_cell.value)
+        except (TypeError, ValueError):
+            continue
+        for reference in features.references:
+            parsed = _formula_reference_bounds(reference, sheet_name, sheet_names)
+            if parsed is None:
+                continue
+            referenced_sheet, (min_column, min_row, max_column, max_row) = parsed
+            if (
+                referenced_sheet == worksheet.title
+                and min_row <= target.row <= max_row
+                and min_column <= target.column <= max_column
+            ):
+                graph[node].add(target_node)
+                break
+
+    pending = list(graph[target_node])
+    visited: set[_FormulaNode] = set()
+    while pending:
+        node = pending.pop()
+        if node == target_node:
+            return True
+        if node in visited:
+            continue
+        visited.add(node)
+        pending.extend(graph.get(node, ()))
+    return False
+
+
+def _derived_formula_proposal(
+    context: RuleContext,
+    worksheet: Worksheet,
+    target: Cell,
+    peers: Iterable[Cell],
+    required_signature: str,
+    *,
+    region: Region | None = None,
+    band: Region | None = None,
+    signature_ratio: float | None = None,
+    coverage_ratio: float | None = None,
+) -> _DerivedFormulaProposal | None:
+    """Return one formula only when independent structural evidence proves uniqueness."""
+
+    if (
+        _in_unsupported_formula_range(context, worksheet.title, target.coordinate)
+        or _is_in_merged_range(worksheet, target.coordinate)
+        or _is_hidden_cell(worksheet, target)
+        or _is_protected_target(worksheet)
+        or (
+            target.data_type == "f"
+            and isinstance(target.value, str)
+            and _formula_has_high_risk_features(target.value)
+        )
+    ):
+        return None
+
+    translated: list[tuple[str, Cell]] = []
+    for peer in sorted(peers, key=lambda item: (item.row, item.column)):
+        if (
+            peer.data_type != "f"
+            or not isinstance(peer.value, str)
+            or _in_unsupported_formula_range(context, worksheet.title, peer.coordinate)
+            or _is_in_merged_range(worksheet, peer.coordinate)
+            or _is_hidden_cell(worksheet, peer)
+            or _formula_signature(peer) != required_signature
+            or not _formula_is_ordinary_derived_candidate(context, worksheet, peer.value)
+        ):
+            continue
+        try:
+            candidate = translate_formula(peer.value, peer.coordinate, target.coordinate)
+        except UnsupportedFormulaError:
+            continue
+        if not _formula_is_ordinary_derived_candidate(context, worksheet, candidate):
+            continue
+        translated.append((candidate, peer))
+    if len(translated) < 2:
+        return None
+    candidate_counts = Counter(candidate for candidate, _ in translated)
+    if len(candidate_counts) != 1:
+        return None
+    candidate = next(iter(candidate_counts))
+    supporting = tuple(peer for value, peer in translated if value == candidate)
+    if len(supporting) < 2 or _formula_candidate_creates_cycle(
+        context, worksheet, target, candidate
+    ):
+        return None
+
+    lower: tuple[Cell, ...] = ()
+    upper: tuple[Cell, ...] = ()
+    if all(peer.row == target.row for peer in supporting):
+        lower = tuple(peer for peer in supporting if peer.column < target.column)
+        upper = tuple(peer for peer in supporting if peer.column > target.column)
+    elif all(peer.column == target.column for peer in supporting):
+        lower = tuple(peer for peer in supporting if peer.row < target.row)
+        upper = tuple(peer for peer in supporting if peer.row > target.row)
+
+    if lower and upper:
+        before = max(lower, key=lambda peer: (peer.row, peer.column))
+        after = min(upper, key=lambda peer: (peer.row, peer.column))
+        strategy = "bidirectional_r1c1_consensus"
+        sources = [
+            f"peer_formula_before:{worksheet.title}!{before.coordinate}",
+            f"peer_formula_after:{worksheet.title}!{after.coordinate}",
+        ]
+    else:
+        boundary: str | None = None
+        strategy = "r1c1_template_and_table_boundary"
+        if (
+            region is not None
+            and float(region.confidence) >= 0.95
+            and len(supporting) >= 8
+            and (signature_ratio or 0.0) >= 0.85
+            and (coverage_ratio or 0.0) >= 0.75
+            and region.min_row < target.row <= region.max_row
+            and region.min_column <= target.column <= region.max_column
+        ):
+            boundary = (
+                f"{get_column_letter(region.min_column)}{region.min_row}:"
+                f"{get_column_letter(region.max_column)}{region.max_row}"
+            )
+        elif (
+            band is not None
+            and float(band.confidence) >= 0.95
+            and not _is_band_boundary(target, band)
+        ):
+            strategy = "r1c1_template_and_formula_band_boundary"
+            boundary = (
+                f"{get_column_letter(band.min_column)}{band.min_row}:"
+                f"{get_column_letter(band.max_column)}{band.max_row}"
+            )
+        if boundary is None:
+            return None
+        source_coordinates = ",".join(peer.coordinate for peer in supporting[:8])
+        sources = [
+            f"peer_template_consensus:{worksheet.title}!{source_coordinates}",
+            f"inferred_region_boundary:{worksheet.title}!{boundary}",
+        ]
+
+    support_coordinates = tuple(peer.coordinate for peer in supporting)
+    return _DerivedFormulaProposal(
+        formula=candidate,
+        source_cell=min(support_coordinates),
+        supporting_cells=support_coordinates,
+        derivation=PatchDerivation(
+            strategy=strategy,
+            sources=sources,
+            candidate_count=1,
+            invariants=[
+                "unique_translated_candidate",
+                "ordinary_bounded_a1_references",
+                "no_external_dynamic_volatile_or_broken_reference",
+                "target_not_merged_hidden_or_protected",
+                "no_static_cycle",
+            ],
+            requires_recalculation=True,
+        ),
+    )
 
 
 class BrokenReferenceRule(WorkbookRule):
@@ -2036,9 +2543,14 @@ class FormulaPatternOutlierRule(WorkbookRule):
             *,
             region: Region | None = None,
             band: Region | None = None,
+            signature_ratio: float | None = None,
+            coverage_ratio: float | None = None,
+            contiguous_outlier_count: int = 1,
         ) -> None:
             key = (worksheet.title, cell.coordinate)
             if key in seen:
+                return
+            if _is_complete_same_column_sum(context, worksheet, cell):
                 return
             seen.add(key)
             active_region = region or _formula_data_body_region(context, worksheet, cell)
@@ -2050,9 +2562,23 @@ class FormulaPatternOutlierRule(WorkbookRule):
                     and active_region.min_column <= peer.column <= active_region.max_column
                 ]
                 if active_region is not None
-                else []
+                else list(consensus_cells)
             )
-            proposal = _translated_consensus(cell, repair_peers, consensus)
+            translated = _translated_consensus(cell, consensus_cells, consensus)
+            if translated is None:
+                return
+            translated_formula, _source = translated
+            proposal = _derived_formula_proposal(
+                context,
+                worksheet,
+                cell,
+                repair_peers,
+                consensus,
+                region=active_region,
+                band=band,
+                signature_ratio=signature_ratio if signature_ratio is not None else confidence,
+                coverage_ratio=coverage_ratio if coverage_ratio is not None else confidence,
+            )
             aggregate_formula = _is_aggregate_formula(cell.value)
             circular_formula = key in circular_cells
             row_semantics_safe = active_region is not None and _formula_repair_context_is_safe(
@@ -2062,28 +2588,38 @@ class FormulaPatternOutlierRule(WorkbookRule):
                 active_region,
                 include_target=True,
             )
+            anomaly_pattern_safe = (
+                region is not None or anomaly_count == 1
+            ) and contiguous_outlier_count < 4
             patches: list[PatchOperation] = []
             if (
                 proposal is not None
-                and confidence >= 0.95
-                and anomaly_count == 1
                 and not aggregate_formula
                 and not circular_formula
-                and (band is None or not _is_band_boundary(cell, band))
+                and (
+                    band is None
+                    or not _is_band_boundary(cell, band)
+                    or (
+                        active_region is not None
+                        and proposal.derivation.strategy == "bidirectional_r1c1_consensus"
+                    )
+                )
                 and not _is_in_merged_range(worksheet, cell.coordinate)
                 and not _is_hidden_cell(worksheet, cell)
                 and not _is_protected_target(worksheet)
                 and row_semantics_safe
+                and anomaly_pattern_safe
             ):
-                formula, source = proposal
                 patch = _make_patch(
                     kind=PatchKind.SET_FORMULA,
                     worksheet=worksheet,
                     cell=cell,
                     before=cell.value,
-                    after=formula,
-                    confidence=confidence,
-                    source_cell=source,
+                    after=proposal.formula,
+                    confidence=0.99,
+                    source_cell=proposal.source_cell,
+                    risk=PatchRisk.FORMULA_DERIVED,
+                    derivation=proposal.derivation,
                     description=(
                         "Replace the one-off formula with the exact translated peer consensus."
                     ),
@@ -2119,7 +2655,9 @@ class FormulaPatternOutlierRule(WorkbookRule):
                                 "detail_formula_replacement_inferred": False,
                             }
                             if aggregate_formula
-                            else consensus
+                            else proposal.formula
+                            if proposal is not None
+                            else translated_formula
                         ),
                         peers=[peer.coordinate for peer in consensus_cells[:12]],
                         details=(
@@ -2147,6 +2685,8 @@ class FormulaPatternOutlierRule(WorkbookRule):
                         else "The target is outside an inferred data body, so automatic formula "
                         "replacement is withheld."
                         if active_region is None
+                        else "Compare the cell with the listed peers and review any proposed formula."
+                        if patches
                         else "Multiple isolated anomalies were found, so no automatic patch is "
                         "offered; compare each cell with the listed peers."
                         if anomaly_count > 1
@@ -2171,7 +2711,17 @@ class FormulaPatternOutlierRule(WorkbookRule):
                 if not outliers:
                     continue
                 anomaly_count = len(profile.cells) - len(profile.consensus_cells)
+                outlier_rows = {cell.row for cell in outliers}
                 for cell in outliers:
+                    contiguous_rows = {cell.row}
+                    preceding_row = cell.row - 1
+                    while preceding_row in outlier_rows:
+                        contiguous_rows.add(preceding_row)
+                        preceding_row -= 1
+                    following_row = cell.row + 1
+                    while following_row in outlier_rows:
+                        contiguous_rows.add(following_row)
+                        following_row += 1
                     record_outlier(
                         worksheet,
                         cell,
@@ -2182,6 +2732,9 @@ class FormulaPatternOutlierRule(WorkbookRule):
                         len(profile.formula_cells),
                         anomaly_count,
                         region=profile.region,
+                        signature_ratio=profile.signature_ratio,
+                        coverage_ratio=profile.coverage_ratio,
+                        contiguous_outlier_count=len(contiguous_rows),
                     )
             for band in context.formula_bands[worksheet.title]:
                 cells = _band_cells(worksheet, band)
@@ -2217,7 +2770,21 @@ class FormulaPatternOutlierRule(WorkbookRule):
                     for item in formula_cells
                     if signature_by_cell[item.coordinate] == consensus
                 ]
+                outlier_rows_by_column = {
+                    column: {item.row for item in outliers if item.column == column}
+                    for column in {item.column for item in outliers}
+                }
                 for cell in outliers:
+                    column_outlier_rows = outlier_rows_by_column[cell.column]
+                    contiguous_rows = {cell.row}
+                    preceding_row = cell.row - 1
+                    while preceding_row in column_outlier_rows:
+                        contiguous_rows.add(preceding_row)
+                        preceding_row -= 1
+                    following_row = cell.row + 1
+                    while following_row in column_outlier_rows:
+                        contiguous_rows.add(following_row)
+                        following_row += 1
                     record_outlier(
                         worksheet,
                         cell,
@@ -2228,6 +2795,9 @@ class FormulaPatternOutlierRule(WorkbookRule):
                         len(signatures),
                         len(cells) - consensus_count,
                         band=band,
+                        signature_ratio=ratio,
+                        coverage_ratio=ratio,
+                        contiguous_outlier_count=len(contiguous_rows),
                     )
         return result
 
@@ -2249,6 +2819,9 @@ class BlankInFormulaBandRule(WorkbookRule):
             anomaly_count: int,
             *,
             region: Region | None = None,
+            band: Region | None = None,
+            signature_ratio: float | None = None,
+            coverage_ratio: float | None = None,
         ) -> None:
             key = (worksheet.title, cell.coordinate)
             if key in seen:
@@ -2266,11 +2839,29 @@ class BlankInFormulaBandRule(WorkbookRule):
                 if active_region is not None
                 else list(consensus_cells)
             )
-            proposal = _translated_consensus(cell, repair_peers, consensus)
-            if proposal is None:
+            translated_evidence = _translated_consensus(cell, repair_peers, consensus)
+            expected_formula = translated_evidence[0] if translated_evidence is not None else None
+            if _summary_rate_blank_is_intentional(
+                context,
+                worksheet,
+                cell,
+                band,
+                expected_formula,
+                repair_peers,
+            ):
                 return
+            proposal = _derived_formula_proposal(
+                context,
+                worksheet,
+                cell,
+                repair_peers,
+                consensus,
+                region=active_region,
+                band=band,
+                signature_ratio=signature_ratio if signature_ratio is not None else confidence,
+                coverage_ratio=coverage_ratio if coverage_ratio is not None else confidence,
+            )
             seen.add(key)
-            formula, source = proposal
             merged_cell = _is_in_merged_range(worksheet, cell.coordinate)
             hidden_cell = _is_hidden_cell(worksheet, cell)
             protected_target = _is_protected_target(worksheet)
@@ -2283,7 +2874,7 @@ class BlankInFormulaBandRule(WorkbookRule):
             )
             patches: list[PatchOperation] = []
             if (
-                confidence >= 0.95
+                proposal is not None
                 and anomaly_count == 1
                 and not merged_cell
                 and not hidden_cell
@@ -2295,9 +2886,11 @@ class BlankInFormulaBandRule(WorkbookRule):
                     worksheet=worksheet,
                     cell=cell,
                     before=None,
-                    after=formula,
-                    confidence=confidence,
-                    source_cell=source,
+                    after=proposal.formula,
+                    confidence=0.99,
+                    source_cell=proposal.source_cell,
+                    risk=PatchRisk.FORMULA_DERIVED,
+                    derivation=proposal.derivation,
                     description=(
                         "Create the missing cell with the exact translated formula agreed by peers."
                     ),
@@ -2320,7 +2913,7 @@ class BlankInFormulaBandRule(WorkbookRule):
                     evidence=Evidence(
                         summary="Independent peer formulas translate to the same expression",
                         observed=None,
-                        expected=formula,
+                        expected=expected_formula,
                         peers=[peer.coordinate for peer in repair_peers[:12]],
                     ),
                     expected=("Formula-dominated data-region columns have no unexplained blank."),
@@ -2364,6 +2957,8 @@ class BlankInFormulaBandRule(WorkbookRule):
                         profile.confidence,
                         anomaly_count,
                         region=profile.region,
+                        signature_ratio=profile.signature_ratio,
+                        coverage_ratio=profile.coverage_ratio,
                     )
             for band in context.formula_bands[worksheet.title]:
                 cells = _band_cells(worksheet, band)
@@ -2394,6 +2989,9 @@ class BlankInFormulaBandRule(WorkbookRule):
                     consensus,
                     0.99 if ratio >= 0.95 else 0.94,
                     len(cells) - count,
+                    band=band,
+                    signature_ratio=ratio,
+                    coverage_ratio=ratio,
                 )
         return result
 
@@ -2415,6 +3013,8 @@ class HardcodedValueInFormulaBandRule(WorkbookRule):
             anomaly_count: int,
             *,
             region: Region | None = None,
+            signature_ratio: float | None = None,
+            coverage_ratio: float | None = None,
         ) -> None:
             key = (worksheet.title, cell.coordinate)
             if key in seen:
@@ -2430,11 +3030,11 @@ class HardcodedValueInFormulaBandRule(WorkbookRule):
                 if active_region is not None
                 else list(consensus_cells)
             )
-            proposal = _translated_consensus(cell, repair_peers, consensus)
-            if proposal is None:
+            translated = _translated_consensus(cell, repair_peers, consensus)
+            if translated is None:
                 return
             seen.add(key)
-            formula, source = proposal
+            formula, _source = translated
             merged_cell = _is_in_merged_range(worksheet, cell.coordinate)
             hidden_cell = _is_hidden_cell(worksheet, cell)
             protected_target = _is_protected_target(worksheet)
@@ -2445,10 +3045,19 @@ class HardcodedValueInFormulaBandRule(WorkbookRule):
                 active_region,
                 include_target=True,
             )
+            proposal = _derived_formula_proposal(
+                context,
+                worksheet,
+                cell,
+                repair_peers,
+                consensus,
+                region=active_region,
+                signature_ratio=signature_ratio if signature_ratio is not None else confidence,
+                coverage_ratio=coverage_ratio if coverage_ratio is not None else confidence,
+            )
             patches: list[PatchOperation] = []
             if (
-                confidence >= 0.95
-                and anomaly_count == 1
+                proposal is not None
                 and not merged_cell
                 and not hidden_cell
                 and not protected_target
@@ -2459,9 +3068,11 @@ class HardcodedValueInFormulaBandRule(WorkbookRule):
                     worksheet=worksheet,
                     cell=cell,
                     before=cell.value,
-                    after=formula,
-                    confidence=confidence,
-                    source_cell=source,
+                    after=proposal.formula,
+                    confidence=0.99,
+                    source_cell=proposal.source_cell,
+                    risk=PatchRisk.FORMULA_DERIVED,
+                    derivation=proposal.derivation,
                     description="Replace the isolated literal with the exact translated peer formula.",
                 )
                 patches.append(patch)
@@ -2496,6 +3107,8 @@ class HardcodedValueInFormulaBandRule(WorkbookRule):
                         else "The target is outside an inferred data body, so automatic formula "
                         "replacement is withheld."
                         if active_region is None
+                        else "Confirm the literal is not an intentional override before selecting the patch."
+                        if patches
                         else "Multiple isolated anomalies were found, so no automatic patch is "
                         "offered; compare each cell with the listed peers."
                         if anomaly_count > 1
@@ -2530,6 +3143,8 @@ class HardcodedValueInFormulaBandRule(WorkbookRule):
                         profile.confidence,
                         anomaly_count,
                         region=profile.region,
+                        signature_ratio=profile.signature_ratio,
+                        coverage_ratio=profile.coverage_ratio,
                     )
             for band in context.formula_bands[worksheet.title]:
                 cells = _band_cells(worksheet, band)
@@ -2567,6 +3182,8 @@ class HardcodedValueInFormulaBandRule(WorkbookRule):
                     consensus,
                     confidence,
                     len(cells) - count,
+                    signature_ratio=ratio,
+                    coverage_ratio=ratio,
                 )
         return result
 
@@ -2601,6 +3218,72 @@ class TextFormulaInDataRegionRule(WorkbookRule):
                     confidence = (
                         profile.confidence if matches_consensus else min(0.94, profile.confidence)
                     )
+                    active_region = profile.region
+                    same_style_peers = tuple(
+                        peer
+                        for peer in profile.consensus_cells
+                        if peer.style_id == cell.style_id and not _is_hidden_cell(worksheet, peer)
+                    )
+                    strict_formula_evidence = bool(
+                        matches_consensus
+                        and formula_text == expected_formula
+                        and not _is_hidden_cell(worksheet, cell)
+                        and float(active_region.confidence) >= 0.95
+                        and len(same_style_peers) >= 8
+                        and not _row_has_summary_semantics(worksheet, cell.row, active_region)
+                        and _formula_is_ordinary_derived_candidate(
+                            context,
+                            worksheet,
+                            formula_text,
+                        )
+                        and not _formula_has_high_risk_features(formula_text)
+                    )
+                    derived = (
+                        _derived_formula_proposal(
+                            context,
+                            worksheet,
+                            cell,
+                            same_style_peers,
+                            profile.consensus_signature,
+                            region=active_region,
+                            signature_ratio=profile.signature_ratio,
+                            coverage_ratio=profile.coverage_ratio,
+                        )
+                        if strict_formula_evidence
+                        else None
+                    )
+                    patches: list[PatchOperation] = []
+                    if derived is not None:
+                        derivation = PatchDerivation(
+                            strategy=derived.derivation.strategy,
+                            sources=[
+                                f"stored_formula_text_exact_match:{worksheet.title}!{cell.coordinate}",
+                                *derived.derivation.sources,
+                            ],
+                            candidate_count=1,
+                            invariants=[
+                                *derived.derivation.invariants,
+                                "stored_text_equals_unique_translated_formula",
+                                "target_and_peers_are_visible_and_share_style",
+                            ],
+                            requires_recalculation=True,
+                        )
+                        patch = _make_patch(
+                            kind=PatchKind.SET_FORMULA,
+                            worksheet=worksheet,
+                            cell=cell,
+                            before=cell.value,
+                            after=derived.formula,
+                            confidence=0.99,
+                            source_cell=derived.source_cell,
+                            risk=PatchRisk.FORMULA_DERIVED,
+                            derivation=derivation,
+                            description=(
+                                "Convert the isolated formula text to the unique translated peer formula."
+                            ),
+                        )
+                        patches.append(patch)
+                        result.patches.append(patch)
                     seen.add(key)
                     result.findings.append(
                         _make_finding(
@@ -2622,8 +3305,13 @@ class TextFormulaInDataRegionRule(WorkbookRule):
                                 peers=[peer.coordinate for peer in profile.consensus_cells[:12]],
                                 details={
                                     "matches_consensus_signature": matches_consensus,
+                                    "matches_unique_translated_formula": (
+                                        formula_text == expected_formula
+                                    ),
                                     "number_format": cell.number_format,
                                     "quote_prefix": bool(cell.quotePrefix),
+                                    "same_style_support_count": len(same_style_peers),
+                                    "region_confidence": float(active_region.confidence),
                                 },
                             ),
                             expected=(
@@ -2631,9 +3319,12 @@ class TextFormulaInDataRegionRule(WorkbookRule):
                                 "formulas, not text."
                             ),
                             suggested_action=(
-                                "Confirm the leading equals sign is intended as a calculation, then "
+                                "Review and select the proposed translated formula."
+                                if derived is not None
+                                else "Confirm the leading equals sign is intended as a calculation, then "
                                 "convert the text to a real formula manually; no automatic patch is offered."
                             ),
+                            patches=patches,
                         )
                     )
         return result
@@ -2804,7 +3495,9 @@ class SuspiciousSumBoundaryRule(WorkbookRule):
                 candidate_row = end_row + 1
                 if candidate_row != cell.row - 1 or start_row >= end_row:
                     continue
-                candidate = _cell(worksheet, candidate_row, cell.column)
+                candidate = worksheet._cells.get((candidate_row, cell.column))
+                if not isinstance(candidate, Cell):
+                    continue
                 if isinstance(candidate.value, bool):
                     continue
                 candidate_dimension = worksheet.row_dimensions.get(candidate_row)
@@ -2926,6 +3619,8 @@ class NumericTextRule(WorkbookRule):
     title = "Numeric text in numeric region"
 
     def run(self, context: RuleContext) -> RuleResult:
+        from workbooklens.rules.profile_quality import _configured_repair_mode_for_cell
+
         result = RuleResult()
         seen: set[tuple[str, str]] = set()
         for worksheet in context.workbook.worksheets:
@@ -2970,9 +3665,16 @@ class NumericTextRule(WorkbookRule):
                                 context, worksheet, cell, region, include_target=True
                             )
                         )
+                        profile_repair_mode = _configured_repair_mode_for_cell(
+                            context,
+                            worksheet,
+                            cell.row,
+                            cell.column,
+                        )
                         patches: list[PatchOperation] = []
                         if (
                             confidence >= 0.95
+                            and profile_repair_mode is None
                             and not identifier_header
                             and measure_header
                             and not text_formatted
