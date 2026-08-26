@@ -5,7 +5,8 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
-from collections import deque
+from collections import Counter, deque
+from collections.abc import Sequence
 from copy import copy
 from dataclasses import dataclass
 from typing import Any
@@ -205,6 +206,7 @@ def measure_text_cell(
     cell: Cell,
     *,
     assume_wrap: bool | None = None,
+    available_width_override: float | None = None,
 ) -> TextMeasurement | None:
     """Estimate literal-text clipping while treating merged non-anchors as non-cells."""
 
@@ -220,6 +222,10 @@ def measure_text_cell(
         if merged.max_row > merged.min_row:
             return None
     available_width, merged_range = _available_width(worksheet, cell)
+    if available_width_override is not None:
+        if merged_range is not None:
+            raise ValueError("available_width_override is only valid for unmerged cells")
+        available_width = max(float(available_width_override), 1.0)
     font_size = float(cell.font.sz or 11.0)
     font_factor = _font_width_factor(cell, cell.value)
     logical_lines = cell.value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -328,6 +334,42 @@ def visual_border_signature(worksheet: Worksheet, cell: Cell) -> tuple[Any, ...]
             bottom_peer.border.top if isinstance(bottom_peer, Cell) else None,
         ),
     )
+
+
+def is_detail_row_perimeter_border_variant(
+    cell: Cell,
+    *,
+    detail_rows: Sequence[int],
+    observed_border: tuple[Any, ...],
+    consensus_border: tuple[Any, ...],
+    boundary_borders: Sequence[tuple[Any, ...]],
+) -> bool:
+    """Return whether a first/last-row edge matches a stable boundary consensus."""
+
+    if not detail_rows or len(boundary_borders) < 2:
+        return False
+    differing_edges = {
+        index
+        for index, (observed, expected) in enumerate(
+            zip(observed_border, consensus_border, strict=True)
+        )
+        if observed != expected
+    }
+    allowed_edges: set[int] = set()
+    if cell.row == detail_rows[0]:
+        allowed_edges.add(2)
+    if cell.row == detail_rows[-1]:
+        allowed_edges.add(3)
+    if not differing_edges or not differing_edges <= allowed_edges:
+        return False
+    for edge_index in differing_edges:
+        counts = Counter(border[edge_index] for border in boundary_borders)
+        boundary_edge, support = counts.most_common(1)[0]
+        if support / len(boundary_borders) < 0.8:
+            return False
+        if observed_border[edge_index] != boundary_edge:
+            return False
+    return True
 
 
 def border_is_missing_only(observed: tuple[Any, ...], expected: tuple[Any, ...]) -> bool:
@@ -897,6 +939,7 @@ __all__ = [
     "find_formatting_tail",
     "find_whitespace_tail",
     "has_visible_border",
+    "is_detail_row_perimeter_border_variant",
     "measure_text_cell",
     "non_border_style_key",
     "range_intersects",

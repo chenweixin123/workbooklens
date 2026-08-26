@@ -2,6 +2,128 @@
 
 All notable changes are documented here. WorkbookLens follows Semantic Versioning.
 
+## [Unreleased]
+
+## [2.4.0] - 2026-08-27
+
+### Added
+
+- Add an optional user-editable Workbook Profile with bounded sheet/column contracts for required
+  fields, enumerations and near-match evidence, email and phone structure, fixed-width identifiers,
+  trailing whitespace, and currency/percentage/date role conflicts. Business values remain
+  report-only; an explicitly requested ASCII-space cleanup is always `layout_review`.
+- Add Patch Plan schema v3 with `formula_derived` and `semantic_review` risks, candidate uniqueness,
+  derivation sources, preserved invariants, and recalculation requirements. Schema-v2 plans remain
+  readable through a fail-closed in-memory migration, while newly written plans always use v3.
+- Add evidence-constrained lossless normalization for strict currency, numeric, percentage, date,
+  and trailing-space cases. Ambiguous business values remain report-only; uniquely parsed Chinese
+  numbers and multiplier text require an explicit version-3 Profile and semantic confirmation.
+- Add Excel-first, LibreOffice-fallback recalculation of isolated source and candidate copies for
+  trusted workbooks. The final workbook remains the direct OOXML result, and failed dependency,
+  formula-error, rescan, or idempotency validation removes or rolls back the affected patch group.
+- Add a conservative Formula IR and report-only rules for truncated aggregate ranges, invalid or
+  structurally blank cross-sheet targets, isolated formulas in notes columns, algebraically
+  degenerate top-level formulas, and formula-label/number-format role conflicts.
+- Add report-only layout geometry for chart/image overlap with non-source data or KPI regions,
+  fixed-format numeric display width risk, unexplained explicit row-height outliers, and
+  role-aware title/header/body/total style fragmentation.
+- Add report-only inferred data-quality rules for duplicate or missing identifiers, mixed numeric
+  storage, robust numeric outliers, percentage-scale anomalies, date-storage anomalies, and
+  sign-domain violations: negative values under nonnegative headers, and zero or negative values
+  under positive headers.
+- Add report-only structure checks for partial AutoFilter coverage, chart category/value range
+  mismatches, deeply displaced freeze panes, and print areas that truncate inferred tables or chart
+  frames already included by the print area.
+- Add formula-text, bounded static circular-dependency, and provable formula-error findings. The
+  provable error rule is intentionally narrow and recognizes only deterministic expressions such as
+  direct NA(), simple constant division by zero, and clearly nonnumeric literal VALUE(...) calls.
+  It also propagates a proven error through complete direct references, exact one-range
+  SUM/AVERAGE/MIN/MAX formulas, and strictly bounded pure-operator expressions over ordinary
+  single-cell references and literals. Other functions, conditions, error handlers, and
+  range/union/intersection syntax inside pure-operator expressions remain excluded, as do
+  arrays, dynamic-array syntax, and external references.
+  Saved OOXML formula-error caches are reported separately as advisory evidence and may be stale.
+- Add seven conservative report-only checks: WL051 detects success-green conditional formatting that
+  selects sign violations; WL052 identifies aggregates outside the labelled summary block; WL053
+  infers rare categorical near-spellings and explicit placeholder values; WL054 reports isolated
+  blanks in highly complete fields; and WL055 cross-checks manual page breaks, literal footer page
+  totals, print areas, and fit-to-width settings against independently inferred layout evidence.
+  WL056 flags only a unique, isolated, unusually tiny vivid label immediately beside a wide inferred
+  title, as an INFO-level manual-review advisory with no repair patch.
+  WL057 conservatively infers repeated cross-sheet foreign-key columns from matching identifier
+  headers, parent-column uniqueness, and strong value overlap; it reports only unsupported child
+  identifiers and never invents a replacement. WL022 skips only columns reliably inferred as foreign
+  keys, while retaining duplicate checks for parent and unrelated identifier columns.
+  WL053 and WL054 also run without a Profile only when conservative structural thresholds are met;
+  they never invent or replace semantic values.
+
+### Changed
+
+- Make WL051 conservative about every matching or unknown higher-priority conditional-format rule,
+  including `stopIfTrue=false`, so a lower-priority success-green fill is not falsely reported as
+  effective.
+- Make WL055 respect each page-break `min`/`max` span both with and without a saved print area,
+  preventing local row or column breaks from overstating the fixed footer page count.
+- Add bilingual Select all/Clear all controls and a live selected-count summary to the local repair
+  review page. Bulk selection is scoped only to proposed repairs and never checks the separate
+  layout-risk consent on the user's behalf.
+- Add INFO-level block summaries when a wide inferred table has repeated confirmed clipping in
+  multiple non-identifier, non-contact, non-notes text columns. The summary links the proven cells
+  but never normalizes every column to one width or adds another repair patch.
+- Summarize compact KPI blocks with at least three independently proven truncated aggregates while
+  explicitly listing neighboring aggregate formulas that lack enough boundary evidence as
+  unproven. The advisory does not classify or copy those neighboring formulas.
+- Keep references to missing worksheets as `ERROR`, while classifying an empty target outside
+  recorded content as low-confidence advisory `INFO`. Add scan-scoped sparse-index,
+  formula-cell, and row-label caches; these formula checks remain findings-only.
+- Apply one 1,000,000-cell Profile-range limit to direct scanner configuration and YAML Profiles,
+  and resolve sparse Profile body rows without walking the full declared rectangle.
+- Make Profile configuration fail closed for boolean-to-integer coercion, out-of-range header rows,
+  duplicate worksheet/table definitions, ambiguous or missing headers, out-of-range columns, and
+  multiple selectors resolving to the same physical column. A bounded range now defaults its
+  header row to the range's first row. Version 3 adds per-column `repair: auto | review | report`;
+  version-1 and version-2 Profiles remain readable and retain their earlier repair behavior.
+- Resolve chart source worksheet names plus global and worksheet-local defined names
+  case-insensitively, matching Excel semantics. Suppress overlap findings only for exact chart
+  source cells, preserving covered non-source columns for WL047 detection.
+- Interpret zero-offset TwoCellAnchor end markers at the leading edge of the marker cell, avoiding
+  false print-area truncation findings while retaining real row or column overflow findings.
+- Expand the built-in deterministic registry from 35 to 57 rules and require exact Chinese/English
+  title, explanation, evidence-summary, expectation, and suggested-action coverage for every
+  built-in module.
+- Extend version-3 YAML validation with a strict, bounded `profile.sheets[].columns[]` schema and
+  repair policy while preserving direct scanner calls and legacy Profiles that omit the new policy.
+- Extend one-click safe repair to combine lossless normalization with uniquely derived formula
+  candidates that pass local recalculation. Semantic and layout candidates remain unselected until
+  the user explicitly chooses them and grants the matching risk authorization.
+- Bound Hatchling below 1.32 because 1.32 emits Core Metadata 2.5, which current Twine 6.2 rejects;
+  the compatible build emits Core Metadata 2.4 and passes strict distribution checks.
+- Build copied-formula consensus across inferred data-body columns so several anomalies no longer
+  split the evidence into short bands. Multiple formula, blank, or hardcoded anomalies are reported
+  but are never patched automatically; a formula patch still requires one anomaly, at least 0.95
+  confidence, exact translation agreement, and stable visible detail-row semantics.
+- Exclude fully blank structural separator rows from missing-formula findings, preventing false
+  creation of formulas immediately before subtotal or total rows.
+- Cache circular-reference analysis once per scan and bound range expansion to avoid quadratic work
+  on broad references while retaining direct and bounded-range cycle detection.
+- Prefer an atomic bounded-width, wrap, and row-height proposal for one isolated extreme long-text
+  row. Multiple dependent rows remain findings-only, and automatic row-height proposals no longer
+  grow to visually disruptive sizes.
+- Remove the stale fixed-version wording from the OOXML input safety message.
+- Harden role-aware style inspection when an OOXML border side is absent instead of represented by
+  an empty `Side`, preventing a valid workbook from raising `WL-INT-001`.
+- Keep WL007 from treating a data region's first-row top edge or last-row bottom edge as a column
+  style anomaly when every other visible style component matches; WL017 remains responsible for
+  border continuity findings.
+- Generalize the Windows installer upgrade smoke test to accept a pinned earlier numeric release,
+  while retaining the legacy portable-profile exception only for version 2.2.1.
+
+### Security
+
+- Remove ambiguous backtracking from the conservative email local-part validator and add
+  adversarial long-input timeout coverage, preventing a regular-expression denial of service while
+  retaining valid multi-segment addresses and rejecting leading, trailing, or consecutive dots.
+
 ## [2.3.0] - 2026-08-23
 
 ### Added
@@ -100,6 +222,9 @@ All notable changes are documented here. WorkbookLens follows Semantic Versionin
 - Scope the non-execution guarantee to normal OOXML scan, test, diff, and repair workflows. Optional
   `.xls` conversion invokes an installed spreadsheet application and is explicitly documented as a
   trusted-file-only boundary.
+- Require a separate trusted-workbook authorization before Excel or LibreOffice can open isolated
+  copies for formula-repair validation. Without authorization, one-click repair continues with
+  lossless normalization and clearly skips formula-derived candidates.
 - The local server reserves its `127.0.0.1` socket before Uvicorn starts, removing the port-probe
   race. Browser launch waits for `/health` and bypasses system HTTP proxies.
 

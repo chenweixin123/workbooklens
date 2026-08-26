@@ -12,12 +12,17 @@ from typer.testing import CliRunner
 import workbooklens.cli as cli_module
 from workbooklens.cli import app
 from workbooklens.demo.workflow import generate_demo_workbook
+from workbooklens.exceptions import UsageError
 from workbooklens.models import (
+    PatchDerivation,
     PatchKind,
     PatchOperation,
     PatchPlan,
     PatchPrecondition,
+    PatchResult,
     PatchRisk,
+    RecalculationProvider,
+    ValidationStatus,
 )
 from workbooklens.utils import sha256_file
 
@@ -31,25 +36,30 @@ def test_help_version_and_required_commands() -> None:
         assert command in help_result.stdout
     version_result = runner.invoke(app, ["--version"])
     assert version_result.exit_code == 0
-    assert "WorkbookLens 2.3.0" in version_result.stdout
+    assert "WorkbookLens 2.4.0" in version_result.stdout
 
 
-def test_apply_help_explains_layout_review_opt_in() -> None:
+def test_apply_help_explains_v3_repair_and_review_boundaries() -> None:
     result = runner.invoke(
         app,
         ["apply", "--help"],
         color=False,
-        terminal_width=160,
+        terminal_width=240,
     )
     help_text = unstyle(result.stdout)
 
     assert result.exit_code == 0
     assert "--accept-layout-risk" in help_text
+    assert "--accept-semantic-" in help_text
+    assert "--auto-repair" in help_text
+    assert "--recalc-provider" in help_text
     assert "--safe-only" in help_text
+    assert "--trust-workbook" in help_text
+    assert "formula-derived" in help_text
     assert "layout-review" in help_text
 
 
-def test_plan_reports_safe_and_layout_review_counts(
+def test_plan_reports_all_v3_risk_counts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -77,11 +87,42 @@ def test_plan_reports_safe_and_layout_review_counts(
         description="layout test patch",
         precondition=PatchPrecondition(cell_fingerprint="review-fingerprint"),
     )
+    formula_patch = PatchOperation(
+        id="formula-patch",
+        kind=PatchKind.SET_FORMULA,
+        sheet="Sheet1",
+        cell="B1",
+        after="=SUM(A1:A2)",
+        confidence=0.99,
+        safe=False,
+        risk=PatchRisk.FORMULA_DERIVED,
+        description="formula test patch",
+        precondition=PatchPrecondition(cell_fingerprint="formula-fingerprint"),
+        derivation=PatchDerivation(
+            strategy="peer_consensus",
+            sources=["peer_before:Sheet1!A1", "peer_after:Sheet1!A3"],
+            candidate_count=1,
+            invariants=["same_region"],
+            requires_recalculation=True,
+        ),
+    )
+    semantic_patch = PatchOperation(
+        id="semantic-patch",
+        kind=PatchKind.SET_NUMERIC,
+        sheet="Sheet1",
+        cell="C1",
+        after=89000,
+        confidence=0.99,
+        safe=False,
+        risk=PatchRisk.SEMANTIC_REVIEW,
+        description="semantic test patch",
+        precondition=PatchPrecondition(cell_fingerprint="semantic-fingerprint"),
+    )
     patch_plan = PatchPlan(
         tool_version="2.1.0",
         source_name="input.xlsx",
         source_sha256="abc123",
-        patches=[safe_patch, review_patch],
+        patches=[safe_patch, formula_patch, semantic_patch, review_patch],
     )
     monkeypatch.setattr(cli_module, "scan_workbook", lambda *args, **kwargs: object())
     monkeypatch.setattr(cli_module, "build_patch_plan", lambda _scan: patch_plan)
@@ -92,7 +133,204 @@ def test_plan_reports_safe_and_layout_review_counts(
     )
 
     assert result.exit_code == 0, result.stdout
-    assert "(1 safe, 1 layout review)" in result.stdout
+    normalized_output = " ".join(result.stdout.split())
+    assert "(1 safe, 1 formula-derived, 1 semantic review, 1 layout review)" in normalized_output
+
+
+@pytest.mark.parametrize(
+    "trust_option",
+    ["--trust-workbook", "--trust-workbook-for-recalculation"],
+)
+def test_apply_passes_auto_repair_and_recalculation_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    trust_option: str,
+) -> None:
+    plan_model = PatchPlan(
+        tool_version="2.4.0",
+        source_name="input.xlsx",
+        source_sha256="abc123",
+        patches=[],
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(cli_module, "load_patch_plan", lambda _path: plan_model)
+
+    def fake_apply(*_args: object, **kwargs: object) -> PatchResult:
+        captured.update(kwargs)
+        return PatchResult(
+            source_sha256="source",
+            output_sha256="output",
+            output_path=str(tmp_path / "fixed.xlsx"),
+            applied_patch_ids=["safe-patch"],
+            package_changes=[],
+            recalculation_provider=RecalculationProvider.EXCEL,
+            formula_errors_before=["Sheet1!A1=#VALUE!"],
+            formula_errors_after=[],
+            validation_status=ValidationStatus.PASSED,
+        )
+
+    monkeypatch.setattr(cli_module, "apply_patch_plan", fake_apply)
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            str(tmp_path / "input.xlsx"),
+            str(tmp_path / "plan.json"),
+            "--out",
+            str(tmp_path / "fixed.xlsx"),
+            "--auto-repair",
+            "--recalc-provider",
+            "excel",
+            trust_option,
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert captured["auto_repair"] is True
+    assert captured["recalc_provider"] == "excel"
+    assert captured["trust_workbook_for_recalculation"] is True
+    assert captured["accept_semantic_risk"] is False
+    assert "formula errors 1 → 0" in result.stdout
+    assert "validation: Passed" in result.stdout
+
+
+def test_apply_auto_repair_with_none_provider_is_forwarded_for_safe_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan_model = PatchPlan(
+        tool_version="2.4.0",
+        source_name="input.xlsx",
+        source_sha256="abc123",
+        patches=[],
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(cli_module, "load_patch_plan", lambda _path: plan_model)
+
+    def fake_apply(*_args: object, **kwargs: object) -> PatchResult:
+        captured.update(kwargs)
+        return PatchResult(
+            source_sha256="source",
+            output_sha256="output",
+            output_path=str(tmp_path / "fixed.xlsx"),
+            applied_patch_ids=["safe-patch"],
+            package_changes=[],
+            downgraded_patch_ids=["formula-patch"],
+            validation_status=ValidationStatus.DEGRADED,
+        )
+
+    monkeypatch.setattr(cli_module, "apply_patch_plan", fake_apply)
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            str(tmp_path / "input.xlsx"),
+            str(tmp_path / "plan.json"),
+            "--out",
+            str(tmp_path / "fixed.xlsx"),
+            "--auto-repair",
+            "--recalc-provider",
+            "none",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert captured["auto_repair"] is True
+    assert captured["recalc_provider"] == "none"
+    assert captured["trust_workbook_for_recalculation"] is False
+    assert "1 patches" in result.stdout
+    assert "downgraded: 1" in result.stdout
+
+
+def test_apply_auto_repair_forwards_explicit_semantic_selection_and_consent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan_model = PatchPlan(
+        tool_version="2.4.0",
+        source_name="input.xlsx",
+        source_sha256="abc123",
+        patches=[],
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(cli_module, "load_patch_plan", lambda _path: plan_model)
+
+    def fake_apply(*_args: object, **kwargs: object) -> PatchResult:
+        captured.update(kwargs)
+        return PatchResult(
+            source_sha256="source",
+            output_sha256="output",
+            output_path=str(tmp_path / "fixed.xlsx"),
+            applied_patch_ids=["semantic-patch"],
+            package_changes=[],
+            recalculation_provider=RecalculationProvider.EXCEL,
+            validation_status=ValidationStatus.PASSED,
+        )
+
+    monkeypatch.setattr(cli_module, "apply_patch_plan", fake_apply)
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            str(tmp_path / "input.xlsx"),
+            str(tmp_path / "plan.json"),
+            "--out",
+            str(tmp_path / "fixed.xlsx"),
+            "--auto-repair",
+            "--patch-id",
+            "semantic-patch",
+            "--accept-semantic-risk",
+            "--recalc-provider",
+            "excel",
+            "--trust-workbook",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert captured["selected_ids"] == ["semantic-patch"]
+    assert captured["auto_repair"] is True
+    assert captured["accept_semantic_risk"] is True
+
+
+def test_apply_explicit_formula_patch_with_none_provider_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan_model = PatchPlan(
+        tool_version="2.4.0",
+        source_name="input.xlsx",
+        source_sha256="abc123",
+        patches=[],
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(cli_module, "load_patch_plan", lambda _path: plan_model)
+
+    def reject_formula(*_args: object, **kwargs: object) -> PatchResult:
+        captured.update(kwargs)
+        raise UsageError("Formula-derived patches require recalculation authorization")
+
+    monkeypatch.setattr(cli_module, "apply_patch_plan", reject_formula)
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            str(tmp_path / "input.xlsx"),
+            str(tmp_path / "plan.json"),
+            "--out",
+            str(tmp_path / "fixed.xlsx"),
+            "--patch-id",
+            "formula-patch",
+            "--recalc-provider",
+            "none",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert captured["selected_ids"] == ["formula-patch"]
+    assert captured["recalc_provider"] == "none"
+    assert "WL-REQ-001" in result.stdout
+    assert not (tmp_path / "fixed.xlsx.apply.json").exists()
 
 
 def test_scan_outputs_and_fail_on_exit_code(tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-version: 2
+version: 3
 workbook:
   max_critical_findings: 0
   max_error_findings: 0
@@ -6,6 +6,36 @@ keys:
   - sheet: Invoices
     range: A2:A10000
     ignore_blank: true
+profile:
+  infer_semantics: true
+  report_trailing_whitespace: true
+  review_trailing_whitespace_patches: false
+  sheets:
+    - sheet: Invoices
+      range: A1:G10000
+      header_row: 1
+      columns:
+        - column: A
+          role: identifier
+          repair: report
+          required: true
+        - column: B
+          role: text
+          repair: auto
+          trim_trailing_whitespace: true
+        - column: C
+          role: email
+        - column: D
+          role: date
+          repair: auto
+        - column: F
+          role: currency
+          repair: auto
+        - column: G
+          role: category
+          repair: report
+          required: true
+          allowed_values: [Open, Paid, Void]
 suppressions:
   - id: accepted-template-volatility
     reason: Legacy template intentionally uses NOW() on the Cover sheet.

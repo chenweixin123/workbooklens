@@ -32,17 +32,26 @@ reproducer.
 
 | Version | Security support |
 |---|---|
-| 2.2.x | Supported |
-| 2.1.x and earlier | Upgrade required |
+| 2.4.x | Supported |
+| 2.3.x and earlier | Upgrade required |
 
 Security fixes land on main and are included in the next supported patch release. A GitHub
 Security Advisory may remain private until users have an upgrade path.
 
 ## Security model
 
-WorkbookLens 2.2 does not execute formulas, VBA, embedded objects, or external links. It rejects
-packages that exceed entry, compressed/uncompressed size, compression-ratio, member-path,
-relationship, or XML limits. DTDs and entities are forbidden. .xlsm remains read-only.
+WorkbookLens 2.4 normal OOXML scan, test, diff, and direct repair do not execute formulas, VBA,
+embedded objects, or external links. It rejects packages that exceed entry,
+compressed/uncompressed size, compression-ratio, member-path, relationship, or XML limits. DTDs and
+entities are forbidden. `.xlsm` remains read-only.
+
+Two optional workflows cross that non-execution boundary and must be used only with files the user
+trusts: legacy `.xls` conversion and formula-repair recalculation validation. Both may open temporary
+copies in Microsoft Excel or LibreOffice. Although WorkbookLens disables macros, events, prompts,
+and automatic link updates where supported, the spreadsheet application may still process
+`WEBSERVICE`, data connections, or other workbook-defined behavior. Formula validation therefore
+requires a separate explicit trust confirmation; without it, lossless repair may continue but
+formula-derived candidates are not applied.
 
 Repairs require a matching source hash, matching target fingerprints, explicit safe patches, an
 exact changed-part allowlist, successful reopen, and a clean post-repair scan. Partial output is

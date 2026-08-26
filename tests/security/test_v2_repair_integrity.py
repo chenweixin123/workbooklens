@@ -19,9 +19,9 @@ from workbooklens.exceptions import (
     UsageError,
     WorkbookLensError,
 )
-from workbooklens.models import PatchKind, PatchOperation, PatchPlan
+from workbooklens.models import Confidence, PatchKind, PatchOperation, PatchPlan
 from workbooklens.ooxml.safety import PackageLimits, inspect_package
-from workbooklens.repair import apply_patch_plan, build_patch_plan
+from workbooklens.repair import build_patch_plan
 from workbooklens.scanner import scan_workbook
 from workbooklens.snapshot import cell_fingerprint
 from workbooklens.utils import sha256_file
@@ -48,11 +48,15 @@ def _mutate_after(patch: PatchOperation) -> None:
 
 
 def _mutate_safe(patch: PatchOperation) -> None:
-    patch.safe = False
+    # Model assignment validation blocks this invalid v3 state. Simulate a plan
+    # tampered after validation so the canonical-plan boundary is still exercised.
+    object.__setattr__(patch, "safe", True)
 
 
 def _mutate_confidence(patch: PatchOperation) -> None:
-    patch.confidence = 0.98
+    # Confidence itself is valid, but it violates the formula-derived >=0.99
+    # invariant. Bypass assignment validation to model a tampered payload in memory.
+    object.__setattr__(patch, "confidence", Confidence(0.98))
 
 
 def _mutate_kind(patch: PatchOperation) -> None:
@@ -87,7 +91,7 @@ def _mutate_cell(patch: PatchOperation) -> None:
     ("field", "mutate", "expected_error"),
     [
         ("after", _mutate_after, PatchValidationError),
-        ("safe", _mutate_safe, UsageError),
+        ("safe", _mutate_safe, PatchValidationError),
         ("confidence", _mutate_confidence, PatchValidationError),
         ("kind", _mutate_kind, PatchValidationError),
         ("source_cell", _mutate_source_cell, PatchValidationError),
@@ -98,7 +102,7 @@ def _mutate_cell(patch: PatchOperation) -> None:
         ("cell", _mutate_cell, StalePlanError),
     ],
 )
-def test_apply_rejects_every_tampered_patch_field_without_output(
+def test_low_level_apply_rejects_every_tampered_patch_field_without_output(
     tmp_path: Path,
     field: str,
     mutate: Callable[[PatchOperation], None],
@@ -106,13 +110,21 @@ def test_apply_rejects_every_tampered_patch_field_without_output(
 ) -> None:
     source = tmp_path / f"source-{field}.xlsx"
     generate_demo_workbook(source)
-    submitted = _plan(source)
+    canonical = _plan(source)
+    submitted = canonical.model_copy(deep=True)
     patch = _formula_patch(submitted)
     mutate(patch)
     output = tmp_path / f"fixed-{field}.xlsx"
 
     with pytest.raises(expected_error):
-        apply_patch_plan(source, submitted, output, selected_ids={patch.id}, config=SCAN_CONFIG)
+        ooxml_patch.patch_ooxml_package(
+            source,
+            submitted,
+            output,
+            selected_ids={patch.id},
+            accept_formula_derived=True,
+            canonical_plan=canonical,
+        )
 
     assert not output.exists()
 
@@ -216,7 +228,7 @@ def test_precondition_analysis_receives_original_package_limits(
     output = tmp_path / "limits-fixed.xlsx"
     limits = PackageLimits()
     received: list[PackageLimits | None] = []
-    original_load = ooxml_patch.load_for_analysis
+    original_load = ooxml_patch.load_for_analysis  # type: ignore[attr-defined]
 
     def recording_load(path: Path, active_limits: PackageLimits | None) -> Any:
         received.append(active_limits)

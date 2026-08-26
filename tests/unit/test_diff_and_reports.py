@@ -81,6 +81,40 @@ def test_semantic_diff_covers_cell_and_structure_changes(tmp_path: Path) -> None
     assert formula_change.before_signature != formula_change.after_signature
 
 
+def test_snapshot_and_diff_round_trip_worksheet_local_defined_names(tmp_path: Path) -> None:
+    before = Workbook()
+    before_sheet = before.active
+    assert before_sheet is not None
+    before_sheet.title = "Data"
+    before_sheet["B2"] = 1
+    before_sheet.defined_names.add(DefinedName("LocalRate", attr_text="'Data'!$B$2"))
+    before_path = tmp_path / "local-name-before.xlsx"
+    before.save(before_path)
+    before.close()
+
+    after = Workbook()
+    after_sheet = after.active
+    assert after_sheet is not None
+    after_sheet.title = "Data"
+    after_sheet["B3"] = 2
+    after_sheet.defined_names.add(DefinedName("LocalRate", attr_text="'Data'!$B$3"))
+    after_path = tmp_path / "local-name-after.xlsx"
+    after.save(after_path)
+    after.close()
+
+    snapshot = create_snapshot(before_path)
+    assert snapshot.defined_names == {"LocalRate@sheet:0": "'Data'!$B$2"}
+
+    changes = compare_workbooks(before_path, after_path).structural_changes
+    change = next(
+        item
+        for item in changes
+        if item.change_type == "defined_name" and item.subject == "LocalRate@sheet:0"
+    )
+    assert change.before == "'Data'!$B$2"
+    assert change.after == "'Data'!$B$3"
+
+
 def test_semantic_diff_is_value_type_sensitive(tmp_path: Path) -> None:
     before = Workbook()
     before.active["A1"] = 1

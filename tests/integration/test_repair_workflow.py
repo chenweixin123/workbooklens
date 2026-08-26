@@ -8,13 +8,16 @@ from lxml import etree
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import LineChart, Reference
 
+import workbooklens.repair.engine as repair_engine
+from workbooklens import conversion
 from workbooklens.demo import run_demo
 from workbooklens.demo.workflow import DemoOutput, generate_demo_workbook
 from workbooklens.exceptions import PatchValidationError, StalePlanError, UsageError
-from workbooklens.models import PatchPlan, PatchResult
+from workbooklens.models import PatchKind, PatchPlan, PatchResult, PatchRisk
 from workbooklens.repair import apply_patch_plan, build_patch_plan
 from workbooklens.repair.ooxml_patch import patch_ooxml_package
 from workbooklens.repair.planning import load_patch_plan
+from workbooklens.repair.recalculation import RecalculationValidation
 from workbooklens.scanner import scan_workbook
 from workbooklens.utils import sha256_file
 
@@ -29,12 +32,26 @@ def _plan(path: Path) -> PatchPlan:
     return build_patch_plan(scan_workbook(path, config=config))
 
 
-def test_demo_applies_four_safe_patch_types_and_reopens(completed_demo: DemoOutput) -> None:
+def _mock_recalculation(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = conversion.ConversionProvider(
+        "excel",
+        "Mock Microsoft Excel",
+        Path("excel.exe"),
+    )
+    monkeypatch.setattr(repair_engine, "candidate_providers", lambda _preference: (provider,))
+    monkeypatch.setattr(
+        repair_engine,
+        "validate_formula_recalculation",
+        lambda *args, **kwargs: RecalculationValidation(provider, (), ()),
+    )
+
+
+def test_demo_applies_two_safe_patch_types_and_reopens(completed_demo: DemoOutput) -> None:
     plan = PatchPlan.model_validate_json(completed_demo.repair_plan.read_text(encoding="utf-8"))
     report_path = completed_demo.directory / "apply-report.json"
     result = PatchResult.model_validate_json(report_path.read_text(encoding="utf-8"))
     safe_patch_ids = {patch.id for patch in plan.patches if patch.safe_only_eligible}
-    assert len(safe_patch_ids) == 4
+    assert len(safe_patch_ids) == 2
     assert len(plan.patches) >= len(safe_patch_ids)
     assert plan.findings
     assert {finding.id for finding in plan.findings} == set(plan.finding_ids)
@@ -43,8 +60,8 @@ def test_demo_applies_four_safe_patch_types_and_reopens(completed_demo: DemoOutp
     assert result.source_sha256 == sha256_file(completed_demo.before_workbook)
     assert result.output_sha256 == sha256_file(completed_demo.after_workbook)
     workbook = load_workbook(completed_demo.after_workbook, read_only=True, data_only=False)
-    assert workbook["Sales"]["D8"].value == "=B8*C8"
-    assert workbook["Sales"]["E12"].value == "=D12*0.08"
+    assert workbook["Sales"]["D8"].value is None
+    assert workbook["Sales"]["E12"].value == 999
     assert workbook["Sales"]["B10"].value == 12
     assert workbook["Summary"]["B10"].value == "=SUM(B2:B8)"
     workbook.close()
@@ -57,10 +74,7 @@ def test_only_manifested_parts_change_and_chart_is_byte_identical(
         (completed_demo.directory / "apply-report.json").read_text(encoding="utf-8")
     )
     changed = {change.part for change in result.package_changes}
-    assert changed == {
-        "xl/workbook.xml",
-        "xl/worksheets/sheet1.xml",
-    }
+    assert changed == {"xl/worksheets/sheet1.xml"}
     with (
         zipfile.ZipFile(completed_demo.before_workbook) as before_archive,
         zipfile.ZipFile(completed_demo.after_workbook) as after_archive,
@@ -73,7 +87,10 @@ def test_only_manifested_parts_change_and_chart_is_byte_identical(
                 assert before_archive.read(name) == after_archive.read(name), name
 
 
-def test_chartsheet_is_skipped_and_preserved_during_scan_and_apply(tmp_path: Path) -> None:
+def test_chartsheet_is_skipped_and_preserved_during_scan_and_apply(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "chartsheet-source.xlsx"
     workbook = Workbook()
     worksheet = workbook.active
@@ -96,7 +113,15 @@ def test_chartsheet_is_skipped_and_preserved_during_scan_and_apply(tmp_path: Pat
     assert any(patch.cell == "C12" for patch in scan.patches)
     plan = build_patch_plan(scan)
     output = tmp_path / "chartsheet-fixed.xlsx"
-    apply_patch_plan(source, plan, output, safe_only=True)
+    _mock_recalculation(monkeypatch)
+    apply_patch_plan(
+        source,
+        plan,
+        output,
+        auto_repair=True,
+        recalc_provider="excel",
+        trust_workbook_for_recalculation=True,
+    )
 
     with zipfile.ZipFile(source) as before, zipfile.ZipFile(output) as after:
         preserved = [
@@ -117,11 +142,22 @@ def test_chartsheet_is_skipped_and_preserved_during_scan_and_apply(tmp_path: Pat
         reopened.close()
 
 
-def test_formula_repairs_remove_cache_and_request_full_recalculation(
-    completed_demo: DemoOutput,
-) -> None:
+def test_formula_repairs_remove_cache_and_request_full_recalculation(tmp_path: Path) -> None:
+    source = tmp_path / "source.xlsx"
+    generate_demo_workbook(source)
+    plan = _plan(source)
+    formula_patch = next(patch for patch in plan.patches if patch.cell == "D8")
+    output = tmp_path / "formula-fixed.xlsx"
+    patch_ooxml_package(
+        source,
+        plan,
+        output,
+        selected_ids={formula_patch.id},
+        accept_formula_derived=True,
+        canonical_plan=plan,
+    )
     namespaces = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    with zipfile.ZipFile(completed_demo.after_workbook) as archive:
+    with zipfile.ZipFile(output) as archive:
         workbook_root = etree.fromstring(archive.read("xl/workbook.xml"))
         calc = workbook_root.find("x:calcPr", namespaces)
         assert calc is not None
@@ -133,6 +169,84 @@ def test_formula_repairs_remove_cache_and_request_full_recalculation(
         assert cell is not None
         assert cell.find("x:f", namespaces) is not None
         assert cell.find("x:v", namespaces) is None
+
+
+def test_profile_semantic_repair_applies_reopens_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "semantic-source.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    worksheet.title = "Data"
+    worksheet.append(["Hours", "Cost"])
+    for row in range(2, 23):
+        worksheet.append([row, f"=A{row}*100"])
+    worksheet["A12"] = "八小时"
+    workbook.save(source)
+    workbook.close()
+
+    config = {
+        "version": 3,
+        "profile": {
+            "infer_semantics": True,
+            "sheets": [
+                {
+                    "sheet": "Data",
+                    "range": "A1:B22",
+                    "header_row": 1,
+                    "columns": [
+                        {
+                            "header": "Hours",
+                            "role": "number",
+                            "repair": "review",
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+    before_scan = scan_workbook(source, config=config)
+    plan = build_patch_plan(before_scan)
+    semantic = next(
+        patch
+        for patch in plan.patches
+        if patch.cell == "A12" and patch.kind == PatchKind.SET_NUMERIC
+    )
+    assert semantic.risk == PatchRisk.SEMANTIC_REVIEW
+    assert semantic.before == "八小时"
+    assert semantic.after == 8
+    assert semantic.derivation.candidate_count == 1
+    assert semantic.derivation.requires_recalculation
+
+    output = tmp_path / "semantic-fixed.xlsx"
+    _mock_recalculation(monkeypatch)
+    result = apply_patch_plan(
+        source,
+        plan,
+        output,
+        selected_ids={semantic.id},
+        accept_semantic_risk=True,
+        recalc_provider="excel",
+        trust_workbook_for_recalculation=True,
+        config=config,
+    )
+
+    assert result.applied_patch_ids == [semantic.id]
+    assert result.recalculation_provider.value == "excel"
+    assert not result.rollback_performed
+    reopened = load_workbook(output, read_only=True, data_only=False)
+    try:
+        assert reopened["Data"]["A12"].value == 8
+        assert reopened["Data"]["B12"].value == "=A12*100"
+    finally:
+        reopened.close()
+
+    after_scan = scan_workbook(output, config=config)
+    assert not any(
+        patch.cell == "A12" and patch.kind == PatchKind.SET_NUMERIC for patch in after_scan.patches
+    )
 
 
 def test_stale_source_hash_fails_without_output(tmp_path: Path) -> None:
@@ -263,11 +377,13 @@ def test_shared_formula_source_is_never_auto_patched(tmp_path: Path) -> None:
 
     original_plan.source_sha256 = sha256_file(path)
     with pytest.raises(PatchValidationError, match="intersects an unsupported shared"):
-        apply_patch_plan(
+        patch_ooxml_package(
             path,
             original_plan,
             tmp_path / "fixed.xlsx",
             selected_ids={original_patch.id},
+            accept_formula_derived=True,
+            canonical_plan=plan,
         )
 
 
@@ -294,11 +410,13 @@ def test_array_and_data_table_ranges_are_never_auto_patched(
     assert not any(patch.cell == "D12" for patch in scan.patches)
     original_plan.source_sha256 = sha256_file(path)
     with pytest.raises(PatchValidationError, match=f"unsupported {formula_type}"):
-        apply_patch_plan(
+        patch_ooxml_package(
             path,
             original_plan,
             tmp_path / f"{formula_type}-fixed.xlsx",
             selected_ids={original_patch.id},
+            accept_formula_derived=True,
+            canonical_plan=build_patch_plan(scan),
         )
 
 
@@ -310,7 +428,14 @@ def test_edited_plan_cannot_inject_structured_formula(tmp_path: Path) -> None:
     patch.after = "=Table1[Amount]"
     output = tmp_path / "fixed.xlsx"
     with pytest.raises(PatchValidationError, match="structured"):
-        apply_patch_plan(source, plan, output, selected_ids={patch.id})
+        patch_ooxml_package(
+            source,
+            plan,
+            output,
+            selected_ids={patch.id},
+            accept_formula_derived=True,
+            canonical_plan=_plan(source),
+        )
     assert not output.exists()
 
 

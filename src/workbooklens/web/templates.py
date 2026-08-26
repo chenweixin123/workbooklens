@@ -158,6 +158,7 @@ TEMPLATES = {
     .file-name { min-width: 0; color: var(--muted); overflow-wrap: anywhere; }
     .field-hint, .status-text { margin: 0; color: var(--muted); font-size: 13px; }
     .form-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
+    .selection-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin: 0 0 12px; }
     button, .button {
       display: inline-flex;
       align-items: center;
@@ -188,6 +189,11 @@ TEMPLATES = {
     .section-title { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
     .section-title p { margin: 0; color: var(--muted); font-size: 13px; }
     .patch-list, .finding-list { display: grid; gap: 9px; }
+    .patch-group { display: grid; gap: 9px; margin-top: 16px; }
+    .patch-group:first-child { margin-top: 0; }
+    .patch-group-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .patch-group-heading p { margin: 3px 0 0; color: var(--muted); font-size: 13px; }
+    .patch-count { flex: 0 0 auto; color: var(--muted); font-size: 13px; }
     .patch-row, .finding-row { display: block; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; }
     .patch-row { position: relative; padding: 14px 16px 14px 46px; cursor: pointer; }
     .patch-row:hover { border-color: var(--focus); }
@@ -196,7 +202,8 @@ TEMPLATES = {
     .patch-location { font-weight: 700; }
     .badge { display: inline-flex; align-items: center; min-height: 23px; padding: 2px 7px; border-radius: 5px; background: var(--surface-soft); border: 1px solid var(--line); color: var(--muted); font-size: 12px; font-weight: 650; }
     .badge.safe, .badge.info { color: var(--success); background: var(--success-soft); border-color: #b8dfc9; }
-    .badge.layout_review, .badge.warning { color: var(--warning); background: var(--warning-soft); border-color: #ead58a; }
+    .badge.formula_derived { color: var(--accent); background: var(--accent-soft); border-color: #c7dfef; }
+    .badge.layout_review, .badge.semantic_review, .badge.warning { color: var(--warning); background: var(--warning-soft); border-color: #ead58a; }
     .badge.error, .badge.critical { color: var(--danger); background: var(--danger-soft); border-color: #efbbb5; }
     .patch-description { margin: 7px 0 0; color: var(--muted); }
     .change { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 9px; align-items: center; margin-top: 10px; }
@@ -221,6 +228,14 @@ TEMPLATES = {
     .result-heading { display: flex; gap: 15px; align-items: flex-start; margin-bottom: 18px; }
     .result-heading p { margin: 5px 0 0; color: var(--muted); }
     .result-actions { display: flex; gap: 9px; flex-wrap: wrap; margin-top: 18px; }
+    .result-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+    .result-detail-section { min-width: 0; padding: 0 18px 0 0; }
+    .result-detail-section + .result-detail-section { padding: 0 0 0 18px; border-left: 1px solid var(--line); }
+    .result-detail-section h2 { margin-bottom: 10px; font-size: 16px; }
+    .result-detail-section dl { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px 12px; margin: 0; }
+    .result-detail-section dt { color: var(--muted); }
+    .result-detail-section dd { margin: 0; text-align: right; font-weight: 650; overflow-wrap: anywhere; }
+    .result-detail-section ul { display: grid; gap: 7px; margin: 0; padding-left: 20px; }
     .diagnostic { margin-top: 16px; padding-top: 13px; border-top: 1px solid var(--line); }
     .diagnostic dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 12px; margin: 10px 0 0; }
     .diagnostic dt { color: var(--muted); }
@@ -237,6 +252,9 @@ TEMPLATES = {
       .page-heading { display: block; }
       .change { grid-template-columns: 1fr; }
       .arrow { transform: rotate(90deg); width: max-content; }
+      .result-details { grid-template-columns: 1fr; gap: 16px; }
+      .result-detail-section, .result-detail-section + .result-detail-section { padding: 0; border-left: 0; }
+      .result-detail-section + .result-detail-section { padding-top: 16px; border-top: 1px solid var(--line); }
     }
     @media (max-width: 420px) {
       .brand-mark { display: none; }
@@ -304,6 +322,16 @@ TEMPLATES = {
           <p id="workbook-hint" class="field-hint">{{ t("web.scan_hint") }}</p>
         </div>
       </div>
+      <div class="upload-field">
+        <span id="profile-label" class="field-label">{{ t("web.profile_label") }}</span>
+        <div class="upload-box">
+          <div class="file-picker-row">
+            <label class="file-picker-control"><span id="profile-choose">{{ t("web.file_choose") }}</span><input id="profile" name="profile" type="file" accept=".yml,.yaml" aria-labelledby="profile-label profile-choose" aria-describedby="profile-file-name profile-hint"></label>
+            <span id="profile-file-name" class="file-name" aria-live="polite">{{ t("web.file_none") }}</span>
+          </div>
+          <p id="profile-hint" class="field-hint">{{ t("web.profile_hint") }}</p>
+        </div>
+      </div>
       <div class="form-actions">
         <button id="scan-button" type="submit">{{ t("web.scan_button") }}</button>
         <p id="scan-status" class="status-text" aria-live="polite">{{ t("web.scan_limit", max_mb=max_mb) }}</p>
@@ -361,6 +389,7 @@ TEMPLATES = {
     update();
   };
   bindFileSelection('workbook', 'workbook-file-name', {{ t("web.file_none")|tojson }});
+  bindFileSelection('profile', 'profile-file-name', {{ t("web.file_none")|tojson }});
   bindFileSelection('legacy-workbook', 'legacy-workbook-file-name', {{ t("web.file_none")|tojson }});
   bindBusyState('scan-form', 'scan-button', 'scan-status', {{ t("web.scan_running")|tojson }}, {{ t("web.scan_running_detail")|tojson }});
   bindBusyState('convert-form', 'convert-button', 'convert-status', {{ t("web.convert_running")|tojson }}, {{ t("web.convert_running_detail")|tojson }});
@@ -386,17 +415,34 @@ TEMPLATES = {
   <form id="apply-form" action="/sessions/{{ session_id }}/apply" method="post">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="language" value="{{ language }}">
-    {% if patches %}<div class="patch-list">
-    {% for patch in patches %}
-      <label class="patch-row">
-        <input type="checkbox" name="patch_id" value="{{ patch.id }}" data-risk="{{ patch.risk.value }}">
-        <span class="patch-heading"><span class="patch-location">{{ patch.sheet }}!{{ patch.cell }}</span><span class="badge">{{ t("patch_kind." ~ patch.kind.value) }}</span><span class="badge {{ patch.risk.value }}">{{ t("risk." ~ patch.risk.value) }}</span><span class="badge">{{ t("web.confidence", percent='%.0f'|format(patch.confidence.root * 100)) }}</span></span>
-        <span class="patch-description">{{ patch.description }}</span>
-        <span class="change"><code>{{ display_value(patch.before) }}</code><span class="arrow" aria-hidden="true">&rarr;</span><code>{{ display_value(patch.after) }}</code></span>
-      </label>
+    <input id="repair-mode" type="hidden" name="auto_repair" value="false">
+    {% if patches %}<aside class="notice"><span class="notice-icon" aria-hidden="true">i</span><div><strong>{{ t("web.results_auto_repair") }}</strong><p>{{ t("web.results_auto_repair_help") }}</p></div></aside><div class="selection-actions">
+      <button id="select-all-patches" class="secondary" type="button" aria-controls="patch-list">{{ t("web.results_select_all") }}</button>
+      <button id="clear-all-patches" class="secondary" type="button" aria-controls="patch-list" disabled>{{ t("web.results_clear_all") }}</button>
+      <p id="patch-selection-status" class="status-text" aria-live="polite">{{ t("web.results_selection_count", selected=0, total=patches|length) }}</p>
+    </div><div id="patch-list" class="patch-list">
+    {% for risk in ("safe", "formula_derived", "semantic_review", "layout_review") %}
+      {% set group = patch_groups[risk] %}{% if group %}<section class="patch-group" data-risk-group="{{ risk }}">
+        <div class="patch-group-heading"><div><h3>{% if risk == "safe" %}{{ t("web.patch_group_safe") }}{% elif risk == "formula_derived" %}{{ t("web.patch_group_formula_derived") }}{% elif risk == "semantic_review" %}{{ t("web.patch_group_semantic_review") }}{% else %}{{ t("web.patch_group_layout_review") }}{% endif %}</h3><p>{% if risk == "safe" %}{{ t("web.patch_group_safe_help") }}{% elif risk == "formula_derived" %}{{ t("web.patch_group_formula_derived_help") }}{% elif risk == "semantic_review" %}{{ t("web.patch_group_semantic_review_help") }}{% else %}{{ t("web.patch_group_layout_review_help") }}{% endif %}</p></div><span class="patch-count">{{ group|length }}</span></div>
+        {% for patch in group %}<label class="patch-row">
+          <input type="checkbox" name="patch_id" value="{{ patch.id }}" data-risk="{{ patch.risk.value }}" data-auto-selectable="{% if patch.risk.value == 'safe' or patch.risk.value == 'formula_derived' %}true{% else %}false{% endif %}">
+          <span class="patch-heading"><span class="patch-location">{{ patch.sheet }}!{{ patch.cell }}</span><span class="badge">{{ t("patch_kind." ~ patch.kind.value) }}</span><span class="badge {{ patch.risk.value }}">{{ t("risk." ~ patch.risk.value) }}</span><span class="badge">{{ t("web.confidence", percent='%.0f'|format(patch.confidence.root * 100)) }}</span></span>
+          <span class="patch-description">{{ patch.description }}</span>
+          <span class="change"><code>{{ display_value(patch.before) }}</code><span class="arrow" aria-hidden="true">&rarr;</span><code>{{ display_value(patch.after) }}</code></span>
+          {% if patch.risk.value == 'semantic_review' %}<details class="patch-evidence"><summary>{{ t("web.patch_derivation_evidence") }}</summary><dl>
+            <dt>{{ t("web.patch_derivation_strategy") }}</dt><dd><code>{{ patch.derivation.strategy }}</code></dd>
+            <dt>{{ t("web.patch_candidate_count") }}</dt><dd>{{ patch.derivation.candidate_count }}</dd>
+            <dt>{{ t("web.patch_evidence_sources") }}</dt><dd>{% if patch.derivation.sources %}<code>{{ patch.derivation.sources|join(', ') }}</code>{% else %}{{ t("web.applied_none") }}{% endif %}</dd>
+            <dt>{{ t("web.patch_invariants") }}</dt><dd>{% if patch.derivation.invariants %}<code>{{ patch.derivation.invariants|join(', ') }}</code>{% else %}{{ t("web.applied_none") }}{% endif %}</dd>
+            <dt>{{ t("web.patch_requires_recalculation") }}</dt><dd>{{ t("common.yes") if patch.derivation.requires_recalculation else t("common.no") }}</dd>
+          </dl></details>{% endif %}
+        </label>{% endfor %}
+      </section>{% endif %}
     {% endfor %}</div>
+    {% if patch_groups.formula_derived %}<label class="consent trust-consent"><input type="checkbox" name="trust_workbook_for_recalculation" value="true"><span><strong>{{ t("web.results_recalculation_consent") }}</strong><span>{{ t("web.recalculation_consent_body") }}</span></span></label>{% endif %}
+    {% if has_semantic_review %}<label class="consent"><input type="checkbox" name="accept_semantic_risk" value="true"><span><strong>{{ t("web.results_semantic_consent") }}</strong><span>{{ t("web.semantic_consent_body") }}</span></span></label>{% endif %}
     {% if has_layout_review %}<label class="consent"><input type="checkbox" name="accept_layout_risk" value="true"><span><strong>{{ t("web.results_layout_consent") }}</strong><span>{{ t("web.layout_consent_body") }}</span></span></label>{% endif %}
-    <div class="form-actions"><button id="apply-button" type="submit">{{ t("web.results_apply") }}</button><p id="apply-status" class="status-text" aria-live="polite"></p></div>
+    <div class="form-actions">{% if patch_groups.safe or patch_groups.formula_derived %}<button id="auto-repair-button" type="submit">{{ t("web.results_auto_repair") }}</button>{% endif %}<button id="apply-button" class="secondary" type="submit" disabled>{{ t("web.results_apply") }}</button><p id="apply-status" class="status-text" aria-live="polite"></p></div>
     {% else %}<div class="empty-state">{{ t("web.results_no_patches") }}</div>{% endif %}
   </form>
 </section>
@@ -406,17 +452,75 @@ TEMPLATES = {
   {% for finding in findings %}<article class="finding-row {{ finding.severity.value }}">
     <div class="finding-meta"><span class="badge {{ finding.severity.value }}">{{ t("severity." ~ finding.severity.value) }}</span><span class="badge">{{ finding.rule_id }}</span><span>{{ finding.sheet or t("web.results_workbook_scope") }}{% if finding.location %}!{{ finding.location }}{% endif %}</span></div>
     <h3>{{ finding.title }}</h3><p>{{ finding.explanation }}</p>
-    <details><summary>{{ t("web.results_evidence") }}</summary><div class="evidence-grid"><span>{{ finding.evidence.summary }}</span><code>{{ display_value(finding.evidence.observed) }}</code></div></details>
+      <details><summary>{{ t("web.results_evidence") }}</summary><div class="evidence-grid"><span>{{ finding.evidence.summary }}</span><code>{{ display_evidence(finding.evidence.observed) }}</code>{% if finding.evidence.details %}<code>{{ display_evidence(finding.evidence.details) }}</code>{% endif %}</div></details>
   </article>{% endfor %}
   </div>{% else %}<div class="empty-state">{{ t("web.no_findings") }}</div>{% endif %}
 </section>
 {% endblock %}{% block script %}
 <script>
   const applyForm = document.getElementById('apply-form');
-  if (applyForm) applyForm.addEventListener('submit', () => {
-    const button = document.getElementById('apply-button');
+  const patchCheckboxes = applyForm ? Array.from(
+    applyForm.querySelectorAll('#patch-list input[name="patch_id"]:not(:disabled)')
+  ) : [];
+  const autoSelectableCheckboxes = patchCheckboxes.filter(
+    (checkbox) => checkbox.dataset.autoSelectable === 'true'
+  );
+  const selectAllButton = document.getElementById('select-all-patches');
+  const clearAllButton = document.getElementById('clear-all-patches');
+  const applyButton = document.getElementById('apply-button');
+  const repairModeInput = document.getElementById('repair-mode');
+  const patchSelectionStatus = document.getElementById('patch-selection-status');
+  const selectionCountTemplate = {{ t("web.results_selection_count", selected="__SELECTED__", total="__TOTAL__")|tojson }};
+
+  const updatePatchSelectionControls = () => {
+    const selectedCount = patchCheckboxes.filter((checkbox) => checkbox.checked).length;
+    const selectedAutoCount = autoSelectableCheckboxes.filter(
+      (checkbox) => checkbox.checked
+    ).length;
+    if (selectAllButton) {
+      selectAllButton.disabled = autoSelectableCheckboxes.length === 0 ||
+        selectedAutoCount === autoSelectableCheckboxes.length;
+    }
+    if (clearAllButton) clearAllButton.disabled = selectedCount === 0;
+    if (applyButton) applyButton.disabled = selectedCount === 0;
+    if (patchSelectionStatus) {
+      patchSelectionStatus.textContent = selectionCountTemplate
+        .replace('__SELECTED__', String(selectedCount))
+        .replace('__TOTAL__', String(patchCheckboxes.length));
+    }
+  };
+
+  if (selectAllButton) selectAllButton.addEventListener('click', () => {
+    autoSelectableCheckboxes.forEach((checkbox) => { checkbox.checked = true; });
+    if (document.activeElement === selectAllButton && clearAllButton) {
+      clearAllButton.disabled = false;
+      clearAllButton.focus();
+    }
+    updatePatchSelectionControls();
+  });
+  if (clearAllButton) clearAllButton.addEventListener('click', () => {
+    patchCheckboxes.forEach((checkbox) => { checkbox.checked = false; });
+    if (document.activeElement === clearAllButton && selectAllButton) {
+      selectAllButton.disabled = false;
+      selectAllButton.focus();
+    }
+    updatePatchSelectionControls();
+  });
+  patchCheckboxes.forEach((checkbox) => {
+    checkbox.addEventListener('change', updatePatchSelectionControls);
+  });
+  updatePatchSelectionControls();
+
+  if (applyForm) applyForm.addEventListener('submit', (event) => {
+    const button = event.submitter;
     const status = document.getElementById('apply-status');
-    if (button) { button.disabled = true; button.textContent = {{ t("web.apply_running")|tojson }}; }
+    if (repairModeInput) {
+      repairModeInput.value = button && button.id === 'auto-repair-button' ? 'true' : 'false';
+    }
+    if (selectAllButton) selectAllButton.disabled = true;
+    if (clearAllButton) clearAllButton.disabled = true;
+    applyForm.querySelectorAll('button').forEach((item) => { item.disabled = true; });
+    if (button) button.textContent = {{ t("web.apply_running")|tojson }};
     if (status) status.textContent = {{ t("web.apply_running_detail")|tojson }};
   });
 </script>
@@ -433,6 +537,18 @@ TEMPLATES = {
       <div class="metric"><span class="metric-value">{{ result.output_sha256[:8] }}</span><span class="metric-label">{{ t("web.metric_output_hash") }}</span></div>
     </div>
     <p>{{ t("web.applied_validation") }}</p>
+    <div class="result-details">
+      <section class="result-detail-section"><h2>{{ t("web.applied_recalculation_title") }}</h2><dl>
+        <dt>{{ t("web.applied_provider") }}</dt><dd>{{ t("recalc_provider." ~ result.recalculation_provider.value) }}</dd>
+        <dt>{{ t("web.applied_formula_before") }}</dt><dd>{{ result.formula_errors_before|length }}</dd>
+        <dt>{{ t("web.applied_formula_after") }}</dt><dd>{{ result.formula_errors_after|length }}</dd>
+        <dt>{{ t("web.applied_validation_status") }}</dt><dd>{{ t("validation_status." ~ result.validation_status.value) }}</dd>
+        <dt>{{ t("web.applied_rollback") }}</dt><dd>{{ t("common.yes") if result.rollback_performed else t("common.no") }}</dd>
+        <dt>{{ t("web.applied_downgraded") }}</dt><dd>{% if result.downgraded_patch_ids %}<code>{{ result.downgraded_patch_ids|join(', ') }}</code>{% else %}{{ t("web.applied_none") }}{% endif %}</dd>
+        <dt>{{ t("web.applied_skipped") }}</dt><dd>{% if result.skipped_patch_ids %}<code>{{ result.skipped_patch_ids|join(', ') }}</code>{% else %}{{ t("web.applied_none") }}{% endif %}</dd>
+      </dl></section>
+      <section class="result-detail-section"><h2>{{ t("web.applied_locations_title") }}</h2>{% if modified_locations %}<ul>{% for location in modified_locations %}<li><code>{{ location }}</code></li>{% endfor %}</ul>{% else %}<p>{{ t("web.applied_no_locations") }}</p>{% endif %}</section>
+    </div>
     <div class="result-actions"><a class="button" href="/sessions/{{ session_id }}/fixed">{{ t("web.applied_download") }}</a><a class="button secondary" href="/sessions/{{ session_id }}/diff">{{ t("web.applied_diff") }}</a><a class="button secondary" href="/sessions/{{ session_id }}/apply-report">{{ t("web.applied_apply_report") }}</a></div>
   </div>
 </div>
@@ -443,6 +559,13 @@ TEMPLATES = {
     <div class="result-heading"><span class="result-mark error" aria-hidden="true">!</span><div><h1>{{ error.title }}</h1><p>{{ error.message }}</p></div></div>
     <aside class="notice warning"><span class="notice-icon" aria-hidden="true">i</span><div><strong>{{ t("web.error_suggestion") }}</strong><p>{{ error.suggestion }}</p></div></aside>
     <p>{{ t("web.error_source_safe") }}</p>
+    {% if failure_result %}<section class="result-detail-section"><h2>{{ t("web.error_repair_status_title") }}</h2><dl>
+      <dt>{{ t("web.applied_provider") }}</dt><dd>{{ t("recalc_provider." ~ failure_result.recalculation_provider.value) }}</dd>
+      <dt>{{ t("web.applied_formula_before") }}</dt><dd>{{ failure_result.formula_errors_before|length }}</dd>
+      <dt>{{ t("web.applied_formula_after") }}</dt><dd>{{ failure_result.formula_errors_after|length }}</dd>
+      <dt>{{ t("web.applied_validation_status") }}</dt><dd>{{ t("validation_status." ~ failure_result.validation_status.value) }}</dd>
+      <dt>{{ t("web.applied_rollback") }}</dt><dd>{{ t("common.yes") if failure_result.rollback_performed else t("common.no") }}</dd>
+    </dl>{% if failure_report_url %}<p><a class="button secondary" href="{{ failure_report_url }}">{{ t("web.error_failure_report_download") }}</a></p>{% endif %}</section>{% endif %}
     <details class="diagnostic"><summary>{{ t("web.error_details") }}</summary><dl><dt>{{ t("web.error_code") }}</dt><dd><code>{{ error.code }}</code></dd><dt>{{ t("web.error_diagnostic_id") }}</dt><dd><code>{{ error.diagnostic_id }}</code></dd></dl></details>
     <div class="result-actions"><a class="button" href="/?lang={{ language|urlencode }}">{{ t("web.error_retry") }}</a></div>
   </div>

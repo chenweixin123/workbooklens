@@ -17,6 +17,7 @@ from workbooklens.i18n import (
     assert_catalog_complete,
     assert_error_catalog_complete,
     canonical_text_translation,
+    localize_evidence_value,
     localize_exception,
     localize_finding,
     localize_scan_result,
@@ -34,10 +35,66 @@ from workbooklens.models import (
     WorkbookDiff,
 )
 from workbooklens.reports import write_scan_report
+from workbooklens.rules import default_registry
 from workbooklens.rules.builtin import BUILTIN_RULES
+from workbooklens.rules.data_quality import DATA_QUALITY_RULES
+from workbooklens.rules.formula_semantics import FORMULA_SEMANTIC_RULES
+from workbooklens.rules.inferred_semantics import INFERRED_SEMANTIC_RULES
+from workbooklens.rules.layout_geometry import LAYOUT_GEOMETRY_RULES
+from workbooklens.rules.print_quality import PRINT_QUALITY_RULES
+from workbooklens.rules.profile_quality import PROFILE_QUALITY_RULES
+from workbooklens.rules.relational_semantics import RELATIONAL_SEMANTIC_RULES
 from workbooklens.scanner import scan_workbook
 
 runner = CliRunner()
+
+
+def test_evidence_values_localize_recursively_without_mutating_input() -> None:
+    canonical = {
+        "proof": "propagated_formula_error",
+        "source_proof": [
+            {"font_size": 8, "fixed_total_pages": 3},
+            ("unknown_key", {"custom": "业务原文"}),
+        ],
+    }
+
+    chinese = localize_evidence_value(canonical, "zh-CN")
+    english = localize_evidence_value(canonical, "en")
+
+    assert chinese == {
+        "证明": "传播的公式错误",
+        "源证明": [
+            {"字号": 8, "固定总页数": 3},
+            ("unknown_key", {"custom": "业务原文"}),
+        ],
+    }
+    assert english == {
+        "Proof": "Propagated formula error",
+        "Source proof": [
+            {"Font size": 8, "Fixed total pages": 3},
+            ("unknown_key", {"custom": "业务原文"}),
+        ],
+    }
+    assert localize_evidence_value(
+        {"observed": ["proof", "formula", "numeric", "hidden", "Chart"]}, "zh-CN"
+    ) == {"实际值": ["proof", "formula", "numeric", "hidden", "Chart"]}
+    assert localize_evidence_value(
+        {"kind": ["formula", "numeric", "hidden", "Chart"]}, "zh-CN"
+    ) == {"类型": ["公式", "数值", "隐藏", "图表"]}
+    assert localize_evidence_value({"proof": 1, "证明": 2}, "zh-CN") == {
+        "proof": 1,
+        "证明": 2,
+    }
+    assert canonical == {
+        "proof": "propagated_formula_error",
+        "source_proof": [
+            {"font_size": 8, "fixed_total_pages": 3},
+            ("unknown_key", {"custom": "业务原文"}),
+        ],
+    }
+    assert chinese is not canonical
+    assert chinese["源证明"] is not canonical["source_proof"]
+    assert english["Source proof"] is not canonical["source_proof"]
 
 
 def test_catalogs_are_complete_and_locale_normalization_is_bounded() -> None:
@@ -47,11 +104,31 @@ def test_catalogs_are_complete_and_locale_normalization_is_bounded() -> None:
     assert normalize_language("en-US") == "en"
     assert normalize_language("fr") == "en"
     assert translate("severity.error", "zh-CN") == "错误"
+    assert translate("risk.formula_derived", "zh-CN") == "公式推导"
+    assert translate("risk.semantic_review", "zh-CN") == "需确认语义"
+    assert translate("patch_kind.normalize_text", "zh-CN") == "规范化数值"
+    assert translate("web.results_auto_repair", "zh-CN") == "一键安全修复"
+    assert translate("web.profile_label", "zh-CN") == "工作簿 Profile（可选 .yml 或 .yaml）"
+    assert translate("web.patch_derivation_evidence", "zh-CN") == "推导证据"
+    assert translate("web.patch_candidate_count", "zh-CN") == "候选数量"
+    assert translate("web.patch_requires_recalculation", "zh-CN") == "是否需要重算"
+    assert translate("validation_status.degraded", "zh-CN") == "已安全降级"
 
 
 def test_every_builtin_rule_has_exact_bilingual_title_coverage() -> None:
-    emitted = {rule.rule_id: rule.title for rule in BUILTIN_RULES}
+    all_rule_types = (
+        *BUILTIN_RULES,
+        *DATA_QUALITY_RULES,
+        *PROFILE_QUALITY_RULES,
+        *INFERRED_SEMANTIC_RULES,
+        *FORMULA_SEMANTIC_RULES,
+        *LAYOUT_GEOMETRY_RULES,
+        *PRINT_QUALITY_RULES,
+        *RELATIONAL_SEMANTIC_RULES,
+    )
+    emitted = {rule.rule_id: rule.title for rule in all_rule_types}
     assert set(emitted) == set(BUILTIN_RULE_TITLES)
+    assert {rule.rule_id for rule in default_registry().values()} == set(BUILTIN_RULE_TITLES)
     assert {rule_id: titles[0] for rule_id, titles in BUILTIN_RULE_TITLES.items()} == emitted
     assert all(titles[1] and titles[1] != titles[0] for titles in BUILTIN_RULE_TITLES.values())
 
@@ -66,18 +143,36 @@ def _literal_branches(node: ast.expr) -> list[str]:
 
 def test_all_static_builtin_finding_patch_and_evidence_templates_are_translated() -> None:
     import workbooklens.rules.builtin as builtin
+    import workbooklens.rules.data_quality as data_quality
+    import workbooklens.rules.formula_semantics as formula_semantics
+    import workbooklens.rules.inferred_semantics as inferred_semantics
+    import workbooklens.rules.layout_geometry as layout_geometry
+    import workbooklens.rules.print_quality as print_quality
+    import workbooklens.rules.profile_quality as profile_quality
+    import workbooklens.rules.relational_semantics as relational_semantics
 
-    source = Path(builtin.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
     fields = {"description", "explanation", "expected", "suggested_action", "summary"}
-    texts = {
-        text
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        for keyword in node.keywords
-        if keyword.arg in fields
-        for text in _literal_branches(keyword.value)
-    }
+    texts: set[str] = set()
+    for module in (
+        builtin,
+        data_quality,
+        formula_semantics,
+        inferred_semantics,
+        layout_geometry,
+        print_quality,
+        profile_quality,
+        relational_semantics,
+    ):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        texts.update(
+            text
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            for keyword in node.keywords
+            if keyword.arg in fields
+            for text in _literal_branches(keyword.value)
+        )
     missing = sorted(text for text in texts if canonical_text_translation(text, "zh-CN") is None)
     assert not missing
 
@@ -103,6 +198,17 @@ def test_all_known_dynamic_builtin_templates_are_translated() -> None:
         "Missing parallel-consensus edge(s): left, right",
         "14 exact blank styled cells and 3 empty row records form a separated tail",
         "6 literal-whitespace cells form an outer tail",
+        "A nonblank email value fails conservative structural validation",
+        "A percentage field uses a conflicting number-format role",
+        "Chart 1 covers 7 populated non-source cells",
+        "Image 2 covers 3 populated non-source cells",
+        "4 fixed-format numeric values exceed the estimated column width",
+        "Explicit row height 48 is 3.20 times the detail-row median",
+        "Merged title combines 4 unusual role-specific style components",
+        "Body-role component consensus identifies 12 anomalous cells",
+        "3 total-row cells use formats inconsistent with their body columns",
+        "Confirm whether 'Sales'!B2:B5 should cover 'Sales'!B2:B8.",
+        "1 manual row break(s) split the dense leading portion of an inferred table",
     )
     assert all(canonical_text_translation(text, "zh-CN") for text in samples)
 

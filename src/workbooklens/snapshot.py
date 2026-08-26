@@ -137,6 +137,11 @@ def _defined_names(workbook: Workbook) -> dict[str, str]:
         if name.localSheetId is not None:
             key = f"{key}@sheet:{name.localSheetId}"
         names[key] = name.attr_text or ""
+    for worksheet in workbook.worksheets:
+        sheet_id = workbook.index(worksheet)
+        for name in worksheet.defined_names.values():
+            key = f"{name.name}@sheet:{sheet_id}"
+            names[key] = name.attr_text or ""
     return dict(sorted(names.items()))
 
 

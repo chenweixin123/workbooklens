@@ -3,19 +3,53 @@
 **Deterministic linting, regression testing, semantic diffing, and conservative repair for
 Excel workbooks.**
 
-WorkbookLens 2.3 core scan, test, diff, and repair workflows work locally without Microsoft Excel,
-LibreOffice, an AI key, or a cloud service. Those normal OOXML workflows do not calculate formulas,
-execute VBA, open embedded objects, or fetch external links. .xlsx files support scan, test, diff,
-and safe-copy repair; .xlsm files remain read-only. The optional local `.xls` conversion button is a
-separate trust boundary and should be used only with trusted files: Microsoft Excel (preferred) or
-LibreOffice opens the workbook locally and may recalculate formulas or process workbook-defined
-behavior supported by that application. Conversion never uses a cloud service and does not claim
-that every legacy workbook feature can be preserved.
+WorkbookLens 2.4 core scan, test, diff, and direct OOXML repair workflows work locally without
+Microsoft Excel, LibreOffice, an AI key, or a cloud service. Those normal workflows do not calculate
+formulas, execute VBA, open embedded objects, or fetch external links. `.xlsx` files support scan,
+test, diff, and conservative repair; `.xlsm` files remain read-only. Formula-derived auto-repair can
+optionally validate isolated temporary copies with Microsoft Excel (preferred) or LibreOffice, but
+only after the user explicitly marks the workbook as trusted. The installed application may evaluate
+`WEBSERVICE`, data connections, or other workbook-defined behavior, so leave that authorization off
+for untrusted files; lossless normalization still works and formula candidates are skipped. Local
+`.xls` conversion is the same kind of trusted-file-only boundary. Neither path uses a cloud service.
 
 > **Release status:** GitHub Releases are authoritative for source archives and attached artifacts.
-> Version 2.3.0 may not be published to [PyPI](https://pypi.org/project/workbooklens/); use the
+> Version 2.4.0 may not be published to [PyPI](https://pypi.org/project/workbooklens/); use the
 > downloaded wheel or source checkout instructions below unless PyPI explicitly lists that version.
 > Do not assume pipx or uvx can install a GitHub-only release by package name.
+
+## What is new in 2.4
+
+- Formula analysis now profiles the full inferred data body instead of relying only on short
+  contiguous bands. It reports multiple copied-formula outliers, hardcoded interruptions,
+  formula-looking text, bounded static circular dependencies, and a small set of provable formula
+  errors without evaluating workbook formulas. Saved OOXML formula-error caches are advisory,
+  lower-confidence evidence and may be stale. Multiple anomalies remain findings-only; automatic
+  formula replacement is limited to a single high-confidence anomaly with stable detail-row
+  evidence.
+- Patch Plan schema v3 records candidate uniqueness, derivation evidence, preserved invariants, and
+  recalculation requirements. One-click safe repair combines lossless normalization with uniquely
+  derived formula candidates, but Office-backed validation is opt-in for trusted workbooks and any
+  failed recalculation, rescan, dependency, or idempotency check rolls the candidate back.
+- New report-only data-quality rules infer likely identifier columns, mixed numeric storage, robust
+  numeric outliers, percentage-scale mistakes, date-storage anomalies, and sign-domain violations
+  (negative values under nonnegative headers, or zero/negative values under positive headers). They
+  never invent replacement business values.
+- New report-only structure rules check partial AutoFilter coverage, chart source-shape mismatches,
+  freeze panes saved deep inside or beyond content, and print areas that truncate inferred tables or
+  included chart frames.
+- A conservative Formula IR now checks aggregate coverage, cross-sheet targets, notes-column
+  formulas, algebraic degeneracy, and label/number-format role conflicts without evaluating or
+  rewriting business formulas.
+- Optional Workbook Profiles add user-owned semantics for required fields, enumerations, contacts,
+  fixed-width identifiers, and number-format roles. Without a Profile, rules continue to require
+  strong structural evidence and do not invent allowed-value sets.
+- Layout geometry now reports drawings that cover non-source data or KPI cells, fixed-format numeric
+  width risks, unexplained row-height outliers, and role-aware title/header/body/total style
+  fragmentation. These checks are report-only.
+- Isolated extreme long text can receive one atomic bounded-width, wrap, and row-height proposal.
+  Repeated extreme rows remain findings-only so a shared width dependency cannot be selected
+  partially, and generated row-height proposals are capped at a readable size.
 
 ## What is new in 2.3
 
@@ -98,12 +132,12 @@ that every legacy workbook feature can be preserved.
 ## Windows installer (recommended)
 
 For the normal Windows experience, download
-`WorkbookLens-2.3.0-windows-x64-setup.exe` and `SHA256SUMS` from the official
-[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.3.0). Verify the
+`WorkbookLens-2.4.0-windows-x64-setup.exe` and `SHA256SUMS` from the official
+[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.4.0). Verify the
 published checksum before running the installer:
 
 ~~~powershell
-(Get-FileHash .\WorkbookLens-2.3.0-windows-x64-setup.exe -Algorithm SHA256).Hash
+(Get-FileHash .\WorkbookLens-2.4.0-windows-x64-setup.exe -Algorithm SHA256).Hash
 ~~~
 
 The installer uses the current Windows account and does not require administrator access. Its
@@ -123,20 +157,20 @@ interface as the portable build.
 
 ## Windows portable ZIP
 
-The official `WorkbookLens-2.3.0-windows-x64-portable.zip` is the no-install Windows option.
+The official `WorkbookLens-2.4.0-windows-x64-portable.zip` is the no-install Windows option.
 It bundles a 64-bit CPython 3.12 runtime, so users do not need to install Python, `uv`, Microsoft
 Excel, LibreOffice, an AI key, or a cloud client. It is a portable folder rather than an installer:
 it does not request administrator access, modify the registry, create file associations, or add an
 automatic updater.
 
 Download the ZIP and `SHA256SUMS` from the official
-[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.3.0), compare the
+[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.4.0), compare the
 published SHA-256 value, and extract the complete folder. In PowerShell:
 
 ~~~powershell
-(Get-FileHash .\WorkbookLens-2.3.0-windows-x64-portable.zip -Algorithm SHA256).Hash
-Expand-Archive .\WorkbookLens-2.3.0-windows-x64-portable.zip -DestinationPath .\WorkbookLens
-Set-Location .\WorkbookLens\WorkbookLens-2.3.0-windows-x64
+(Get-FileHash .\WorkbookLens-2.4.0-windows-x64-portable.zip -Algorithm SHA256).Hash
+Expand-Archive .\WorkbookLens-2.4.0-windows-x64-portable.zip -DestinationPath .\WorkbookLens
+Set-Location .\WorkbookLens\WorkbookLens-2.4.0-windows-x64
 .\Start-WorkbookLens.cmd
 ~~~
 
@@ -167,17 +201,17 @@ upload service. Workbook processing stays on the user's computer. Installing the
 the configured Python package index once to obtain dependencies; scanning, planning, repair, diff,
 and the loopback web UI do not upload workbooks.
 
-Download `workbooklens-2.3.0-py3-none-any.whl`, `workbooklens-2.3.0.tar.gz`, and
+Download `workbooklens-2.4.0-py3-none-any.whl`, `workbooklens-2.4.0.tar.gz`, and
 `SHA256SUMS` from the official
-[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.3.0), verify the
+[GitHub Release](https://github.com/chenweixin123/workbooklens/releases/tag/v2.4.0), verify the
 checksum, and install it with Python 3.11+ and `uv`.
 
 ### PowerShell
 
 ~~~powershell
 Get-Content .\SHA256SUMS
-(Get-FileHash .\workbooklens-2.3.0-py3-none-any.whl -Algorithm SHA256).Hash
-uv tool install .\workbooklens-2.3.0-py3-none-any.whl
+(Get-FileHash .\workbooklens-2.4.0-py3-none-any.whl -Algorithm SHA256).Hash
+uv tool install .\workbooklens-2.4.0-py3-none-any.whl
 workbooklens --version
 workbooklens serve --port 8765
 ~~~
@@ -185,9 +219,9 @@ workbooklens serve --port 8765
 ### Bash
 
 ~~~bash
-grep -E '  workbooklens-2\.3\.0-py3-none-any\.whl$' SHA256SUMS | sha256sum -c -
-grep -E '  workbooklens-2\.3\.0\.tar\.gz$' SHA256SUMS | sha256sum -c -
-uv tool install ./workbooklens-2.3.0-py3-none-any.whl
+grep -E '  workbooklens-2\.4\.0-py3-none-any\.whl$' SHA256SUMS | sha256sum -c -
+grep -E '  workbooklens-2\.4\.0\.tar\.gz$' SHA256SUMS | sha256sum -c -
+uv tool install ./workbooklens-2.4.0-py3-none-any.whl
 workbooklens --version
 workbooklens serve --port 8765
 ~~~
@@ -224,11 +258,11 @@ uv run workbooklens --version
 uv run workbooklens demo --out .artifacts/demo
 ~~~
 
-If PyPI lists version 2.3.0, isolated installation is:
+If PyPI lists version 2.4.0, isolated installation is:
 
 ~~~bash
-uvx --from workbooklens==2.3.0 workbooklens --help
-pipx install workbooklens==2.3.0
+uvx --from workbooklens==2.4.0 workbooklens --help
+pipx install workbooklens==2.4.0
 ~~~
 
 ## Core workflows
@@ -250,6 +284,10 @@ workbooklens scan INPUT.xlsx --source-scope models/INPUT.xlsx --baseline previou
 workbooklens plan INPUT.xlsx --config workbooklens.yml --out repair-plan.json
 workbooklens apply INPUT.xlsx repair-plan.json --patch-id patch-0123456789abcdef --out INPUT.fixed.xlsx
 workbooklens apply INPUT.xlsx repair-plan.json --safe-only --out INPUT.fixed.xlsx
+
+# Apply lossless repairs and validate unique formula candidates from a trusted workbook
+workbooklens apply INPUT.xlsx repair-plan.json --auto-repair --recalc-provider auto \
+  --trust-workbook --out INPUT.auto-fixed.xlsx
 
 # Apply an explicitly reviewed layout patch or atomic layout group
 workbooklens apply INPUT.xlsx repair-plan.json --patch-id patch-fedcba9876543210 --accept-layout-risk --out INPUT.layout-fixed.xlsx
@@ -274,6 +312,57 @@ workbooklens scan INPUT.xlsx --baseline previous\findings.json --new-only --fail
 input path relative to the current directory), so a report for one workbook cannot silently hide a
 finding in another. Without --new-only, reports retain all current findings while identifying which
 were already known. Reusing a --new-only report preserves both its new and previously known IDs.
+
+### Optional Workbook Profile
+
+Some spreadsheet mistakes cannot be proved from layout alone. An optional version-3 YAML
+`profile` lets a user declare field roles, constraints, and repair policy without sending the
+workbook anywhere:
+
+~~~yaml
+version: 3
+profile:
+  infer_semantics: true
+  report_trailing_whitespace: true
+  review_trailing_whitespace_patches: false
+  sheets:
+    - sheet: Invoices
+      range: A1:G10000
+      header_row: 1
+      columns:
+        - header: Invoice ID
+          role: identifier
+          repair: report
+          required: true
+          identifier_width: 8
+          preserve_leading_zeros: true
+        - header: Status
+          role: category
+          required: true
+          allowed_values: [Open, Paid, Void]
+        - header: Customer Email
+          role: email
+        - header: Amount
+          role: currency
+          repair: auto
+        - header: Tax Rate
+          role: percentage
+          repair: review
+~~~
+
+Supported roles are `identifier`, `category`, `email`, `phone`, `currency`, `percentage`,
+`date`, `number`, and `text`. Select a field by `header` or bounded Excel `column`. Version 3 adds
+`repair: auto | review | report`: `auto` still requires a unique parse, stable native peers, no
+leading-zero risk, and all postconditions; `review` emits a semantic-review candidate; `report`
+never emits a patch. Profile rules report missing required values, invalid enumerations or contact
+formats, possible lost leading zeros, trailing whitespace, and number-format role conflicts. They
+never invent business values. Versions 1 and 2 remain readable and retain their earlier behavior.
+
+Profile contracts fail closed instead of silently disabling checks: each worksheet may appear once,
+each column must use exactly one header or column selector, and resolved headers/columns must be
+unique and inside the configured table. If range is present and header_row is omitted, its first
+row is used. Missing or hidden worksheets, ambiguous headers, invalid types, and unsupported Profile
+versions produce a clear configuration error before findings are evaluated.
 
 For a repository containing several workbooks, use an aggregate manifest keyed by repository-
 relative POSIX paths:
@@ -306,7 +395,7 @@ confidentiality as the input workbook.
 
 ## GitHub Action
 
-After the v2.3.0 tag exists:
+After the v2.4.0 tag exists:
 
 ~~~yaml
 permissions:
@@ -318,7 +407,7 @@ steps:
     with:
       fetch-depth: 0
 
-  - uses: chenweixin123/workbooklens@v2.3.0
+  - uses: chenweixin123/workbooklens@v2.4.0
     with:
       mode: scan
       path: workbooks
@@ -332,7 +421,7 @@ steps:
 Assertion mode requires config and deliberately rejects baseline/new-only:
 
 ~~~yaml
-- uses: chenweixin123/workbooklens@v2.3.0
+- uses: chenweixin123/workbooklens@v2.4.0
   with:
     mode: test
     path: workbooks
@@ -366,9 +455,12 @@ For formula and style operations, the target row must also agree with stable pee
 patterns. A secondary adjustment label, a unique note, a whole-row highlight, or only free-form labels
 without a dominant template causes automatic repair to be withheld.
 
-The engine writes a new OOXML package directly, verifies the exact changed-part allowlist, reopens
-the result, rescans it, and removes partial output after validation failure. Formula edits remove
-stale caches and request Excel recalculation; WorkbookLens never claims to have calculated the result.
+The engine writes a private candidate OOXML package directly, verifies the exact changed-part
+allowlist, reopens and rescans it, and publishes the output only after validation succeeds. Formula
+edits remove stale caches. With explicit trusted-workbook authorization, Excel or LibreOffice
+recalculates separate temporary source and candidate copies using the same provider; the provider is
+never used to write the final file. Without authorization or a provider, formula-derived candidates
+are skipped and WorkbookLens does not claim that they were validated.
 Layout repairs additionally verify row, column, view, or exact-tail fingerprints. Formatting-tail
 cleanup fails closed when an authorized cell or row intersects formulas, names, table or validation
 ranges, comments, links, page breaks, drawing anchors, or other guarded worksheet structures.
@@ -389,14 +481,21 @@ the workbook. Only the resulting macro-free `.xlsx` package enters the normal sa
 Temporary conversion files are deleted after the download response completes and again on normal
 server shutdown.
 
+Formula-repair validation is also an explicit trust boundary. `--trust-workbook`
+or the matching local-UI checkbox is required before Excel or LibreOffice can open isolated copies.
+Disabling macros, events, prompts, and link updates reduces risk but cannot guarantee that every
+calculation-time feature, data connection, or application behavior is inert. Do not authorize this
+path for a workbook from an unknown or untrusted source.
+
 See [SECURITY.md](SECURITY.md) for private reporting. Never attach a confidential production
 workbook to a public issue.
 
 ## Honest limitations
 
-- Normal OOXML scan, test, diff, and repair have no Excel calculation engine, VBA execution,
-  external-link fetching, or embedded-object opening. This guarantee does not describe the optional
-  local `.xls` conversion path.
+- Normal OOXML scan, test, diff, and direct repair do not use an Excel calculation engine, execute
+  VBA, fetch external links, or open embedded objects. This guarantee does not describe explicitly
+  authorized formula recalculation or local `.xls` conversion, both of which open trusted temporary
+  copies in an installed spreadsheet application.
 - No automatic repair for shared, array, data-table, spilled, or dynamic-array formulas.
 - Suspicious SUM boundaries are findings-only; the expected formula is evidence for human review,
   not proof that the adjacent row belongs in the aggregate.
@@ -431,7 +530,7 @@ uv run mypy src
 uv run python -m pytest -q
 uv build --out-dir dist
 uvx --from twine twine check --strict dist/*
-python scripts/check_release_artifacts.py dist --version 2.3.0
+python scripts/check_release_artifacts.py dist --version 2.4.0
 ~~~
 
 To reproduce the Windows x64 portable release candidate from the built wheel, run the following in
@@ -447,27 +546,27 @@ uv export --locked --python 3.12 --no-dev --group portable --no-emit-project --n
 $wheel = @(Get-ChildItem -LiteralPath .artifacts/portable-python-dist -Filter '*.whl')
 if ($wheel.Count -ne 1) { throw "Expected exactly one wheel, found $($wheel.Count)." }
 $python = (Resolve-Path .venv/Scripts/python.exe).Path
-& $python scripts/build_portable_windows.py --wheel $wheel[0].FullName --python $python --expected-version 2.3.0 --constraints .artifacts/portable-constraints.txt --output-dir .artifacts/portable-dist
+& $python scripts/build_portable_windows.py --wheel $wheel[0].FullName --python $python --expected-version 2.4.0 --constraints .artifacts/portable-constraints.txt --output-dir .artifacts/portable-dist
 $archive = @(Get-ChildItem -LiteralPath .artifacts/portable-dist -Filter '*.zip')
 if ($archive.Count -ne 1) { throw "Expected exactly one ZIP, found $($archive.Count)." }
-& $python scripts/check_portable_artifact.py $archive[0].FullName --expected-version 2.3.0
-& $python scripts/smoke_portable.py $archive[0].FullName --expected-version 2.3.0
+& $python scripts/check_portable_artifact.py $archive[0].FullName --expected-version 2.4.0
+& $python scripts/smoke_portable.py $archive[0].FullName --expected-version 2.4.0
 $iscc = (Resolve-Path "$env:LOCALAPPDATA/Programs/Inno Setup 6/ISCC.exe").Path
-& $python scripts/build_installer_windows.py --portable-zip $archive[0].FullName --expected-version 2.3.0 --iscc $iscc --output-dir .artifacts/installer-dist
+& $python scripts/build_installer_windows.py --portable-zip $archive[0].FullName --expected-version 2.4.0 --iscc $iscc --output-dir .artifacts/installer-dist
 $installer = @(Get-ChildItem -LiteralPath .artifacts/installer-dist -Filter '*.exe')
 if ($installer.Count -ne 1) { throw "Expected exactly one installer, found $($installer.Count)." }
-& $python scripts/check_installer_artifact.py $installer[0].FullName --expected-version 2.3.0
-& $python scripts/smoke_installer_windows.py $installer[0].FullName --portable-zip $archive[0].FullName --expected-version 2.3.0
+& $python scripts/check_installer_artifact.py $installer[0].FullName --expected-version 2.4.0
+& $python scripts/smoke_installer_windows.py $installer[0].FullName --portable-zip $archive[0].FullName --expected-version 2.4.0
 ~~~
 
 The installer smoke test requires a user account without an existing WorkbookLens installation. It
 rejects custom directories and a forged per-user uninstall entry, installs only to the fixed
 `%LOCALAPPDATA%\Programs\WorkbookLens` directory, verifies the ownership marker, exact portable
 payload, Start-menu and desktop shortcuts, the Installed apps record, and the installed executable,
-then uninstalls and confirms that all test-created state was removed. Starting with the release after
-2.2.1, also pass the pinned preceding release's setup executable and portable ZIP through
-`--previous-installer` and `--previous-portable-zip`; the published 2.2.0 release did not contain
-Windows artifacts and therefore cannot be used as an installer-upgrade baseline.
+then uninstalls and confirms that all test-created state was removed. Also pass the pinned preceding
+release's setup executable and portable ZIP through `--previous-installer` and
+`--previous-portable-zip`; for 2.4.0 the upgrade baseline is 2.3.0. The smoke test validates that the
+baseline is an earlier numeric release and retains the legacy ZIP profile only for 2.2.1.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md), [the architecture guide](docs/architecture.md),
 [CLI exit codes](docs/cli-exit-codes.md), and [the release checklist](docs/release-checklist.md).

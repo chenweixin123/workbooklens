@@ -35,7 +35,11 @@ drawing anchors, or unsupported row metadata.
 
 After replacement, the engine compares every package entry, rejects an unexpected changed, added,
 or removed part, reopens the output, checks requested cell and layout semantics, rescans findings,
-and deletes the output on failure.
+and deletes the private candidate on failure. A validated candidate is published only at the end.
+When a uniquely derived formula requires calculation validation, an installed Excel or LibreOffice
+provider may open isolated source and candidate copies only after explicit trusted-workbook
+authorization. The provider never saves the final artifact, and its copies must preserve formulas
+and key workbook structure before their calculated error sets are accepted as evidence.
 
 ## Consequences
 
@@ -62,6 +66,7 @@ Costs:
 ## Rejected alternatives
 
 - Save through `openpyxl`: too broad a package rewrite for a preservation tool.
-- Automate Excel/LibreOffice: not reliably cross-platform or local-installation independent, and it
-  would recalculate or normalize unrelated content.
+- Use Excel/LibreOffice as the repair writer: rejected because it can normalize unrelated content.
+  Installed applications are optional validation providers only, behind explicit trust authorization,
+  and the final file remains the direct OOXML candidate.
 - Patch cached values: WorkbookLens is not an Excel calculation engine and cannot prove them.

@@ -1,6 +1,10 @@
 .venv/
 .tools/
 .artifacts/
+.verification/
+outputs/
+/.w[0-9]*/
+/.wfinal/
 .pytest_cache/
 /.pytest-tmp*/
 .mypy_cache/

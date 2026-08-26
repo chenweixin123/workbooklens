@@ -16,7 +16,9 @@
 - [ ] Source hashes remain unchanged and only expected OOXML parts change.
 - [ ] Charts, drawings, images, relationships, themes, and unknown fixtures remain byte-identical.
 - [ ] Shared, array, data-table, dynamic-array, stale-plan, and malformed inputs fail closed.
-- [ ] Formula edits remove caches and request recalculation without claiming it occurred.
+- [ ] Formula edits remove caches; recalculation-required patches are validated only after explicit
+  trusted-workbook authorization, use one provider for isolated before/after copies, and never let
+  that provider write the final file.
 - [ ] `--safe-only` excludes every `layout_review` patch; explicit layout selection requires
   `--accept-layout-risk`, confidence at least 0.95, and complete atomic groups.
 - [ ] Row heights, column widths, wrapping, width-only identifier display, saved views, edge-only borders, and
@@ -27,6 +29,9 @@
 ## Security and supply chain
 
 - [ ] Adversarial ZIP/XML/relationship and web-limit tests pass.
+- [ ] Untrusted-workbook tests prove that CLI and Web defaults never launch Excel or LibreOffice,
+  while authorized recalculation enforces time/cell budgets, process cleanup, structural equivalence,
+  no new formula errors, and rollback reports in both languages.
 - [ ] CodeQL, dependency review, and locked-runtime vulnerability audit pass.
 - [ ] GitHub Actions and dependencies have reviewed updates.
 - [ ] Windows CI and release jobs compile an `Output=no` probe and accept only the ISCC compiler
@@ -71,16 +76,16 @@
   runs without Python on `PATH`, and uninstalls without residual test state.
 - [ ] When the immediately previous release has Windows installer and portable artifacts, run
   `scripts/smoke_installer_windows.py` with both `--previous-installer` and
-  `--previous-portable-zip` and record the exact previous artifact hashes. Version 2.2.1 is the
-  first Windows-installer release, so the published 2.2.0 wheel/sdist-only assets cannot supply this
-  baseline; do not substitute an unpinned or same-version download.
+  `--previous-portable-zip` and record the exact previous artifact hashes. For 2.4.0, use the pinned
+  2.3.0 setup executable and portable ZIP; do not substitute an unpinned, same-version, or newer
+  download. The script uses the legacy portable profile only when the baseline is exactly 2.2.1.
 - [ ] README Bash and PowerShell commands match a clean checkout.
 - [ ] Representative layout repairs are opened in the target spreadsheet application; text is not
   clipped, identifiers are exact, the initial viewport is useful, and printer/page layout is reviewed.
 
 ## Release candidate and publication
 
-- [ ] Push v2.3.0; the release-candidate workflow validates the tag, builds distributions,
+- [ ] Push v2.4.0; the release-candidate workflow validates the tag, builds distributions,
   generates SHA256SUMS, and uploads workflow artifacts.
 - [ ] Inspect the downloaded artifacts before external publication.
 - [ ] Record whether the release is GitHub-only or also publishes to PyPI.
@@ -90,4 +95,4 @@
   chenweixin123/workbooklens, then publish only from the validated tag using OIDC; do not add a
   long-lived PyPI token.
 - [ ] If publishing to PyPI, verify the project page, uvx installation, and pipx installation for
-  version 2.3.0.
+  version 2.4.0.

@@ -414,7 +414,7 @@ def test_release_installer_smoke_verifies_pinned_upgrade_baseline() -> None:
     )
     ci_workflow = (repository_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
-    baseline_step = "      - name: Download and verify the v2.2.1 upgrade baseline"
+    baseline_step = "      - name: Download and verify the v2.3.0 upgrade baseline"
     installer_step = "      - name: Build and smoke-test the Windows installer"
     baseline_start = release_workflow.index(baseline_step)
     installer_start = release_workflow.index(installer_step, baseline_start)
@@ -425,12 +425,12 @@ def test_release_installer_smoke_verifies_pinned_upgrade_baseline() -> None:
         "portable:\n    if: github.repository == 'chenweixin123/workbooklens'" in release_workflow
     )
     assert "GH_TOKEN: ${{ github.token }}" in baseline
-    assert "$baselineTag = 'v2.2.1'" in baseline
+    assert "$baselineTag = 'v2.3.0'" in baseline
     assert "gh release download $baselineTag --repo chenweixin123/workbooklens" in baseline
-    assert "WorkbookLens-2.2.1-windows-x64-portable.zip" in baseline
-    assert "WorkbookLens-2.2.1-windows-x64-setup.exe" in baseline
-    assert "c5b2eb0b6b4e1b97de2563918dc3b35b969c767a8dc3ce6a8ab5ceb9fe093538" in baseline
-    assert "d54b874e1c540df65e099e860b5df5a3c658dde507f46e20995ae93db7aa4fef" in baseline
+    assert "WorkbookLens-2.3.0-windows-x64-portable.zip" in baseline
+    assert "WorkbookLens-2.3.0-windows-x64-setup.exe" in baseline
+    assert "0a0e3bde2f89b71dfb8324719cd01ecb7794dd2fee40540231580599afd1a441" in baseline
+    assert "ad9103f84936ca018e7bde9cc69dd4d13b03d583dd7f4eacda9127b735cb6ab4" in baseline
     assert "Get-FileHash -LiteralPath $path -Algorithm SHA256" in baseline
     assert '$sidecarContents = "$actualHash  $name`n"' in baseline
     assert (
