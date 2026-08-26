@@ -157,6 +157,7 @@ def test_excel_recalculation_rejects_overlong_tool_path_before_process_start(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(recalculation.sys, "platform", "win32")
     source = tmp_path / "source.xlsx"
     source.write_bytes(b"source")
     output = tmp_path / "output.xlsx"
