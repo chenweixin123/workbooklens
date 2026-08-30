@@ -31,7 +31,7 @@ dependencies = [
   "pydantic>=2.11,<3",
   "python-multipart>=0.0.20,<1",
   "pyyaml>=6.0.2,<7",
-  "rich>=14,<15",
+  "rich>=14,<16",
   "typer>=0.16,<1",
   "uvicorn>=0.35,<1",
 ]
